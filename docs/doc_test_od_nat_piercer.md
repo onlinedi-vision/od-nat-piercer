@@ -7,8 +7,9 @@
 cargo run --bin signaling_server
 ```
 ### Expected output
+```bash
 Signaling server listening on 0.0.0.0:5000
-
+```
 
 ## 2. Start the first client (**user1**)
 **Open a new terminal.**
@@ -27,12 +28,14 @@ You can discover your machine's ip by running the next command in a terminal (on
 
 ## Expected Output for the first client
 
-Server response:
+```bash
+Server response:  
  MODE RELAY
 
 You are in RELAY mode (only user in channel)
 Relay mode active: waiting for incoming messages...
 
+```
 
 ## 3. Start a second client
 **Open a new terminal.**
@@ -50,6 +53,7 @@ cargo run --bin client -- <your_machine_ip> <your_machine_ip> server1 channel1 u
 
 ## Expected Outputs:
 ### Output for 3rd client:
+```bash
 Server response:
  MODE DIRECT user1 <your_machine_ip>:4000
 Added peer user1 with addr <your_machine_ip>:4000
@@ -67,9 +71,10 @@ Sent UDP punch to <your_machine_ip>:4000
 Sent UDP punch to <your_machine_ip>:4000
 Sent UDP punch to <your_machine_ip>:4000
 Finished hole punching / listening phase.
-
+```
 
 ### Output for 2nd client
+```bash
 Server response:
  MODE DIRECT user1 <your_machine_ip>:4000
 Added peer user1 with addr <your_machine_ip>:4000
@@ -87,9 +92,10 @@ Sent UDP punch to <your_machine_ip>:4000
 Sent UDP punch to <your_machine_ip>:4000
 Sent UDP punch to <your_machine_ip>:4000
 Finished hole punching / listening phase.
-
+```
 
 ### Output for 1st client
+```bash
 Server response:
  MODE RELAY
 
@@ -101,14 +107,15 @@ Received from <your_machine_ip>:4002: punch
 Received from <your_machine_ip>:4002: punch
 Received from <your_machine_ip>:4002: punch
 Finished hole punching / listening phase.
-
+```
 
 ## And now, you're server's output should look something like this:
+```bash
 Signaling server listening on 0.0.0.0:5000
 User user1 joined server1-channel1 from <your_machine_ip>:4000
 User user2 joined server1-channel1 from <your_machine_ip>:4002
 User user3 joined server1-channel1 from <your_machine_ip>:4003
-
+```
 
 #For Phase 1 of this protocol, if you're receiving the same outputs, the server and client are working properly (for now)
 

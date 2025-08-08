@@ -4,7 +4,7 @@
 
 This UDP server acts as signaling server for a peer-to-peer voice chat that uses UDP hole punching to connect clients/users directly.
 
-It keeps track of users grouped into channels with different server IDs and shares their network address so they can connect to each other. (this will probably be modified a little)
+It keeps track of users grouped into channels with different server IDs and shares their network address so they can connect to each other (this will probably be modified a little).  
 If a user is alone in a channel, the server will set him into a **RELAY** mode; if the user is not alone, he is placed into **DIRECT** mode with the addresses of their peers.
 
 ---

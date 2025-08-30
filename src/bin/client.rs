@@ -1,5 +1,10 @@
 use std::{ 
-    env, net::{SocketAddr, UdpSocket}, sync::{Arc,Mutex}, str::FromStr, thread, time::{Duration, Instant}
+    env,
+    net::{SocketAddr, UdpSocket},
+    sync::{Arc,Mutex},
+    str::FromStr,
+    thread,
+    time::{Duration, Instant}
 };
 
 
@@ -12,17 +17,16 @@ struct PeerInfo{
 }
 
 fn main() -> std::io::Result<()> {
-    //CLI arguments: signaling_ip, client_ip(ignored), server, channel, user, local_port
+    //CLI arguments: signaling_ip, server, channel, user, local_port
     let args: Vec<String> = env::args().collect();
     if args.len() < 7 {
         eprintln!(
-            "Usage: client <signaling_ip> <client_ip(ignored)> <server_id> <channel> <user> <local_port>"
+            "Usage: client <signaling_ip> <server_id> <channel> <user> <local_port>"
         );
         std::process::exit(1);
     }
 
     let signaling_ip = &args[1];
-    //let client_ip = &args[2];
     let server_id = &args[3];
     let channel = &args[4];
     let user = &args[5];
@@ -45,6 +49,23 @@ fn main() -> std::io::Result<()> {
     let peers = Arc::new(Mutex::new(peers));
     let is_relay = Arc::new(Mutex::new(false));
     let relay_started = Arc::new(Mutex::new(false));
+
+    //Start sending heartbeat to server every 20s so server knows we're alive
+    {
+        let socket_clone = socket.try_clone()?;
+        let server_id = server_id.to_string();
+        let channel = channel.to_string();
+        let user = user.to_string();
+        let signaling_addr = signaling_addr.to_string();
+
+        thread::spawn(move || {
+            loop{
+                let hb = format!("HB {} {} {}", server_id, channel, user);
+                let _ = socket_clone.send_to(hb.as_bytes(), &signaling_addr);
+                thread::sleep(Duration::from_secs(20));
+            }
+        });
+    }
 
     // 2. Aggregate server responses for a short window
     let setup_deadline = Instant::now() + Duration::from_millis(1500);
@@ -74,7 +95,7 @@ fn main() -> std::io::Result<()> {
         thread::spawn(move || {
             //We'll keep punching until peer.connected == true or timeout
             let punch_start = Instant::now();
-            while punch_start.elapsed() < Duration::from_secs(15){
+            while punch_start.elapsed() < Duration::from_secs(5){
                 let guard = peers_clone.lock().unwrap();
                 for p in guard.iter(){
                     if !p.connected{
@@ -99,7 +120,7 @@ fn main() -> std::io::Result<()> {
         let is_relay_clone = Arc::clone(&is_relay);
         let relay_started_clone = Arc::clone(&relay_started);
 
-        //Clone the String so the thread own them, otherwise i get a warning
+        //Clone the String so the thread owns them, otherwise i get a warning
         let server_id = server_id.to_string();
         let channel = channel.to_string();
         let signaling_addr = signaling_addr.to_string();

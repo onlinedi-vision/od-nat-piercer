@@ -1,4 +1,9 @@
-use std::{collections::HashMap, net::SocketAddr, sync::Arc, time::{Duration, Instant}};
+use std::{
+    collections::HashMap,
+    net::SocketAddr,
+    sync::Arc,
+    time::{Duration, Instant}
+};
 use tokio::{net::UdpSocket, sync::Mutex};
 
 #[derive(Clone, Debug)]
@@ -33,11 +38,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         loop{
             interval.tick().await;
 
-            //Collect pings and removals while holding the lock
-            let (to_ping, mut to_cleanup): (Vec<SocketAddr>, Vec<(String, String)>) ={
+            //Collect:
+            // -pings to send (server -> lone users to keep NAT)
+            // - cleanup of empty channels
+            // -per-timeout notifications to send after lock is release
+            let (to_ping, to_cleanup, notify_msgs): (Vec<SocketAddr>, Vec<(String, String)>, Vec<(Vec<SocketAddr>, Vec<u8>)>) ={
                 let mut st = heartbeat_state.lock().await;
                 let mut pings = Vec::new();
-                let mut clean = Vec::new();
+                let mut cleanup = Vec::new();
+                let mut notifications: Vec<(Vec<SocketAddr>, Vec<u8>)> = Vec::new();
 
                 let server_ids: Vec<String> = st.keys().cloned().collect();
                 for sid in server_ids.iter(){
@@ -45,23 +54,70 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         let channel_names: Vec<String> = channels.keys().cloned().collect();
                         for cname in channel_names.iter(){
                             if let Some(channel) = channels.get_mut(cname){
-                                //check users for timeouts
+                                //check users for timeouts (use last_pong for all users)
                                 let mut i = 0;
                                 while i < channel.users.len(){
                                     let user = &channel.users[i];
 
-                                    //Only apply timeout if there are other users in the channel
-                                    let is_lone_user = channel.users.len() == 1;
+                                    //if we've seen no HB/PONG for this user in the timeout window, he timed out
+                                    if user.last_pong.elapsed() > Duration::from_secs(40){
+                                        println!("User {} timed out from {}-{}", user.name, sid, cname);
 
-                                    let is_relay_user = channel.relay.as_ref().map(|r| r == &user.name).unwrap_or(false);
-                                    
-                                    if !is_lone_user && !is_relay_user && user.last_pong.elapsed() > Duration::from_secs(60){
-                                        println!("User {} disconnected (timeout) from {}-{}", user.name, sid, cname);
+                                        //prepare USER-LEFT notification to remaining users (collect their addresses now)
+                                        let msg = format!("USER_LEFT {} {}\n", user.name, user.addr);
+                                        let peers_to_notify: Vec<SocketAddr> = channel.users
+                                            .iter()
+                                            .filter(|u| u.addr != user.addr) //remaining peers
+                                            .map(|u| u.addr)
+                                            .collect();
+
+                                        if !peers_to_notify.is_empty(){
+                                            notifications.push((peers_to_notify, msg.as_bytes().to_vec()));
+                                        }
+
+                                        //detect whether this user was relay
+                                        let was_relay = channel.relay.as_ref().map(|r| r == &user.name).unwrap_or(false);
+
+                                        //remove the user
                                         channel.users.remove(i);
+
+                                        //if we removed the relay and there are still users, promote first
+                                        if was_relay{
+                                            if !channel.users.is_empty(){
+                                                let new_relay = channel.users[0].name.clone();
+                                                channel.relay = Some(new_relay.clone());
+
+                                                //notify new relay and others (collect peers to notify)
+                                                let new_relay_addr = channel.users[0].addr;
+
+                                                //notify new relay
+                                                notifications.push((vec![new_relay_addr], b"MODE RELAY\n".to_vec()));
+
+                                                //notify other users about the new relay
+                                                let mut relinfo_msg = Vec::new();
+                                                for peer in channel.users.iter().skip(1){
+                                                    let m = format!("MODE DIRECT {} {}\n", new_relay, new_relay_addr);
+                                                    relinfo_msg.extend_from_slice(m.as_bytes());
+                                                }
+                                                if !relinfo_msg.is_empty(){
+                                                    let others_addrs: Vec<SocketAddr> = channel.users.iter().skip(1).map(|u| u.addr).collect();
+                                                    notifications.push((others_addrs, relinfo_msg));
+                                                }
+                                            }else{
+                                                channel.relay = None;
+                                            }
+                                        }
+
+                                        //if only one user left, ensure they are marked relay
+                                        if channel.users.len() == 1{
+                                            channel.relay = Some(channel.users[0].name.clone());
+                                            //notify lone user that they are relay (keepalive by server)
+                                            notifications.push((vec![channel.users[0].addr], b"MODE RELAY\n".to_vec()));
+                                        }
                                     }else{
                                         i += 1;
-                                    }
-                                }
+                                    }                         
+                                }//end per-user loop
 
                                 //if channel has only one user, ping him to keep NAT connection
                                 if channel.users.len() == 1{
@@ -70,14 +126,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                                 //if channel empty, mark for cleanup
                                 if channel.users.is_empty(){
-                                    clean.push((sid.clone(), cname.clone()));
+                                    cleanup.push((sid.clone(), cname.clone()));
                                 }
                             }
                         }
                     }
                 }
-                (pings, clean)
+                (pings, cleanup, notifications)
             }; //lock dropped here
+            
             // Send pings without holding the lock
             for addr in to_ping{
                 if let Err(e) = heartbeat_socket.send_to(b"PING", addr).await{
@@ -85,10 +142,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
 
+            //send notifications (USER_LEFT, MODE RELAY, MODE DIRECT messages}
+            for (peers_to_notify, payload) in to_cleanup_and_notify_iter(notify_msgs.into_iter()){
+                for addr in peers_to_notify{
+                    if let Err(e) = heartbeat_socket.send_to(&payload, addr).await{
+                        eprintln!("Failed to send heartbeat notification to {}: {}", addr, e);
+                    }
+                }
+            }
+
             //Cleanup empty channels / servers
             if !to_cleanup.is_empty(){
                 let mut st = heartbeat_state.lock().await;
-                for(sid, cname) in to_cleanup.drain(..){
+                for(sid, cname) in to_cleanup.into_iter(){
                     if let Some(chans) = st.get_mut(&sid){
                         chans.remove(&cname);
                         if chans.is_empty(){
@@ -105,13 +171,34 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let msg = String::from_utf8_lossy(&buf[..len]).to_string();
         let parts: Vec<&str> = msg.trim().split_whitespace().collect();
 
-        // Handle PONG messages first
+        // Handle PONG messages first (relay PING <-> client PONG)
         if msg.trim() == "PONG"{
             let mut st = state.lock().await;
-            for(_, channels) in st.iter_mut(){
-                for(_, channel) in channels.iter_mut(){
+            for(_sid, channels) in st.iter_mut(){
+                for(_cname, channel) in channels.iter_mut(){
                     if let Some(user) = channel.users.iter_mut().find(|u| u.addr == src){
                         user.last_pong = Instant::now();
+                    }
+                }
+            }
+            continue;
+        }
+
+        //HB messages from clients to inform server they are alive
+        if parts.len() >= 4 && parts[0] == "HB" {
+            //HB server_id channel_name user_name
+            let server_id = parts[1];
+            let channel_name = parts[2];
+            let user_name = parts[3];
+            let mut st = state.lock().await;
+            if let Some(channels) = st.get_mut(server_id){
+                if let Some(channel) = channels.get_mut(channel_name){
+                    if let Some(u) = channel
+                        .users
+                        .iter_mut()
+                        .find(|u| u.name == user_name && u.addr == src)
+                    {
+                        u.last_pong = Instant::now();
                     }
                 }
             }
@@ -121,12 +208,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         if parts.len() >= 1 {
             match parts[0] {
                 "CONNECT" if parts.len() >= 4 => {
-                    //CONNECT server_id channel_name user_name [client_provided_addr]
+                    //CONNECT server_id channel_name user_name 
                     let server_id = parts[1].to_string();
                     let channel_name = parts[2].to_string();
                     let user_name = parts[3].to_string();
 
-                    //Use src as address, ignore client provided addr, because it might be different behind NAT than the UDP provided one
+                    //Use src as address (UDP observer addr), ignore client provided addr, because it might be different behind NAT than the UDP provided one
                     let src_addr = src;
 
                     //Add or update user under lock, but collect notifications to send after releasing the lock
@@ -156,6 +243,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 if let Err(e) = socket.send_to(reply.as_bytes(), channel.users[0].addr).await{
                                     eprintln!("Failed to notify lone user about server relay: {}", e);
                                 }
+
+                                //mark channel.relay to None (server is special relay)
+                                channel.relay = Some(channel.users[0].name.clone());
                             }
                         
                             println!("User {} joined {}-{} from {}", user_name, server_id, channel_name, src_addr);
@@ -169,8 +259,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
 
                     // Now decide messages to send based on cloned channel state
-                    if users_to_notify.users.len() > 1 && users_to_notify.relay.is_none(){
-                        //promote first user to relay
+                    // if more than 1 user and relay wasn't set previously, promote first user
+                    if users_to_notify.users.len() > 1{
+                        //if there was a server marked relay (we earlier set relay name for lone users)
+                        //we want the first client to become the real client relay
                         let relay_user = &users_to_notify.users[0];
                     
                         //Mark relay in the channel
@@ -183,7 +275,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             }
                         }
                         
-                        //Notify the new relay about all other users
+                        //Notify the new relay about all other users (MODE DIRECT <peer> <addr>)
                         for peer in users_to_notify.users.iter().skip(1){
                             let msg = format!("MODE DIRECT {} {}\n", peer.name, peer.addr);
                             if let Err(e) = socket.send_to(msg.as_bytes(), relay_user.addr).await{
@@ -191,7 +283,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             }
                         }
 
-                        //Notify other users about the new relay
+                        //Notify other users about the new relay (MODE DIRECT <relay> <addr>)
                         for peer in users_to_notify.users.iter().skip(1){
                             let msg = format!("MODE DIRECT {} {}\n", relay_user.name, relay_user.addr);
                             if let Err(e) = socket.send_to(msg.as_bytes(), peer.addr).await{
@@ -199,13 +291,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             }
                         }
                         
-                        //Finally notify the relay itself
+                        //Finally notify the relay itself that it shoult act as relay
                         let reply = "MODE RELAY\n";
                         if let Err(e) = socket.send_to(reply.as_bytes(), relay_user.addr).await{
                             eprintln!("Failed to send RELAY mode to {}: {}", relay_user.name, e);
                         }
                     } else {
-                        //Notify existing users about the new user, and notify new user about existing users
+                        //either theres only 1 user to notify, that we already handled
+                        //or the relay was already set, in which case 
+                        //notify existing users about the new one, and the new one about existing users
                         for user in users_to_notify.users.iter(){
                             if user.addr != src_addr{
                                 //notify existing user about the new one
@@ -352,6 +446,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 }
+
+//helper to iterate notify_msgs (to avoid moving Vec in pattern)
+fn to_cleanup_and_notify_iter<I>(it:I) -> Vec<(Vec<SocketAddr>, Vec<u8>)>
+    where I: IntoIterator<Item = (Vec<SocketAddr>, Vec<u8>)>,
+    {
+        it.into_iter().collect()
+    }
             
         
    

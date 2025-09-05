@@ -7,6 +7,8 @@ use std::{
     time::{Duration, Instant},
 };
 
+use reqwest::header::SEC_WEBSOCKET_ACCEPT;
+
 #[derive(Clone, Debug)]
 struct PeerInfo {
     addr: SocketAddr,
@@ -180,6 +182,31 @@ fn main() -> std::io::Result<()> {
         });
     }
 
+    // Thread for sending messages - test that users can comunicate with each other
+    {
+        let peers_clone = Arc::clone(&peers);
+        let socket_clone = socket.try_clone()?;
+        let username = user.to_string();
+
+        thread::spawn(move || {
+            use std::io::{self, BufRead};
+            let stdin = io::stdin();
+            for line in stdin.lock().lines() {
+                if let Ok(msg) = line {
+                    let msg = msg.trim();
+                    if msg.is_empty() {
+                        continue;
+                    }
+                    let payload = format!("DATA {} {}\n", username, msg);
+                    let peers_guard = peers_clone.lock().unwrap();
+                    for peer in peers_guard.iter() {
+                        let _ = socket_clone.send_to(payload.as_bytes(), peer.addr);
+                    }
+                }
+            }
+        });
+    }
+
     println!("Starting main message loop...");
     loop {
         match socket.recv_from(&mut buf) {
@@ -222,8 +249,34 @@ fn main() -> std::io::Result<()> {
                             }
                         }
                         _ => {
-                            //Handle control messages: MODE / USER_LEFT
-                            handle_mode_line(line, &peers, user, &is_relay);
+                            if line.starts_with("DATA ") {
+                                //format: DATA <sender> <text>
+                                let parts: Vec<&str> = line.splitn(3, ' ').collect();
+                                if parts.len() >= 3 {
+                                    let sender = parts[1];
+                                    let text = parts[2];
+                                    println!("[{}]: {}", sender, text);
+
+                                    if *is_relay.lock().unwrap() {
+                                        let peers_guard = peers.lock().unwrap();
+                                        for peer in peers_guard.iter() {
+                                            if peer.username != sender {
+                                                if let Err(e) =
+                                                    socket.send_to(line.as_bytes(), peer.addr)
+                                                {
+                                                    eprintln!(
+                                                        "Failed to send data to user {}: {}",
+                                                        peer.username, e
+                                                    );
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            } else {
+                                //Handle control messages: MODE / USER_LEFT
+                                handle_mode_line(line, &peers, user, &is_relay);
+                            }
                         }
                     }
                 }

@@ -1,35 +1,25 @@
 use std::{
     env,
-    net::{SocketAddr, UdpSocket},
-    str::FromStr,
+    net::UdpSocket,
     sync::{Arc, Mutex},
     thread,
     time::{Duration, Instant},
 };
 
-use reqwest::header::SEC_WEBSOCKET_ACCEPT;
-
-#[derive(Clone, Debug)]
-struct PeerInfo {
-    addr: SocketAddr,
-    last_pong: Instant,
-    username: String,
-    connected: bool, //whether we've received any packet from them
-}
+use od_nat_piercer::client::{handlers::handle_mode_line, networking::*, structures::PeerInfo};
 
 fn main() -> std::io::Result<()> {
-    //CLI arguments: signaling_ip, server, channel, user, local_port
     let args: Vec<String> = env::args().collect();
-    if args.len() < 7 {
+    if args.len() < 6 {
         eprintln!("Usage: client <signaling_ip> <server_id> <channel> <user> <local_port>");
         std::process::exit(1);
     }
 
     let signaling_ip = &args[1];
-    let server_id = &args[3];
-    let channel = &args[4];
-    let user = &args[5];
-    let local_port: u16 = args[6].parse().expect("Invalid port number");
+    let server_id = &args[2];
+    let channel = &args[3];
+    let user = &args[4];
+    let local_port: u16 = args[5].parse().expect("Invalid port number");
 
     //Socket UDP local
     let socket = UdpSocket::bind(("0.0.0.0", local_port))?;
@@ -49,24 +39,16 @@ fn main() -> std::io::Result<()> {
     let is_relay = Arc::new(Mutex::new(false));
     let relay_started = Arc::new(Mutex::new(false));
 
-    //Start sending heartbeat to server every 20s so server knows we're alive
-    {
-        let socket_clone = socket.try_clone()?;
-        let server_id = server_id.to_string();
-        let channel = channel.to_string();
-        let user = user.to_string();
-        let signaling_addr = signaling_addr.to_string();
+    //Start heartbeat to server every 20s so server knows we're alive
+    start_heartbeat(
+        socket.try_clone()?,
+        server_id.to_string(),
+        channel.to_string(),
+        user.to_string(),
+        signaling_addr.clone(),
+    );
 
-        thread::spawn(move || {
-            loop {
-                let hb = format!("HB {} {} {}", server_id, channel, user);
-                let _ = socket_clone.send_to(hb.as_bytes(), &signaling_addr);
-                thread::sleep(Duration::from_secs(20));
-            }
-        });
-    }
-
-    // 2. Aggregate server responses for a short window
+    //Agregate server responses for a short window
     let setup_deadline = Instant::now() + Duration::from_millis(1500);
     while Instant::now() < setup_deadline {
         match socket.recv_from(&mut buf) {
@@ -87,125 +69,22 @@ fn main() -> std::io::Result<()> {
         }
     }
 
-    // Start hole punching tasks for known peers
-    {
-        let peers_clone = Arc::clone(&peers);
-        let socket_clone = socket.try_clone()?;
-        thread::spawn(move || {
-            //We'll keep punching until peer.connected == true or timeout
-            loop {
-                {
-                    let guard = peers_clone.lock().unwrap();
-                    for p in guard.iter() {
-                        if !p.connected {
-                            if let Err(e) = socket_clone.send_to(b"HOLE_PUNCH", p.addr) {
-                                eprintln!("Failed to send punch to{}: {}", p.addr, e);
-                            } else {
-                                println!("Sent UDP punch to {} ({})", p.username, p.addr);
-                            }
-                        }
-                    }
-                }
-                thread::sleep(Duration::from_millis(500));
-            }
-            // }
-        });
-    }
+    //Start hole-punching tasks for knows peers
+    start_hole_punching(socket.try_clone()?, Arc::clone(&peers));
 
-    // 3. Relay keepalive thread starter
-    {
-        let socket_clone = socket.try_clone()?;
-        let peers_clone = Arc::clone(&peers);
-        let is_relay_clone = Arc::clone(&is_relay);
-        let relay_started_clone = Arc::clone(&relay_started);
+    //Relay keepalive thread starter
+    start_relay_keepalive(
+        socket.try_clone()?,
+        Arc::clone(&peers),
+        Arc::clone(&is_relay),
+        Arc::clone(&relay_started),
+        server_id.to_string(),
+        channel.to_string(),
+        signaling_addr.clone(),
+    );
 
-        //Clone the String so the thread owns them, otherwise i get a warning
-        let server_id = server_id.to_string();
-        let channel = channel.to_string();
-        let signaling_addr = signaling_addr.to_string();
-
-        thread::spawn(move || {
-            loop {
-                if *is_relay_clone.lock().unwrap() {
-                    let mut started = relay_started_clone.lock().unwrap();
-                    //Only start one relay loop
-                    if *started {
-                        thread::sleep(Duration::from_secs(1));
-                        continue;
-                    }
-                    *started = true;
-                    drop(started);
-                    println!("Starting relay keepalive thread");
-
-                    loop {
-                        let mut to_remove = Vec::new();
-                        {
-                            let mut guard = peers_clone.lock().unwrap();
-                            for (i, peer) in guard.iter_mut().enumerate() {
-                                if peer.last_pong.elapsed() > Duration::from_secs(60) {
-                                    println!(
-                                        "Peer {} timeout - reporting to server",
-                                        peer.username
-                                    );
-                                    let _ = socket_clone.send_to(
-                                        format!(
-                                            "PEER_TIMEOUT {} {} {}",
-                                            server_id, channel, peer.username
-                                        )
-                                        .as_bytes(),
-                                        &signaling_addr,
-                                    );
-                                    to_remove.push(i);
-                                } else {
-                                    if let Err(e) = socket_clone.send_to(b"PING", peer.addr) {
-                                        eprintln!("Failed to send PING to {}: {}", peer.addr, e);
-                                    }
-                                }
-                            }
-
-                            for &idx in to_remove.iter().rev() {
-                                guard.remove(idx);
-                            }
-                        }
-
-                        if !*is_relay_clone.lock().unwrap() {
-                            //we lost relay role
-                            *relay_started_clone.lock().unwrap() = false;
-                            break;
-                        }
-
-                        thread::sleep(Duration::from_secs(15));
-                    }
-                }
-                thread::sleep(Duration::from_millis(200));
-            }
-        });
-    }
-
-    // Thread for sending messages - test that users can comunicate with each other
-    {
-        let peers_clone = Arc::clone(&peers);
-        let socket_clone = socket.try_clone()?;
-        let username = user.to_string();
-
-        thread::spawn(move || {
-            use std::io::{self, BufRead};
-            let stdin = io::stdin();
-            for line in stdin.lock().lines() {
-                if let Ok(msg) = line {
-                    let msg = msg.trim();
-                    if msg.is_empty() {
-                        continue;
-                    }
-                    let payload = format!("DATA {} {}\n", username, msg);
-                    let peers_guard = peers_clone.lock().unwrap();
-                    for peer in peers_guard.iter() {
-                        let _ = socket_clone.send_to(payload.as_bytes(), peer.addr);
-                    }
-                }
-            }
-        });
-    }
+    //Thread for sending messages
+    start_user_input(socket.try_clone()?, Arc::clone(&peers), user.to_string());
 
     println!("Starting main message loop...");
     loop {
@@ -241,7 +120,6 @@ fn main() -> std::io::Result<()> {
                         }
                         "HOLE_PUNCH" => {
                             println!("Received hole punch from {}", src);
-                            //mark peer connected
                             let mut peers_guard = peers.lock().unwrap();
                             if let Some(peer) = peers_guard.iter_mut().find(|p| p.addr == src) {
                                 peer.connected = true;
@@ -250,7 +128,6 @@ fn main() -> std::io::Result<()> {
                         }
                         _ => {
                             if line.starts_with("DATA ") {
-                                //format: DATA <sender> <text>
                                 let parts: Vec<&str> = line.splitn(3, ' ').collect();
                                 if parts.len() >= 3 {
                                     let sender = parts[1];
@@ -265,8 +142,8 @@ fn main() -> std::io::Result<()> {
                                                     socket.send_to(line.as_bytes(), peer.addr)
                                                 {
                                                     eprintln!(
-                                                        "Failed to send data to user {}: {}",
-                                                        peer.username, e
+                                                        "Failed to send data to {}: {}",
+                                                        peer.addr, e
                                                     );
                                                 }
                                             }
@@ -288,63 +165,6 @@ fn main() -> std::io::Result<()> {
                 eprintln!("Error receiving: {}", e);
                 return Err(e);
             }
-        }
-    }
-
-    // unreachable
-    // Ok(())
-}
-
-fn handle_mode_line(
-    line: &str,
-    peers: &Arc<Mutex<Vec<PeerInfo>>>,
-    me: &str,
-    is_relay: &Arc<Mutex<bool>>,
-) {
-    let parts: Vec<&str> = line.split_whitespace().collect();
-    if parts.is_empty() {
-        return;
-    }
-
-    match parts[0] {
-        "MODE" if parts.len() >= 2 && parts[1] == "RELAY" => {
-            let mut r = is_relay.lock().unwrap();
-            if !*r {
-                *r = true;
-                println!("You are in RELAY MODE");
-            }
-        }
-        "MODE" if parts.len() >= 2 && parts[1] == "SERVER_RELAY" => {
-            println!("Server is currently being relay for the lone user.");
-        }
-        "MODE" if parts.len() >= 4 && parts[1] == "DIRECT" => {
-            let username = parts[2];
-            let addr_str = parts[3];
-            if let Ok(addr) = SocketAddr::from_str(addr_str) {
-                let mut guard = peers.lock().unwrap();
-                if username != me {
-                    if !guard.iter().any(|p| p.addr == addr) {
-                        guard.push(PeerInfo {
-                            addr,
-                            last_pong: Instant::now(),
-                            username: username.to_string(),
-                            connected: false,
-                        });
-                        println!("Added peer {} with addr {}", username, addr_str);
-                    }
-                } else {
-                    println!("Server confirms you ({}) are relay for {}", me, addr_str);
-                }
-            }
-        }
-        "USER_LEFT" if parts.len() >= 2 => {
-            let username = parts[1];
-            let mut guard = peers.lock().unwrap();
-            guard.retain(|p| p.username != username.to_string());
-            println!("[CLIENT:user] {} left, removed from list", username);
-        }
-        _ => {
-            println!("Unhandled control line: {}", line);
         }
     }
 }

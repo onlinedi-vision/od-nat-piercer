@@ -3,8 +3,8 @@ use std::{net::SocketAddr, sync::Arc};
 use tokio::{net::UdpSocket, sync::Mutex};
 
 use super::{
-    notifications_handler::handle_connect_notifications,
-    utils_handler::{add_new_user, update_existing_user},
+    notifications::handle_connect_notifications,
+    utils::{add_new_user, update_existing_user},
 };
 
 pub async fn handle_connect_message(

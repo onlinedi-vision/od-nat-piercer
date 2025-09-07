@@ -2,9 +2,7 @@ use crate::signaling::structures::ServerMap;
 use std::{net::SocketAddr, sync::Arc};
 use tokio::{net::UdpSocket, sync::Mutex};
 
-use super::{
-    notifications_handler::handle_disconnect_notifications, utils_handler::handle_user_removal,
-};
+use super::{notifications::handle_disconnect_notifications, utils::handle_user_removal};
 
 pub async fn handle_disconnect_message(
     parts: &[&str],

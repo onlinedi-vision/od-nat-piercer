@@ -3,10 +3,10 @@ use std::{net::SocketAddr, sync::Arc};
 use tokio::{net::UdpSocket, sync::Mutex};
 
 use super::{
-    connect_handler::handle_connect_message,
-    disconnect_handler::handle_disconnect_message,
-    heartbeat_handler::{handle_heartbeat, handle_pong},
-    notifications_handler::handle_peer_timeout,
+    connect::handle_connect_message,
+    disconnect::handle_disconnect_message,
+    heartbeat::{handle_heartbeat, handle_pong},
+    notifications::handle_peer_timeout,
 };
 
 pub async fn handle_message(

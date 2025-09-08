@@ -4,42 +4,150 @@ use std::{
     sync::{Arc, Mutex},
     thread,
     time::{Duration, Instant},
+    u8,
 };
 
-use od_nat_piercer::client::{handlers::handle_mode_line, networking::*, structures::PeerInfo};
+use od_nat_piercer::client::{handlers::*, networking::*, structures::PeerInfo};
 
-fn main() -> std::io::Result<()> {
-    let args: Vec<String> = env::args().collect();
+fn parse_arguments(args: Vec<String>) -> (String, String, String, String, u16) {
     if args.len() < 6 {
         eprintln!("Usage: client <signaling_ip> <server_id> <channel> <user> <local_port>");
         std::process::exit(1);
     }
 
-    let signaling_ip = &args[1];
-    let server_id = &args[2];
-    let channel = &args[3];
-    let user = &args[4];
+    let signaling_ip = args[1].clone();
+    let server_id = args[2].clone();
+    let channel = args[3].clone();
+    let user = args[4].clone();
     let local_port: u16 = args[5].parse().expect("Invalid port number");
 
+    (signaling_ip, server_id, channel, user, local_port)
+}
+
+fn setup_socket(local_port: u16) -> UdpSocket {
     //Socket UDP local
-    let socket = UdpSocket::bind(("0.0.0.0", local_port))?;
-    socket.set_nonblocking(true)?;
+    let socket = UdpSocket::bind(("0.0.0.0", local_port)).expect("Failed to bind socket");
+    socket
+        .set_nonblocking(true)
+        .expect("Failed to set non-blocking");
+
+    socket
+}
+
+fn send_connect_message(
+    socket: &UdpSocket,
+    signaling_addr: &str,
+    server_id: &str,
+    channel: &str,
+    user: &str,
+) {
+    let connect_msg = format!("CONNECT {} {} {}", server_id, channel, user);
+    socket
+        .send_to(connect_msg.as_bytes(), &signaling_addr)
+        .expect("Failed to send CONNECT");
+    println!("Sent CONNECT to signaling server");
+}
+
+fn process_server_response(
+    response: &str,
+    peers: &Arc<Mutex<Vec<PeerInfo>>>,
+    user: &str,
+    is_relay: &Arc<Mutex<bool>>,
+) {
+    println!("Server response:\n{}", response);
+    for line in response.lines() {
+        handle_mode_line(line.trim(), peers, user, is_relay);
+    }
+}
+
+fn handle_recv_result(
+    result: std::io::Result<(usize, std::net::SocketAddr)>,
+    buf: &mut [u8],
+    peers: &Arc<Mutex<Vec<PeerInfo>>>,
+    user: &str,
+    is_relay: &Arc<Mutex<bool>>,
+) -> bool {
+    match result {
+        Ok((len, _)) => {
+            let resp = String::from_utf8_lossy(&buf[..len]).to_string();
+            process_server_response(&resp, peers, user, is_relay);
+            true
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+            thread::sleep(Duration::from_millis(20));
+            true
+        }
+        Err(e) => {
+            eprintln!("recv error during setup: {}", e);
+            false
+        }
+    }
+}
+
+fn server_responses_during_setup(
+    socket: &UdpSocket,
+    peers: &Arc<Mutex<Vec<PeerInfo>>>,
+    user: &str,
+    is_relay: &Arc<Mutex<bool>>,
+) {
+    let mut buf = [0u8; 1024];
+    let setup_deadline = Instant::now() + Duration::from_millis(1500);
+
+    while Instant::now() < setup_deadline {
+        let recv_result = socket.recv_from(&mut buf);
+
+        if !handle_recv_result(recv_result, &mut buf, peers, user, is_relay) {
+            break;
+        }
+    }
+}
+
+fn main_loop(
+    socket: &UdpSocket,
+    peers: &Arc<Mutex<Vec<PeerInfo>>>,
+    user: String,
+    is_relay: &Arc<Mutex<bool>>,
+) -> std::io::Result<()> {
+    let mut buf = [0u8; 1024];
+
+    println!("Starting main message loop...");
+    loop {
+        match socket.recv_from(&mut buf) {
+            Ok((len, src)) => {
+                let message = String::from_utf8_lossy(&buf[..len]).to_string();
+
+                //If message comes from a peer addr, mark them as connected
+                handle_peer_message(&peers, src);
+                process_incoming_message(socket, &message, src, peers, &user, is_relay);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                thread::sleep(Duration::from_millis(50));
+            }
+            Err(e) => {
+                eprintln!("Error receiving: {}", e);
+                return Err(e);
+            }
+        }
+    }
+}
+
+fn main() -> std::io::Result<()> {
+    let args: Vec<String> = env::args().collect();
+    let (signaling_ip, server_id, channel, user, local_port) = parse_arguments(args);
+
+    let socket = setup_socket(local_port);
 
     //Address for the signalization server (UDP on port 5000)
     let signaling_addr = format!("{}:5000", signaling_ip);
 
-    //1. Send CONNECT
-    let connect_msg = format!("CONNECT {} {} {}", server_id, channel, user);
-    socket.send_to(connect_msg.as_bytes(), &signaling_addr)?;
-    println!("Sent CONNECT to signaling server");
+    send_connect_message(&socket, &signaling_addr, &server_id, &channel, &user);
 
-    let mut buf = [0u8; 1024];
     let peers: Vec<PeerInfo> = Vec::new();
     let peers = Arc::new(Mutex::new(peers));
+
     let is_relay = Arc::new(Mutex::new(false));
     let relay_started = Arc::new(Mutex::new(false));
 
-    //Start heartbeat to server every 20s so server knows we're alive
     start_heartbeat(
         socket.try_clone()?,
         server_id.to_string(),
@@ -48,28 +156,8 @@ fn main() -> std::io::Result<()> {
         signaling_addr.clone(),
     );
 
-    //Agregate server responses for a short window
-    let setup_deadline = Instant::now() + Duration::from_millis(1500);
-    while Instant::now() < setup_deadline {
-        match socket.recv_from(&mut buf) {
-            Ok((len, _)) => {
-                let resp = String::from_utf8_lossy(&buf[..len]).to_string();
-                println!("Server response:\n{}", resp);
-                for line in resp.lines() {
-                    handle_mode_line(line.trim(), &peers, user, &is_relay);
-                }
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                thread::sleep(Duration::from_millis(20));
-            }
-            Err(e) => {
-                eprintln!("recv error during setup: {}", e);
-                break;
-            }
-        }
-    }
+    server_responses_during_setup(&socket, &peers, &user, &is_relay);
 
-    //Start hole-punching tasks for knows peers
     start_hole_punching(socket.try_clone()?, Arc::clone(&peers));
 
     //Relay keepalive thread starter
@@ -86,85 +174,5 @@ fn main() -> std::io::Result<()> {
     //Thread for sending messages
     start_user_input(socket.try_clone()?, Arc::clone(&peers), user.to_string());
 
-    println!("Starting main message loop...");
-    loop {
-        match socket.recv_from(&mut buf) {
-            Ok((len, src)) => {
-                let message = String::from_utf8_lossy(&buf[..len]).to_string();
-                //If message comes from a peer addr, mark them as connected
-                {
-                    let mut guard = peers.lock().unwrap();
-                    if let Some(p) = guard.iter_mut().find(|p| p.addr == src) {
-                        p.last_pong = Instant::now();
-                        p.connected = true;
-                    }
-                }
-
-                for line in message.lines() {
-                    let line = line.trim();
-                    if line.is_empty() {
-                        continue;
-                    }
-                    match line {
-                        "PING" => {
-                            let _ = socket.send_to(b"PONG", src);
-                            println!("Received PING from {}, sent PONG", src);
-                        }
-                        "PONG" => {
-                            //update last_pong if this is a known peer
-                            let mut peers_guard = peers.lock().unwrap();
-                            if let Some(peer) = peers_guard.iter_mut().find(|p| p.addr == src) {
-                                peer.last_pong = Instant::now();
-                                println!("Received PONG from {}", peer.username);
-                            }
-                        }
-                        "HOLE_PUNCH" => {
-                            println!("Received hole punch from {}", src);
-                            let mut peers_guard = peers.lock().unwrap();
-                            if let Some(peer) = peers_guard.iter_mut().find(|p| p.addr == src) {
-                                peer.connected = true;
-                                peer.last_pong = Instant::now();
-                            }
-                        }
-                        _ => {
-                            if line.starts_with("DATA ") {
-                                let parts: Vec<&str> = line.splitn(3, ' ').collect();
-                                if parts.len() >= 3 {
-                                    let sender = parts[1];
-                                    let text = parts[2];
-                                    println!("[{}]: {}", sender, text);
-
-                                    if *is_relay.lock().unwrap() {
-                                        let peers_guard = peers.lock().unwrap();
-                                        for peer in peers_guard.iter() {
-                                            if peer.username != sender {
-                                                if let Err(e) =
-                                                    socket.send_to(line.as_bytes(), peer.addr)
-                                                {
-                                                    eprintln!(
-                                                        "Failed to send data to {}: {}",
-                                                        peer.addr, e
-                                                    );
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            } else {
-                                //Handle control messages: MODE / USER_LEFT
-                                handle_mode_line(line, &peers, user, &is_relay);
-                            }
-                        }
-                    }
-                }
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                thread::sleep(Duration::from_millis(50));
-            }
-            Err(e) => {
-                eprintln!("Error receiving: {}", e);
-                return Err(e);
-            }
-        }
-    }
+    main_loop(&socket, &peers, user, &is_relay)
 }

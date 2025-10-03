@@ -1,7 +1,6 @@
-FROM alpine:3.22.1
+FROM rust:slim-trixie AS builder
 
-LABEL org.opencontainers.image.source=https://github.com/rust-lang/docker-rust
-
+LABEL maintainer=kickhead13<ana.alexandru.gabriel@proton.me>
 RUN apk add --no-cache \
         ca-certificates \
         gcc \
@@ -10,10 +9,7 @@ RUN apk add --no-cache \
 	cargo
 
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs 
-
-COPY ./src ./src
-COPY ./Cargo.toml ./Cargo.toml
-
+COPY . .
 RUN cargo build --release
 
-CMD ["./target/release/od_nat_piercer"]
+ENTRYPOINT ["./target/release/signaling_server"]

@@ -15,12 +15,12 @@ pipeline {
 		  	sh 'docker compose build'
      	 }
 	  }
-   	 stage('Docker Run') {
+   	stage('Docker Run') {
 		 steps {
         		sh 'docker compose up -d'
 					}
-			}
 		}
-		}
-  }
+	}
 }
+
+

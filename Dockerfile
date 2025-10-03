@@ -1,4 +1,4 @@
-FROM rust:slim-trixie AS builder
+FROM rust:1.90-trixie AS builder
 
 LABEL maintainer=kickhead13<ana.alexandru.gabriel@proton.me>
 

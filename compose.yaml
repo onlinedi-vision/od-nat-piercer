@@ -1,5 +1,5 @@
 services:
-  od-official-server:
+  od-nat-piercer:
     build: .
     ports: 
       - "0.0.0.0:5000:5000"

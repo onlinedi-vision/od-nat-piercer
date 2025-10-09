@@ -7,7 +7,7 @@ use tokio::sync::Mutex;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let socket = UdpSocket::bind("127.0.0.1:5000").await?;
+    let socket = UdpSocket::bind("0.0.0.0:5000").await?;
     println!("Signaling server listening on 0.0.0.0:5000");
 
     let socket = Arc::new(socket);

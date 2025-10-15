@@ -14,7 +14,9 @@ fn handle_mode_relay(is_relay: &Arc<Mutex<bool>>) {
     }
 }
 
-fn handle_mode_server_relay() {
+fn handle_mode_server_relay(server_relay_enabled: &Arc<Mutex<bool>>) {
+    let mut s = server_relay_enabled.lock().unwrap();
+    *s = true;
     println!("Server is currently being relay for the lone user.");
 }
 
@@ -30,6 +32,7 @@ fn handle_mode_direct(parts: &[&str], peers: &Arc<Mutex<Vec<PeerInfo>>>, me: &st
                     last_pong: Instant::now(),
                     username: username.to_string(),
                     connected: false,
+                    created_at: Instant::now(),
                 });
                 println!("Added peer {} with addr {}", username, addr_str);
             }
@@ -57,6 +60,7 @@ pub fn handle_mode_line(
     peers: &Arc<Mutex<Vec<PeerInfo>>>,
     me: &str,
     is_relay: &Arc<Mutex<bool>>,
+    server_relay_enabled: &Arc<Mutex<bool>>,
 ) {
     let parts: Vec<&str> = line.split_whitespace().collect();
     if parts.is_empty() {
@@ -66,7 +70,14 @@ pub fn handle_mode_line(
     match parts[0] {
         "MODE" if parts.len() >= 2 => match parts[1] {
             "RELAY" => handle_mode_relay(is_relay),
-            "SERVER_RELAY" => handle_mode_server_relay(),
+            "SERVER_RELAY" => {
+                if parts.len() >= 3 {
+                    let username = parts[2];
+                    handle_mode_server_relay_for(username, me, server_relay_enabled)
+                } else {
+                    handle_mode_server_relay(server_relay_enabled);
+                }
+            }
             "DIRECT" if parts.len() >= 4 => handle_mode_direct(&parts, peers, me),
             _ => handle_unrecognized_command(line),
         },
@@ -88,12 +99,18 @@ pub fn handle_pong(peers: &Arc<Mutex<Vec<PeerInfo>>>, src: std::net::SocketAddr)
     }
 }
 
-pub fn handle_hole_punch(peers: &Arc<Mutex<Vec<PeerInfo>>>, src: std::net::SocketAddr) {
+pub fn handle_hole_punch(
+    peers: &Arc<Mutex<Vec<PeerInfo>>>,
+    src: std::net::SocketAddr,
+    is_relay: &Arc<Mutex<bool>>,
+) {
     println!("Received hole punch from {}", src);
     let mut peers_guard = peers.lock().unwrap();
     if let Some(peer) = peers_guard.iter_mut().find(|p| p.addr == src) {
         peer.connected = true;
         peer.last_pong = Instant::now();
+    } else {
+        println!("Hole punch received from unknown peer: {}", src);
     }
 }
 
@@ -118,6 +135,8 @@ pub fn handle_data_message(
     line: &str,
     peers: &Arc<Mutex<Vec<PeerInfo>>>,
     is_relay: &Arc<Mutex<bool>>,
+    server_relay_enabled: &Arc<Mutex<bool>>,
+    signaling_addr: &str,
 ) {
     if line.starts_with("DATA ") {
         let parts: Vec<&str> = line.splitn(3, ' ').collect();
@@ -128,6 +147,8 @@ pub fn handle_data_message(
 
             if *is_relay.lock().unwrap() {
                 handle_relay_message_to_peers(socket, peers, sender, line);
+            } else if *server_relay_enabled.lock().unwrap() {
+                let _ = socket.send_to(line.as_bytes(), signaling_addr);
             }
         }
     }
@@ -141,6 +162,20 @@ pub fn handle_peer_message(peers: &Arc<Mutex<Vec<PeerInfo>>>, src: std::net::Soc
     }
 }
 
+pub fn handle_mode_server_relay_for(
+    username: &str,
+    me: &str,
+    server_relay_flag: &Arc<Mutex<bool>>,
+) {
+    if username == me {
+        let mut flag = server_relay_flag.lock().unwrap();
+        *flag = true;
+        println!("Server will relay my traffic now: {}", me);
+    } else {
+        println!("Server will relay for user {}", username);
+    }
+}
+
 pub fn process_incoming_message(
     socket: &UdpSocket,
     message: &str,
@@ -148,6 +183,8 @@ pub fn process_incoming_message(
     peers: &Arc<Mutex<Vec<PeerInfo>>>,
     user: &str,
     is_relay: &Arc<Mutex<bool>>,
+    server_relay_enabled: &Arc<Mutex<bool>>,
+    signaling_addr: &str,
 ) {
     for line in message.lines() {
         let line = line.trim();
@@ -157,13 +194,20 @@ pub fn process_incoming_message(
         match line {
             "PING" => handle_ping(socket, src),
             "PONG" => handle_pong(peers, src),
-            "HOLE_PUNCH" => handle_hole_punch(peers, src),
+            "HOLE_PUNCH" => handle_hole_punch(peers, src, is_relay),
             _ => {
                 if line.starts_with("DATA ") {
-                    handle_data_message(socket, line, peers, is_relay);
+                    handle_data_message(
+                        socket,
+                        line,
+                        peers,
+                        is_relay,
+                        server_relay_enabled,
+                        signaling_addr,
+                    );
                 } else {
                     //Handle control messages: MODE / USER_LEFT
-                    handle_mode_line(line, peers, user, is_relay);
+                    handle_mode_line(line, peers, user, is_relay, server_relay_enabled);
                 }
             }
         }

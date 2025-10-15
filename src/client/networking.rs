@@ -78,6 +78,7 @@ fn relay_main_loop(
     server_id: &str,
     channel: &str,
     signaling_addr: &str,
+    server_relay_enabled: &Arc<Mutex<bool>>,
 ) {
     loop {
         let mut to_remove = Vec::new();
@@ -91,6 +92,21 @@ fn relay_main_loop(
                     if let Err(e) = socket.send_to(b"PING", peer.addr) {
                         eprintln!("Failed to send PING to {}: {}", peer.addr, e);
                     }
+
+                    if !peer.connected && peer.created_at.elapsed() > Duration::from_secs(5) {
+                        println!(
+                            "Peer {} not connected after 5s - requesting server relay",
+                            peer.username
+                        );
+                        let _ = socket.send_to(
+                            format!(
+                                "REQUEST_RELAY {} {} {}\n",
+                                server_id, channel, peer.username
+                            )
+                            .as_bytes(),
+                            signaling_addr,
+                        );
+                    }
                 }
             }
 
@@ -99,8 +115,8 @@ fn relay_main_loop(
             }
         }
 
-        if !*is_relay.lock().unwrap() {
-            //we lost relay role
+        if !*is_relay.lock().unwrap() && !*server_relay_enabled.lock().unwrap() {
+            println!("Relay role lost, stopping relay loop.");
             *relay_started.lock().unwrap() = false;
             break;
         }
@@ -117,9 +133,10 @@ fn relay_keepalive_loop(
     server_id: String,
     channel: String,
     signaling_addr: String,
+    server_relay_enabled: Arc<Mutex<bool>>,
 ) {
     loop {
-        if *is_relay.lock().unwrap() {
+        if *is_relay.lock().unwrap() || *server_relay_enabled.lock().unwrap() {
             let mut started = relay_started.lock().unwrap();
             //Only start one relay loop
             if *started {
@@ -138,6 +155,7 @@ fn relay_keepalive_loop(
                 &server_id,
                 &channel,
                 &signaling_addr,
+                &server_relay_enabled,
             );
         }
         thread::sleep(Duration::from_millis(200));
@@ -152,6 +170,7 @@ pub fn start_relay_keepalive(
     server_id: String,
     channel: String,
     signaling_addr: String,
+    server_relay_enabled: Arc<Mutex<bool>>,
 ) {
     thread::spawn(move || {
         relay_keepalive_loop(
@@ -162,6 +181,7 @@ pub fn start_relay_keepalive(
             server_id,
             channel,
             signaling_addr,
+            server_relay_enabled,
         );
     });
 }
@@ -171,15 +191,28 @@ fn handle_user_message(
     peers: &Arc<Mutex<Vec<PeerInfo>>>,
     username: &str,
     message: &str,
+    server_relay_enabled: bool,
+    signaling_addr: &str,
 ) {
     let payload = format!("DATA {} {}\n", username, message);
-    let peers_guard = peers.lock().unwrap();
-    for peer in peers_guard.iter() {
-        let _ = socket.send_to(payload.as_bytes(), peer.addr);
+    if server_relay_enabled {
+        println!("Sending DATA via server relay: {}", message);
+        let _ = socket.send_to(payload.as_bytes(), signaling_addr);
+    } else {
+        let peers_guard = peers.lock().unwrap();
+        for peer in peers_guard.iter() {
+            let _ = socket.send_to(payload.as_bytes(), peer.addr);
+        }
     }
 }
 
-fn user_input_loop(socket: UdpSocket, peers: Arc<Mutex<Vec<PeerInfo>>>, username: String) {
+fn user_input_loop(
+    socket: UdpSocket,
+    peers: Arc<Mutex<Vec<PeerInfo>>>,
+    username: String,
+    server_relay_enabled: Arc<Mutex<bool>>,
+    signaling_addr: String,
+) {
     use std::io::{self, BufRead};
     let stdin = io::stdin();
     for line in stdin.lock().lines() {
@@ -188,13 +221,26 @@ fn user_input_loop(socket: UdpSocket, peers: Arc<Mutex<Vec<PeerInfo>>>, username
             if msg.is_empty() {
                 continue;
             }
-            handle_user_message(&socket, &peers, &username, msg);
+            let relay_flag = *server_relay_enabled.lock().unwrap();
+            handle_user_message(&socket, &peers, &username, msg, relay_flag, &signaling_addr);
         }
     }
 }
 
-pub fn start_user_input(socket: UdpSocket, peers: Arc<Mutex<Vec<PeerInfo>>>, username: String) {
+pub fn start_user_input(
+    socket: UdpSocket,
+    peers: Arc<Mutex<Vec<PeerInfo>>>,
+    username: String,
+    server_relay_enabled: Arc<Mutex<bool>>,
+    signaling_addr: String,
+) {
     thread::spawn(move || {
-        user_input_loop(socket, peers, username);
+        user_input_loop(
+            socket,
+            peers,
+            username,
+            server_relay_enabled,
+            signaling_addr,
+        );
     });
 }

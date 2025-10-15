@@ -7,4 +7,6 @@ pub struct PeerInfo {
     pub last_pong: Instant,
     pub username: String,
     pub connected: bool,
+
+    pub created_at: Instant,
 }

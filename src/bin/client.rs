@@ -53,10 +53,11 @@ fn process_server_response(
     peers: &Arc<Mutex<Vec<PeerInfo>>>,
     user: &str,
     is_relay: &Arc<Mutex<bool>>,
+    server_relay_enabled: &Arc<Mutex<bool>>,
 ) {
     println!("Server response:\n{}", response);
     for line in response.lines() {
-        handle_mode_line(line.trim(), peers, user, is_relay);
+        handle_mode_line(line.trim(), peers, user, is_relay, server_relay_enabled);
     }
 }
 
@@ -66,11 +67,12 @@ fn handle_recv_result(
     peers: &Arc<Mutex<Vec<PeerInfo>>>,
     user: &str,
     is_relay: &Arc<Mutex<bool>>,
+    server_relay_enabled: &Arc<Mutex<bool>>,
 ) -> bool {
     match result {
         Ok((len, _)) => {
             let resp = String::from_utf8_lossy(&buf[..len]).to_string();
-            process_server_response(&resp, peers, user, is_relay);
+            process_server_response(&resp, peers, user, is_relay, server_relay_enabled);
             true
         }
         Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
@@ -89,6 +91,7 @@ fn server_responses_during_setup(
     peers: &Arc<Mutex<Vec<PeerInfo>>>,
     user: &str,
     is_relay: &Arc<Mutex<bool>>,
+    server_relay_enabled: &Arc<Mutex<bool>>,
 ) {
     let mut buf = [0u8; 1024];
     let setup_deadline = Instant::now() + Duration::from_millis(1500);
@@ -96,7 +99,14 @@ fn server_responses_during_setup(
     while Instant::now() < setup_deadline {
         let recv_result = socket.recv_from(&mut buf);
 
-        if !handle_recv_result(recv_result, &mut buf, peers, user, is_relay) {
+        if !handle_recv_result(
+            recv_result,
+            &mut buf,
+            peers,
+            user,
+            is_relay,
+            server_relay_enabled,
+        ) {
             break;
         }
     }
@@ -107,6 +117,8 @@ fn main_loop(
     peers: &Arc<Mutex<Vec<PeerInfo>>>,
     user: String,
     is_relay: &Arc<Mutex<bool>>,
+    server_relay_enabled: &Arc<Mutex<bool>>,
+    signaling_addr: &str,
 ) -> std::io::Result<()> {
     let mut buf = [0u8; 1024];
 
@@ -118,7 +130,16 @@ fn main_loop(
 
                 //If message comes from a peer addr, mark them as connected
                 handle_peer_message(&peers, src);
-                process_incoming_message(socket, &message, src, peers, &user, is_relay);
+                process_incoming_message(
+                    socket,
+                    &message,
+                    src,
+                    peers,
+                    &user,
+                    is_relay,
+                    server_relay_enabled,
+                    signaling_addr,
+                );
             }
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                 thread::sleep(Duration::from_millis(50));
@@ -147,6 +168,7 @@ fn main() -> std::io::Result<()> {
 
     let is_relay = Arc::new(Mutex::new(false));
     let relay_started = Arc::new(Mutex::new(false));
+    let server_relay_enabled = Arc::new(Mutex::new(false));
 
     start_heartbeat(
         socket.try_clone()?,
@@ -156,7 +178,7 @@ fn main() -> std::io::Result<()> {
         signaling_addr.clone(),
     );
 
-    server_responses_during_setup(&socket, &peers, &user, &is_relay);
+    server_responses_during_setup(&socket, &peers, &user, &is_relay, &server_relay_enabled);
 
     start_hole_punching(socket.try_clone()?, Arc::clone(&peers));
 
@@ -169,10 +191,24 @@ fn main() -> std::io::Result<()> {
         server_id.to_string(),
         channel.to_string(),
         signaling_addr.clone(),
+        Arc::clone(&server_relay_enabled),
     );
 
     //Thread for sending messages
-    start_user_input(socket.try_clone()?, Arc::clone(&peers), user.to_string());
+    start_user_input(
+        socket.try_clone()?,
+        Arc::clone(&peers),
+        user.to_string(),
+        Arc::clone(&server_relay_enabled),
+        signaling_addr.clone(),
+    );
 
-    main_loop(&socket, &peers, user, &is_relay)
+    main_loop(
+        &socket,
+        &peers,
+        user,
+        &is_relay,
+        &server_relay_enabled,
+        &signaling_addr,
+    )
 }

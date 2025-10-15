@@ -1,4 +1,8 @@
-use std::{collections::HashMap, net::SocketAddr, time::Instant};
+use std::{
+    collections::{HashMap, HashSet},
+    net::SocketAddr,
+    time::Instant,
+};
 
 #[derive(Clone, Debug)]
 pub struct User {
@@ -11,6 +15,8 @@ pub struct User {
 pub struct Channel {
     pub users: Vec<User>,
     pub relay: Option<String>,
+
+    pub need_server_relay: HashSet<String>,
 }
 
 pub type ServerMap = HashMap<String, HashMap<String, Channel>>;

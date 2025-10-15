@@ -7,6 +7,7 @@ use super::{
     disconnect::handle_disconnect_message,
     heartbeat::{handle_heartbeat, handle_pong},
     notifications::handle_peer_timeout,
+    request_relay::{handle_data_from_client, handle_relay_request},
 };
 
 pub async fn handle_message(
@@ -39,6 +40,14 @@ pub async fn handle_message(
 
             "PEER_TIMEOUT" if parts.len() >= 4 => {
                 handle_peer_timeout(&parts, src, socket, state).await;
+            }
+
+            "REQUEST_RELAY" if parts.len() >= 4 => {
+                handle_relay_request(&parts, src, socket, state).await;
+            }
+
+            "DATA" if parts.len() >= 3 => {
+                handle_data_from_client(&msg, src, socket, state).await;
             }
 
             _ => {

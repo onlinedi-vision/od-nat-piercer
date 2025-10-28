@@ -14,12 +14,6 @@ fn handle_mode_relay(is_relay: &Arc<Mutex<bool>>) {
     }
 }
 
-fn handle_mode_server_relay(server_relay_enabled: &Arc<Mutex<bool>>) {
-    let mut s = server_relay_enabled.lock().unwrap();
-    *s = true;
-    println!("Server is currently being relay for the lone user.");
-}
-
 fn handle_mode_direct(parts: &[&str], peers: &Arc<Mutex<Vec<PeerInfo>>>, me: &str) {
     let username = parts[2];
     let addr_str = parts[3];
@@ -33,6 +27,8 @@ fn handle_mode_direct(parts: &[&str], peers: &Arc<Mutex<Vec<PeerInfo>>>, me: &st
                     username: username.to_string(),
                     connected: false,
                     created_at: Instant::now(),
+                    use_server_relay: false,
+                    relay_requested: false,
                 });
                 println!("Added peer {} with addr {}", username, addr_str);
             }
@@ -60,7 +56,7 @@ pub fn handle_mode_line(
     peers: &Arc<Mutex<Vec<PeerInfo>>>,
     me: &str,
     is_relay: &Arc<Mutex<bool>>,
-    server_relay_enabled: &Arc<Mutex<bool>>,
+    channel_has_server_relays: &Arc<Mutex<bool>>,
 ) {
     let parts: Vec<&str> = line.split_whitespace().collect();
     if parts.is_empty() {
@@ -70,14 +66,41 @@ pub fn handle_mode_line(
     match parts[0] {
         "MODE" if parts.len() >= 2 => match parts[1] {
             "RELAY" => handle_mode_relay(is_relay),
+
             "SERVER_RELAY" => {
                 if parts.len() >= 3 {
                     let username = parts[2];
-                    handle_mode_server_relay_for(username, me, server_relay_enabled)
+
+                    // if the server is relaying for 'me', i must send to server
+                    if username == me {
+                        // we'll set a global flag in bin/process_server_response
+                        println!("Server will relay my traffic now: {}", me);
+                    } else {
+                        // if i am the RELAY, note that the channel has server-relayed peers
+                        if *is_relay.lock().unwrap() {
+                            let mut f = channel_has_server_relays.lock().unwrap();
+                            if !*f {
+                                *f = true;
+                                println!("Relay: channel has server-relayed peers.");
+                            }
+                        } else {
+                            println!("Server will relay for user: {}", username);
+                        }
+
+                        //mark that peer as server-relayed to stop punching it
+                        let mut guard = peers.lock().unwrap();
+                        if let Some(peer) = guard.iter_mut().find(|p| p.username == username) {
+                            peer.use_server_relay = true;
+                            peer.connected = true; // stop punching
+                            peer.relay_requested = true;
+                        }
+                    }
                 } else {
-                    handle_mode_server_relay(server_relay_enabled);
+                    // just a lone user :(
+                    println!("Server is currently being relay for the lone user.");
                 }
             }
+
             "DIRECT" if parts.len() >= 4 => handle_mode_direct(&parts, peers, me),
             _ => handle_unrecognized_command(line),
         },
@@ -99,16 +122,19 @@ pub fn handle_pong(peers: &Arc<Mutex<Vec<PeerInfo>>>, src: std::net::SocketAddr)
     }
 }
 
-pub fn handle_hole_punch(
-    peers: &Arc<Mutex<Vec<PeerInfo>>>,
-    src: std::net::SocketAddr,
-    is_relay: &Arc<Mutex<bool>>,
-) {
+pub fn handle_hole_punch(peers: &Arc<Mutex<Vec<PeerInfo>>>, src: std::net::SocketAddr) {
     println!("Received hole punch from {}", src);
     let mut peers_guard = peers.lock().unwrap();
     if let Some(peer) = peers_guard.iter_mut().find(|p| p.addr == src) {
+        let was_connected = peer.connected;
         peer.connected = true;
         peer.last_pong = Instant::now();
+        if !was_connected {
+            println!(
+                "Peer {} is now CONNECTED (punch) at {}.",
+                peer.username, peer.addr
+            );
+        }
     } else {
         println!("Hole punch received from unknown peer: {}", src);
     }
@@ -135,7 +161,7 @@ pub fn handle_data_message(
     line: &str,
     peers: &Arc<Mutex<Vec<PeerInfo>>>,
     is_relay: &Arc<Mutex<bool>>,
-    server_relay_enabled: &Arc<Mutex<bool>>,
+    channel_has_server_relays: &Arc<Mutex<bool>>,
     signaling_addr: &str,
 ) {
     if line.starts_with("DATA ") {
@@ -145,10 +171,20 @@ pub fn handle_data_message(
             let text = parts[2];
             println!("[{}]: {}", sender, text);
 
+            //NO MATTER THE SOURCE, we've observed sender activity
+            mark_peer_connected_by_name(peers, sender);
+
             if *is_relay.lock().unwrap() {
+                // 1) transmit to peers
                 handle_relay_message_to_peers(socket, peers, sender, line);
-            } else if *server_relay_enabled.lock().unwrap() {
-                let _ = socket.send_to(line.as_bytes(), signaling_addr);
+
+                // 2) mirror to server only if the channel has server-relayed users
+                if *channel_has_server_relays.lock().unwrap() {
+                    let _ = socket.send_to(line.as_bytes(), signaling_addr);
+                }
+            } else {
+                // non-relay receiving data does not forward further
+                // if this non-relay is symmetric and has to send via server, that's handled in networking.rs
             }
         }
     }
@@ -157,8 +193,16 @@ pub fn handle_data_message(
 pub fn handle_peer_message(peers: &Arc<Mutex<Vec<PeerInfo>>>, src: std::net::SocketAddr) {
     let mut guard = peers.lock().unwrap();
     if let Some(p) = guard.iter_mut().find(|p| p.addr == src) {
+        let was_connected = p.connected;
         p.last_pong = Instant::now();
         p.connected = true;
+
+        if !was_connected {
+            println!(
+                "Peer {} is now CONNECTED (direct) at {}.",
+                p.username, p.addr
+            );
+        }
     }
 }
 
@@ -173,6 +217,22 @@ pub fn handle_mode_server_relay_for(
         println!("Server will relay my traffic now: {}", me);
     } else {
         println!("Server will relay for user {}", username);
+    }
+}
+
+// we will call this function when DATA sender... is seen (even received from the server)
+fn mark_peer_connected_by_name(peers: &Arc<Mutex<Vec<PeerInfo>>>, name: &str) {
+    let mut guard = peers.lock().unwrap();
+    if let Some(peer) = guard.iter_mut().find(|p| p.username == name) {
+        let was_connected = peer.connected;
+        peer.connected = true;
+        peer.last_pong = Instant::now();
+        if !was_connected {
+            println!(
+                "Peer {} is now CONNECTED (via server) at {}.",
+                peer.username, peer.addr
+            );
+        }
     }
 }
 
@@ -194,7 +254,7 @@ pub fn process_incoming_message(
         match line {
             "PING" => handle_ping(socket, src),
             "PONG" => handle_pong(peers, src),
-            "HOLE_PUNCH" => handle_hole_punch(peers, src, is_relay),
+            "HOLE_PUNCH" => handle_hole_punch(peers, src),
             _ => {
                 if line.starts_with("DATA ") {
                     handle_data_message(

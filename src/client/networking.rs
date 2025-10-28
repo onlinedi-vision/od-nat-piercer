@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::net::UdpSocket;
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -31,28 +32,50 @@ pub fn start_heartbeat(
     });
 }
 
-fn hole_punching_loop(socket: UdpSocket, peers: Arc<Mutex<Vec<PeerInfo>>>) {
+fn hole_punching_loop(
+    socket: UdpSocket,
+    peers: Arc<Mutex<Vec<PeerInfo>>>,
+    send_via_server: Arc<Mutex<bool>>,
+) {
+    let mut backoff: HashMap<String, u64> = HashMap::new(); //username -> ms
+
     loop {
+        if *send_via_server.lock().unwrap() {
+            // i'm symmetric; i'll use server, no need to punch
+            thread::sleep(Duration::from_millis(500));
+            continue;
+        }
+
         {
             let guard = peers.lock().unwrap();
             for p in guard.iter() {
-                if !p.connected {
-                    if let Err(e) = socket.send_to(b"HOLE_PUNCH", p.addr) {
-                        eprintln!("Failed to send punch to{}: {}", p.addr, e);
-                    } else {
-                        println!("Sent UDP punch to {} ({})", p.username, p.addr);
-                    }
+                if p.connected || p.use_server_relay {
+                    continue; //don't punch server-relayed peers
                 }
+
+                if let Err(e) = socket.send_to(b"HOLE_PUNCH", p.addr) {
+                    eprintln!("Failed to send punch to{}: {}", p.addr, e);
+                } else {
+                    println!("Sent UDP punch to {} ({})", p.username, p.addr);
+                }
+
+                let entry = backoff.entry(p.username.clone()).or_insert(500);
+                *entry = (*entry).saturating_mul(2).min(3000);
             }
         }
-        thread::sleep(Duration::from_millis(500));
+
+        let sleep_ms = backoff.values().min().copied().unwrap_or(500);
+        thread::sleep(Duration::from_millis(sleep_ms));
     }
 }
 
-pub fn start_hole_punching(socket: UdpSocket, peers: Arc<Mutex<Vec<PeerInfo>>>) {
+pub fn start_hole_punching(
+    socket: UdpSocket,
+    peers: Arc<Mutex<Vec<PeerInfo>>>,
+    send_via_server: Arc<Mutex<bool>>,
+) {
     thread::spawn(move || {
-        //We'll keep punching until peer.connected == true or timeout
-        hole_punching_loop(socket, peers);
+        hole_punching_loop(socket, peers, send_via_server);
     });
 }
 
@@ -78,7 +101,7 @@ fn relay_main_loop(
     server_id: &str,
     channel: &str,
     signaling_addr: &str,
-    server_relay_enabled: &Arc<Mutex<bool>>,
+    channel_has_server_relays: &Arc<Mutex<bool>>,
 ) {
     loop {
         let mut to_remove = Vec::new();
@@ -115,7 +138,7 @@ fn relay_main_loop(
             }
         }
 
-        if !*is_relay.lock().unwrap() && !*server_relay_enabled.lock().unwrap() {
+        if !*is_relay.lock().unwrap() && !*channel_has_server_relays.lock().unwrap() {
             println!("Relay role lost, stopping relay loop.");
             *relay_started.lock().unwrap() = false;
             break;
@@ -133,10 +156,10 @@ fn relay_keepalive_loop(
     server_id: String,
     channel: String,
     signaling_addr: String,
-    server_relay_enabled: Arc<Mutex<bool>>,
+    channel_has_server_relays: Arc<Mutex<bool>>,
 ) {
     loop {
-        if *is_relay.lock().unwrap() || *server_relay_enabled.lock().unwrap() {
+        if *is_relay.lock().unwrap() || *channel_has_server_relays.lock().unwrap() {
             let mut started = relay_started.lock().unwrap();
             //Only start one relay loop
             if *started {
@@ -155,7 +178,7 @@ fn relay_keepalive_loop(
                 &server_id,
                 &channel,
                 &signaling_addr,
-                &server_relay_enabled,
+                &channel_has_server_relays,
             );
         }
         thread::sleep(Duration::from_millis(200));
@@ -191,11 +214,11 @@ fn handle_user_message(
     peers: &Arc<Mutex<Vec<PeerInfo>>>,
     username: &str,
     message: &str,
-    server_relay_enabled: bool,
+    send_via_server: bool,
     signaling_addr: &str,
 ) {
     let payload = format!("DATA {} {}\n", username, message);
-    if server_relay_enabled {
+    if send_via_server {
         println!("Sending DATA via server relay: {}", message);
         let _ = socket.send_to(payload.as_bytes(), signaling_addr);
     } else {
@@ -210,7 +233,7 @@ fn user_input_loop(
     socket: UdpSocket,
     peers: Arc<Mutex<Vec<PeerInfo>>>,
     username: String,
-    server_relay_enabled: Arc<Mutex<bool>>,
+    send_via_server: Arc<Mutex<bool>>,
     signaling_addr: String,
 ) {
     use std::io::{self, BufRead};
@@ -221,8 +244,8 @@ fn user_input_loop(
             if msg.is_empty() {
                 continue;
             }
-            let relay_flag = *server_relay_enabled.lock().unwrap();
-            handle_user_message(&socket, &peers, &username, msg, relay_flag, &signaling_addr);
+            let s = *send_via_server.lock().unwrap();
+            handle_user_message(&socket, &peers, &username, msg, s, &signaling_addr);
         }
     }
 }
@@ -231,16 +254,10 @@ pub fn start_user_input(
     socket: UdpSocket,
     peers: Arc<Mutex<Vec<PeerInfo>>>,
     username: String,
-    server_relay_enabled: Arc<Mutex<bool>>,
+    send_via_server: Arc<Mutex<bool>>,
     signaling_addr: String,
 ) {
     thread::spawn(move || {
-        user_input_loop(
-            socket,
-            peers,
-            username,
-            server_relay_enabled,
-            signaling_addr,
-        );
+        user_input_loop(socket, peers, username, send_via_server, signaling_addr);
     });
 }

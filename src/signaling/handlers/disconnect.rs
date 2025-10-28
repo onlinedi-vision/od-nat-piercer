@@ -26,6 +26,9 @@ pub async fn handle_disconnect_message(
         lone_user_addr,
         &user_name,
         socket,
+        &Arc::clone(&state),
+        server_id,
+        channel_name,
     )
     .await;
 }

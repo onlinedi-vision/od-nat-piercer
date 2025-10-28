@@ -193,7 +193,7 @@ pub fn start_relay_keepalive(
     server_id: String,
     channel: String,
     signaling_addr: String,
-    server_relay_enabled: Arc<Mutex<bool>>,
+    channel_has_server_relays: Arc<Mutex<bool>>,
 ) {
     thread::spawn(move || {
         relay_keepalive_loop(
@@ -204,7 +204,7 @@ pub fn start_relay_keepalive(
             server_id,
             channel,
             signaling_addr,
-            server_relay_enabled,
+            channel_has_server_relays,
         );
     });
 }

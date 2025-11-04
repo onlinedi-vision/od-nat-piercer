@@ -47,6 +47,7 @@ pub async fn create_new_user(user_name: &str, src_addr: SocketAddr) -> User {
         name: user_name.to_string(),
         addr: src_addr,
         last_pong: Instant::now(),
+        needs_server_relay: false,
     }
 }
 

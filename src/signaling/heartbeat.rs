@@ -10,7 +10,7 @@ fn pick_eligible_relay(channel: &Channel) -> Option<User> {
     channel
         .users
         .iter()
-        .find(|u| !channel.need_server_relay.contains(&u.name))
+        .find(|u| !u.needs_server_relay)
         .cloned()
 }
 
@@ -154,7 +154,7 @@ fn process_channel_heartbeat(
     if channel.users.len() == 1 {
         //one lone user, if he's eligible, we keep him as relay, otherwise the server remains relay
         let solo = channel.users[0].clone();
-        let is_eligible = !channel.need_server_relay.contains(&solo.name);
+        let is_eligible = !solo.needs_server_relay;
 
         if is_eligible {
             pings.push(solo.addr);

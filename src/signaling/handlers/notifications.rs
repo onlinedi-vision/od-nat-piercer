@@ -7,7 +7,7 @@ fn pick_eligible_relay(channel: &Channel) -> Option<User> {
     channel
         .users
         .iter()
-        .find(|u| !channel.need_server_relay.contains(&u.name))
+        .find(|u| !u.needs_server_relay)
         .cloned()
 }
 

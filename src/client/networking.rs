@@ -1,10 +1,18 @@
 use std::collections::HashMap;
 use std::net::UdpSocket;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
-use crate::client::structures::PeerInfo;
+use crate::client::structures::{PeerInfo, PunchSync, RelaySync};
+
+const PUNCH_INITIAL_SLEEP_MS: u64 = 500; //initial sleep between punches
+const PUNCH_MAX_SLEEP_MS: u64 = 3000; // max sleep value between punches
+const HEARTBEAT_SLEEP_SEC: u64 = 20; // sleep between heartbeats
+const RELAY_TICK_SEC: u64 = 15; // how often the relay does keepalive work
+const PEER_TIMEOUT_SEC: u64 = 60; //peer timeout if no PONG message in this time
+const CONNECT_GRACE_SEC: u64 = 5; // wait for connection for this time, after this, ask server for relay
 
 fn heartbeat_loop(
     socket: UdpSocket,
@@ -16,7 +24,7 @@ fn heartbeat_loop(
     loop {
         let hb = format!("HB {} {} {}", server_id, channel, user);
         let _ = socket.send_to(hb.as_bytes(), &signaling_addr);
-        thread::sleep(Duration::from_secs(20));
+        thread::sleep(Duration::from_secs(HEARTBEAT_SLEEP_SEC));
     }
 }
 
@@ -32,18 +40,21 @@ pub fn start_heartbeat(
     });
 }
 
-fn hole_punching_loop(
-    socket: UdpSocket,
-    peers: Arc<Mutex<Vec<PeerInfo>>>,
-    send_via_server: Arc<Mutex<bool>>,
-) {
+fn hole_punching_loop(socket: UdpSocket, peers: Arc<Mutex<Vec<PeerInfo>>>, sync: PunchSync) {
     let mut backoff: HashMap<String, u64> = HashMap::new(); //username -> ms
 
     loop {
-        if *send_via_server.lock().unwrap() {
-            // i'm symmetric; i'll use server, no need to punch
-            thread::sleep(Duration::from_millis(500));
-            continue;
+        // block if we are paused (sending via server) -> block here
+        {
+            let (lock, cvar) = &*sync;
+            let mut state = lock.lock().unwrap();
+
+            while state.paused {
+                //here the thread doesn't consume CPU
+                state = cvar.wait(state).unwrap();
+            }
+
+            //here state.paused == false, we can punch
         }
 
         {
@@ -54,17 +65,23 @@ fn hole_punching_loop(
                 }
 
                 if let Err(e) = socket.send_to(b"HOLE_PUNCH", p.addr) {
-                    eprintln!("Failed to send punch to{}: {}", p.addr, e);
+                    eprintln!("Failed to send punch to {}: {}", p.addr, e);
                 } else {
                     println!("Sent UDP punch to {} ({})", p.username, p.addr);
                 }
 
-                let entry = backoff.entry(p.username.clone()).or_insert(500);
-                *entry = (*entry).saturating_mul(2).min(3000);
+                let entry = backoff
+                    .entry(p.username.clone())
+                    .or_insert(PUNCH_INITIAL_SLEEP_MS);
+                *entry = (*entry).saturating_mul(2).min(PUNCH_MAX_SLEEP_MS);
             }
         }
 
-        let sleep_ms = backoff.values().min().copied().unwrap_or(500);
+        let sleep_ms = backoff
+            .values()
+            .min()
+            .copied()
+            .unwrap_or(PUNCH_INITIAL_SLEEP_MS);
         thread::sleep(Duration::from_millis(sleep_ms));
     }
 }
@@ -72,10 +89,10 @@ fn hole_punching_loop(
 pub fn start_hole_punching(
     socket: UdpSocket,
     peers: Arc<Mutex<Vec<PeerInfo>>>,
-    send_via_server: Arc<Mutex<bool>>,
+    punch_sync: PunchSync,
 ) {
     thread::spawn(move || {
-        hole_punching_loop(socket, peers, send_via_server);
+        hole_punching_loop(socket, peers, punch_sync);
     });
 }
 
@@ -96,19 +113,25 @@ fn handle_peer_timeout(
 fn relay_main_loop(
     socket: &UdpSocket,
     peers: &Arc<Mutex<Vec<PeerInfo>>>,
-    is_relay: &Arc<Mutex<bool>>,
-    relay_started: &Arc<Mutex<bool>>,
     server_id: &str,
     channel: &str,
     signaling_addr: &str,
-    channel_has_server_relays: &Arc<Mutex<bool>>,
+    relay_sync: &RelaySync,
 ) {
     loop {
+        // stop immediatly if deactivated
+        {
+            let (lock, _) = &**relay_sync;
+            if !lock.lock().unwrap().is_active {
+                break;
+            }
+        }
+
         let mut to_remove = Vec::new();
         {
             let mut guard = peers.lock().unwrap();
             for (i, peer) in guard.iter_mut().enumerate() {
-                if peer.last_pong.elapsed() > Duration::from_secs(60) {
+                if peer.last_pong.elapsed() > Duration::from_secs(PEER_TIMEOUT_SEC) {
                     handle_peer_timeout(socket, server_id, channel, peer, signaling_addr);
                     to_remove.push(i);
                 } else {
@@ -116,11 +139,15 @@ fn relay_main_loop(
                         eprintln!("Failed to send PING to {}: {}", peer.addr, e);
                     }
 
-                    if !peer.connected && peer.created_at.elapsed() > Duration::from_secs(5) {
+                    if !peer.connected
+                        && peer.created_at.elapsed() > Duration::from_secs(CONNECT_GRACE_SEC)
+                        && !peer.relay_requested
+                    {
                         println!(
                             "Peer {} not connected after 5s - requesting server relay",
                             peer.username
                         );
+                        peer.relay_requested = true;
                         let _ = socket.send_to(
                             format!(
                                 "REQUEST_RELAY {} {} {}\n",
@@ -137,74 +164,82 @@ fn relay_main_loop(
                 guard.remove(idx);
             }
         }
-
-        if !*is_relay.lock().unwrap() && !*channel_has_server_relays.lock().unwrap() {
-            println!("Relay role lost, stopping relay loop.");
-            *relay_started.lock().unwrap() = false;
-            break;
-        }
-
-        thread::sleep(Duration::from_secs(15));
+        // sleep up to 15s, but wake instantly if is_active flips
+        let (lock, cvar) = &**relay_sync;
+        let st = lock.lock().unwrap();
+        let _ = cvar
+            .wait_timeout(st, Duration::from_secs(RELAY_TICK_SEC))
+            .unwrap();
     }
 }
 
 fn relay_keepalive_loop(
     socket: UdpSocket,
     peers: Arc<Mutex<Vec<PeerInfo>>>,
-    is_relay: Arc<Mutex<bool>>,
     relay_started: Arc<Mutex<bool>>,
     server_id: String,
     channel: String,
     signaling_addr: String,
-    channel_has_server_relays: Arc<Mutex<bool>>,
+    relay_sync: RelaySync,
 ) {
     loop {
-        if *is_relay.lock().unwrap() || *channel_has_server_relays.lock().unwrap() {
-            let mut started = relay_started.lock().unwrap();
-            //Only start one relay loop
-            if *started {
-                thread::sleep(Duration::from_secs(1));
-                continue;
+        // wait until active
+        {
+            let (lock, cvar) = &*relay_sync;
+            let mut st = lock.lock().unwrap();
+            while !st.is_active {
+                st = cvar.wait(st).unwrap();
             }
-            *started = true;
-            drop(started);
-
-            println!("Starting relay keepalive thread");
-            relay_main_loop(
-                &socket,
-                &peers,
-                &is_relay,
-                &relay_started,
-                &server_id,
-                &channel,
-                &signaling_addr,
-                &channel_has_server_relays,
-            );
         }
-        thread::sleep(Duration::from_millis(200));
+
+        // mark started, only once
+        {
+            let mut started = relay_started.lock().unwrap();
+            if !*started {
+                *started = true;
+                println!("Starting relay keepalive thread.")
+            }
+        }
+
+        // run main loop until deactivated
+        relay_main_loop(
+            &socket,
+            &peers,
+            &server_id,
+            &channel,
+            &signaling_addr,
+            &relay_sync,
+        );
+
+        // mark stopped
+        {
+            let mut started = relay_started.lock().unwrap();
+            *started = false;
+            println!("Relay loop stopped.");
+        }
+
+        //go back to waiting
     }
 }
 
 pub fn start_relay_keepalive(
     socket: UdpSocket,
     peers: Arc<Mutex<Vec<PeerInfo>>>,
-    is_relay: Arc<Mutex<bool>>,
     relay_started: Arc<Mutex<bool>>,
     server_id: String,
     channel: String,
     signaling_addr: String,
-    channel_has_server_relays: Arc<Mutex<bool>>,
+    relay_sync: RelaySync,
 ) {
     thread::spawn(move || {
         relay_keepalive_loop(
             socket,
             peers,
-            is_relay,
             relay_started,
             server_id,
             channel,
             signaling_addr,
-            channel_has_server_relays,
+            relay_sync,
         );
     });
 }
@@ -233,7 +268,7 @@ fn user_input_loop(
     socket: UdpSocket,
     peers: Arc<Mutex<Vec<PeerInfo>>>,
     username: String,
-    send_via_server: Arc<Mutex<bool>>,
+    send_via_server: Arc<AtomicBool>,
     signaling_addr: String,
 ) {
     use std::io::{self, BufRead};
@@ -244,7 +279,7 @@ fn user_input_loop(
             if msg.is_empty() {
                 continue;
             }
-            let s = *send_via_server.lock().unwrap();
+            let s = send_via_server.load(Ordering::Acquire);
             handle_user_message(&socket, &peers, &username, msg, s, &signaling_addr);
         }
     }
@@ -254,7 +289,7 @@ pub fn start_user_input(
     socket: UdpSocket,
     peers: Arc<Mutex<Vec<PeerInfo>>>,
     username: String,
-    send_via_server: Arc<Mutex<bool>>,
+    send_via_server: Arc<AtomicBool>,
     signaling_addr: String,
 ) {
     thread::spawn(move || {

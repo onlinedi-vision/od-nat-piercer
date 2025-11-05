@@ -1,41 +1,81 @@
-use crate::signaling::{structures::ServerMap, utils::cleanup_and_notify_iter};
+use crate::signaling::{
+    structures::{Channel, ServerMap, User},
+    utils::cleanup_and_notify_iter,
+};
 use std::{net::SocketAddr, sync::Arc, time::Duration};
 use tokio::{net::UdpSocket, sync::Mutex};
+
+fn pick_eligible_relay(channel: &Channel) -> Option<User> {
+    // First user that is NOT in need_server_relay (meaning he doesn't have Symmetric NAT)
+    channel
+        .users
+        .iter()
+        .find(|u| !u.needs_server_relay)
+        .cloned()
+}
 
 fn handle_relay_timeout(
     channel: &mut crate::signaling::structures::Channel,
     notifications: &mut Vec<(Vec<SocketAddr>, Vec<u8>)>,
 ) {
-    if !channel.users.is_empty() {
-        let new_relay = channel.users[0].name.clone();
-        channel.relay = Some(new_relay.clone());
+    if let Some(new_relay_user) = pick_eligible_relay(channel) {
+        //setting the new relay in channel
+        channel.relay = Some(new_relay_user.name.clone());
 
-        let new_relay_addr = channel.users[0].addr;
+        //1) Send MODE RELAY just to the new relay
+        notifications.push((vec![new_relay_user.addr], b"MODE RELAY\n".to_vec()));
 
-        notifications.push((vec![new_relay_addr], b"MODE RELAY\n".to_vec()));
-
-        let mut relinfo_msg = Vec::new();
-        for _peer in channel.users.iter().skip(1) {
-            let m = format!("MODE DIRECT {} {}\n", new_relay, new_relay_addr);
-            relinfo_msg.extend_from_slice(m.as_bytes());
+        //2) Send to every peer: "MODE DIRECT <relay_name> <relay_addr>"
+        let peers_addrs: Vec<SocketAddr> = channel
+            .users
+            .iter()
+            .filter(|u| u.name != new_relay_user.name)
+            .map(|u| u.addr)
+            .collect();
+        if !peers_addrs.is_empty() {
+            let mut payload = Vec::new();
+            for _peer in channel
+                .users
+                .iter()
+                .filter(|u| u.name != new_relay_user.name)
+            {
+                let m = format!(
+                    "MODE DIRECT {} {}\n",
+                    new_relay_user.name, new_relay_user.addr
+                );
+                payload.extend_from_slice(m.as_bytes());
+            }
+            notifications.push((peers_addrs, payload));
         }
-        if !relinfo_msg.is_empty() {
-            let others_addrs: Vec<SocketAddr> =
-                channel.users.iter().skip(1).map(|u| u.addr).collect();
-            notifications.push((others_addrs, relinfo_msg));
-        }
 
+        // 3) Send new relay info about all other peers: "MODE DIRECT <peer> <addr>"
         let mut peers_to_new_msg = Vec::new();
-        for peer in channel.users.iter().skip(1) {
+        for peer in channel
+            .users
+            .iter()
+            .filter(|u| u.name != new_relay_user.name)
+        {
             let m = format!("MODE DIRECT {} {}\n", peer.name, peer.addr);
             peers_to_new_msg.extend_from_slice(m.as_bytes());
         }
-
         if !peers_to_new_msg.is_empty() {
-            notifications.push((vec![new_relay_addr], peers_to_new_msg));
+            notifications.push((vec![new_relay_user.addr], peers_to_new_msg));
         }
     } else {
+        //No eligible user -> no RELAY
+        // we just keep the server as relay (send MODE SERVER_RELAY <user> to all users)
         channel.relay = None;
+        if !channel.users.is_empty() {
+            let mut payload = Vec::new();
+            for u in &channel.users {
+                let m = format!("MODE SERVER_RELAY {}\n", u.name);
+                payload.extend_from_slice(m.as_bytes());
+            }
+
+            //send to all users from channel
+            let all_addrs: Vec<SocketAddr> = channel.users.iter().map(|u| u.addr).collect();
+            notifications.push((all_addrs, payload));
+        }
     }
 }
 
@@ -112,7 +152,23 @@ fn process_channel_heartbeat(
     }
 
     if channel.users.len() == 1 {
-        pings.push(channel.users[0].addr);
+        //one lone user, if he's eligible, we keep him as relay, otherwise the server remains relay
+        let solo = channel.users[0].clone();
+        let is_eligible = !solo.needs_server_relay;
+
+        if is_eligible {
+            pings.push(solo.addr);
+            channel.relay = Some(solo.name.clone());
+        } else {
+            //not eligible, don't promote him as relay, keep server as relay
+            channel.relay = None;
+
+            //announce it
+            notifications.push((
+                vec![solo.addr],
+                format!("MODE SERVER_RELAY {}\n", solo.name).into_bytes(),
+            ));
+        }
     }
 
     if channel.users.is_empty() {

@@ -1,13 +1,21 @@
 use std::{
     env,
-    net::UdpSocket,
+    net::{ToSocketAddrs, UdpSocket},
+    sync::atomic::{AtomicBool, Ordering},
     sync::{Arc, Mutex},
     thread,
     time::{Duration, Instant},
-    u8,
 };
 
-use od_nat_piercer::client::{handlers::*, networking::*, structures::PeerInfo};
+use od_nat_piercer::client::{
+    handlers::*,
+    networking::*,
+    structures::{PeerInfo, PunchState, PunchSync, RelayState, RelaySync},
+};
+
+const SETUP_POLL_SLEEP_MS: u64 = 20;
+const MAIN_POLL_SLEEP_MS: u64 = 50;
+const SETUP_DEADLINE_MS: u64 = 1500;
 
 fn parse_arguments(args: Vec<String>) -> (String, String, String, String, u16) {
     if args.len() < 6 {
@@ -48,35 +56,129 @@ fn send_connect_message(
     println!("Sent CONNECT to signaling server");
 }
 
+fn update_relay_is_active(
+    is_relay: &Arc<Mutex<bool>>,
+    channel_has_server_relays: &Arc<AtomicBool>,
+    relay_sync: &RelaySync,
+) {
+    let active = *is_relay.lock().unwrap() || channel_has_server_relays.load(Ordering::Acquire);
+    let (lock, cvar) = &**relay_sync;
+    let mut st = lock.lock().unwrap();
+    if st.is_active != active {
+        st.is_active = active;
+        cvar.notify_all(); //starts/stops relay loop instantly
+    }
+}
+
 fn process_server_response(
     response: &str,
     peers: &Arc<Mutex<Vec<PeerInfo>>>,
     user: &str,
     is_relay: &Arc<Mutex<bool>>,
-    server_relay_enabled: &Arc<Mutex<bool>>,
+    channel_has_server_relays: &Arc<AtomicBool>,
+    send_via_server: &Arc<AtomicBool>,
+    punch_sync: &PunchSync,
 ) {
     println!("Server response:\n{}", response);
     for line in response.lines() {
-        handle_mode_line(line.trim(), peers, user, is_relay, server_relay_enabled);
+        let line = line.trim();
+
+        if line.starts_with("MODE SERVER_RELAY ") {
+            // MODE SERVER_RELAY <username>
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if parts.len() >= 3 {
+                let who = parts[2];
+
+                if who == user {
+                    //i am symmetric (or lone) => send via server
+                    if !send_via_server.load(Ordering::Acquire) {
+                        send_via_server.store(true, Ordering::Release);
+                        println!("I will send via server from now on.");
+                    }
+
+                    // stop the thread of punching
+                    let (lock, cvar) = &**punch_sync;
+                    let mut st = lock.lock().unwrap();
+                    if !st.paused {
+                        st.paused = true;
+                        cvar.notify_all();
+                    }
+                } else if *is_relay.lock().unwrap() {
+                    // i am the relay -> note that channel has server-relayed peers
+                    if !channel_has_server_relays.load(Ordering::Acquire) {
+                        channel_has_server_relays.store(true, Ordering::Release);
+                        println!("Relay will mirror traffic to server.");
+                    }
+                }
+            }
+        }
+
+        handle_mode_line(
+            line,
+            peers,
+            user,
+            is_relay,
+            channel_has_server_relays,
+            punch_sync,
+        );
     }
 }
 
 fn handle_recv_result(
     result: std::io::Result<(usize, std::net::SocketAddr)>,
     buf: &mut [u8],
+    socket: &UdpSocket,
     peers: &Arc<Mutex<Vec<PeerInfo>>>,
     user: &str,
     is_relay: &Arc<Mutex<bool>>,
-    server_relay_enabled: &Arc<Mutex<bool>>,
+    channel_has_server_relays: &Arc<AtomicBool>,
+    send_via_server: &Arc<AtomicBool>,
+    server_socketaddr: &std::net::SocketAddr,
+    signaling_addr: &str,
+    saw_mode: &mut bool,
+    punch_sync: &PunchSync,
+    relay_sync: &RelaySync,
 ) -> bool {
     match result {
-        Ok((len, _)) => {
+        Ok((len, src)) => {
             let resp = String::from_utf8_lossy(&buf[..len]).to_string();
-            process_server_response(&resp, peers, user, is_relay, server_relay_enabled);
+            if &src == server_socketaddr {
+                if resp.lines().any(|l| l.trim_start().starts_with("MODE ")) {
+                    *saw_mode = true;
+                }
+
+                // real server response
+                process_server_response(
+                    &resp,
+                    peers,
+                    user,
+                    is_relay,
+                    channel_has_server_relays,
+                    send_via_server,
+                    punch_sync,
+                );
+
+                update_relay_is_active(is_relay, channel_has_server_relays, relay_sync);
+            } else {
+                // peer traffic (arrived during setup)
+                handle_peer_message(peers, src);
+
+                process_incoming_message(
+                    socket,
+                    &resp,
+                    src,
+                    peers,
+                    &user,
+                    is_relay,
+                    channel_has_server_relays,
+                    signaling_addr,
+                    punch_sync,
+                );
+            }
             true
         }
         Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-            thread::sleep(Duration::from_millis(20));
+            thread::sleep(Duration::from_millis(SETUP_POLL_SLEEP_MS));
             true
         }
         Err(e) => {
@@ -91,21 +193,33 @@ fn server_responses_during_setup(
     peers: &Arc<Mutex<Vec<PeerInfo>>>,
     user: &str,
     is_relay: &Arc<Mutex<bool>>,
-    server_relay_enabled: &Arc<Mutex<bool>>,
+    channel_has_server_relays: &Arc<AtomicBool>,
+    send_via_server: &Arc<AtomicBool>,
+    server_socketaddr: &std::net::SocketAddr,
+    signaling_addr: &str,
+    punch_sync: &PunchSync,
+    relay_sync: &RelaySync,
 ) {
     let mut buf = [0u8; 1024];
-    let setup_deadline = Instant::now() + Duration::from_millis(1500);
+    let setup_deadline = Instant::now() + Duration::from_millis(SETUP_DEADLINE_MS);
+    let mut saw_mode = false;
 
-    while Instant::now() < setup_deadline {
-        let recv_result = socket.recv_from(&mut buf);
-
+    while Instant::now() < setup_deadline && !saw_mode {
+        let res = socket.recv_from(&mut buf);
         if !handle_recv_result(
-            recv_result,
+            res,
             &mut buf,
+            socket,
             peers,
             user,
             is_relay,
-            server_relay_enabled,
+            channel_has_server_relays,
+            send_via_server,
+            server_socketaddr,
+            signaling_addr,
+            &mut saw_mode,
+            punch_sync,
+            relay_sync,
         ) {
             break;
         }
@@ -117,8 +231,11 @@ fn main_loop(
     peers: &Arc<Mutex<Vec<PeerInfo>>>,
     user: String,
     is_relay: &Arc<Mutex<bool>>,
-    server_relay_enabled: &Arc<Mutex<bool>>,
+    channel_has_server_relays: &Arc<AtomicBool>,
     signaling_addr: &str,
+    server_socketaddr: &std::net::SocketAddr,
+    punch_sync: &PunchSync,
+    relay_sync: &RelaySync,
 ) -> std::io::Result<()> {
     let mut buf = [0u8; 1024];
 
@@ -128,8 +245,10 @@ fn main_loop(
             Ok((len, src)) => {
                 let message = String::from_utf8_lossy(&buf[..len]).to_string();
 
-                //If message comes from a peer addr, mark them as connected
-                handle_peer_message(&peers, src);
+                if &src != server_socketaddr {
+                    handle_peer_message(&peers, src);
+                }
+
                 process_incoming_message(
                     socket,
                     &message,
@@ -137,12 +256,15 @@ fn main_loop(
                     peers,
                     &user,
                     is_relay,
-                    server_relay_enabled,
+                    channel_has_server_relays,
                     signaling_addr,
+                    punch_sync,
                 );
+
+                update_relay_is_active(is_relay, channel_has_server_relays, relay_sync);
             }
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                thread::sleep(Duration::from_millis(50));
+                thread::sleep(Duration::from_millis(MAIN_POLL_SLEEP_MS));
             }
             Err(e) => {
                 eprintln!("Error receiving: {}", e);
@@ -160,6 +282,11 @@ fn main() -> std::io::Result<()> {
 
     //Address for the signalization server (UDP on port 5000)
     let signaling_addr = format!("{}:5000", signaling_ip);
+    let server_socketaddr: std::net::SocketAddr = signaling_addr
+        .to_socket_addrs()
+        .expect("resolve signaling server")
+        .next()
+        .expect("no addr for signaling server");
 
     send_connect_message(&socket, &signaling_addr, &server_id, &channel, &user);
 
@@ -168,7 +295,19 @@ fn main() -> std::io::Result<()> {
 
     let is_relay = Arc::new(Mutex::new(false));
     let relay_started = Arc::new(Mutex::new(false));
-    let server_relay_enabled = Arc::new(Mutex::new(false));
+
+    let send_via_server = Arc::new(AtomicBool::new(false)); //this client must send via server
+    let channel_has_server_relays = Arc::new(AtomicBool::new(false)); //as relay, i should also mirror to serveri
+
+    let punch_sync: PunchSync = Arc::new((
+        Mutex::new(PunchState { paused: false }),
+        std::sync::Condvar::new(),
+    ));
+
+    let relay_sync: RelaySync = Arc::new((
+        Mutex::new(RelayState { is_active: false }),
+        std::sync::Condvar::new(),
+    ));
 
     start_heartbeat(
         socket.try_clone()?,
@@ -178,20 +317,35 @@ fn main() -> std::io::Result<()> {
         signaling_addr.clone(),
     );
 
-    server_responses_during_setup(&socket, &peers, &user, &is_relay, &server_relay_enabled);
+    server_responses_during_setup(
+        &socket,
+        &peers,
+        &user,
+        &is_relay,
+        &channel_has_server_relays,
+        &send_via_server,
+        &server_socketaddr,
+        &signaling_addr,
+        &punch_sync,
+        &relay_sync,
+    );
 
-    start_hole_punching(socket.try_clone()?, Arc::clone(&peers));
+    //pass send_via_server so a symmetric user stops punching
+    start_hole_punching(
+        socket.try_clone()?,
+        Arc::clone(&peers),
+        Arc::clone(&punch_sync),
+    );
 
     //Relay keepalive thread starter
     start_relay_keepalive(
         socket.try_clone()?,
         Arc::clone(&peers),
-        Arc::clone(&is_relay),
         Arc::clone(&relay_started),
         server_id.to_string(),
         channel.to_string(),
         signaling_addr.clone(),
-        Arc::clone(&server_relay_enabled),
+        Arc::clone(&relay_sync),
     );
 
     //Thread for sending messages
@@ -199,7 +353,7 @@ fn main() -> std::io::Result<()> {
         socket.try_clone()?,
         Arc::clone(&peers),
         user.to_string(),
-        Arc::clone(&server_relay_enabled),
+        Arc::clone(&send_via_server),
         signaling_addr.clone(),
     );
 
@@ -208,7 +362,10 @@ fn main() -> std::io::Result<()> {
         &peers,
         user,
         &is_relay,
-        &server_relay_enabled,
+        &channel_has_server_relays,
         &signaling_addr,
+        &server_socketaddr,
+        &punch_sync,
+        &relay_sync,
     )
 }

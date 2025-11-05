@@ -19,8 +19,10 @@ pub async fn handle_relay_request(
     let mut st = state.lock().await;
     if let Some(channels) = st.get_mut(server_id) {
         if let Some(channel) = channels.get_mut(channel_name) {
-            channel.need_server_relay.insert(username.to_string());
-
+            // mark this user that he needs server relay
+            if let Some(user) = channel.users.iter_mut().find(|u| u.name == username) {
+                user.needs_server_relay = true;
+            }
             // notify all users that the server will forward for the user that needs a relay
             let notify = format!("MODE SERVER_RELAY {}\n", username);
             for u in channel.users.iter() {
@@ -36,23 +38,59 @@ pub async fn handle_data_from_client(
     socket: Arc<UdpSocket>,
     state: Arc<Mutex<ServerMap>>,
 ) {
+    // expect "DATA <sender> <payload>"
     let parts: Vec<&str> = raw.splitn(3, ' ').collect();
     if parts.len() < 3 {
         return;
     }
-    let sender = parts[1];
+    let sender_name = parts[1];
 
-    //find channel and user by src addr and sender name
     let mut st = state.lock().await;
+
     for (_sid, channels) in st.iter_mut() {
         for (_cname, channel) in channels.iter_mut() {
-            if let Some(_user_in_channel) = channel
+            //find the sender in this channel by (addr, name)
+            if let Some(sender_index) = channel
                 .users
                 .iter()
-                .position(|u| u.addr == src && u.name == sender)
+                .position(|u| u.addr == src && u.name == sender_name)
             {
-                for peer in channel.users.iter().filter(|p| p.addr != src) {
-                    let _ = socket.send_to(raw.as_bytes(), peer.addr).await;
+                //who is relay
+                let sender_is_relay = channel
+                    .relay
+                    .as_deref()
+                    .map(|r| r == sender_name)
+                    .unwrap_or(false);
+
+                let sender_needs_server_relay = channel.users[sender_index].needs_server_relay;
+
+                //if sender is relay -> deliver only to need_server_relay users
+                if sender_is_relay {
+                    for peer in channel.users.iter() {
+                        if peer.name != sender_name && peer.needs_server_relay {
+                            let _ = socket.send_to(raw.as_bytes(), peer.addr).await;
+                        }
+                    }
+                    return;
+                }
+
+                // If sender is symmetric (needs server relay) -> deliver to everyone else
+                if sender_needs_server_relay {
+                    for peer in channel.users.iter() {
+                        if peer.addr != src {
+                            let _ = socket.send_to(raw.as_bytes(), peer.addr).await;
+                        }
+                    }
+                }
+
+                //otherwise (unexpected normal client sent to server?)
+                // forward to the relay only
+                if let Some(relay_name) = &channel.relay {
+                    if let Some(relay_user) = channel.users.iter().find(|u| &u.name == relay_name) {
+                        if relay_user.addr != src {
+                            let _ = socket.send_to(raw.as_bytes(), relay_user.addr).await;
+                        }
+                    }
                 }
                 return;
             }

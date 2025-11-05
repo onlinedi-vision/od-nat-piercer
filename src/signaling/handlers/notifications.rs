@@ -2,6 +2,15 @@ use crate::signaling::structures::{Channel, ServerMap, User};
 use std::{net::SocketAddr, sync::Arc};
 use tokio::{net::UdpSocket, sync::Mutex};
 
+fn pick_eligible_relay(channel: &Channel) -> Option<User> {
+    // Primul user care NU e in need_server_relay (adica nu are NAT symmetric)
+    channel
+        .users
+        .iter()
+        .find(|u| !u.needs_server_relay)
+        .cloned()
+}
+
 pub async fn mark_relay_in_channel(
     state: &Arc<Mutex<ServerMap>>,
     server_id: &str,
@@ -162,13 +171,36 @@ pub async fn handle_multiple_users_scenario(
     socket: &Arc<UdpSocket>,
     state: &Arc<Mutex<ServerMap>>,
 ) {
-    let relay_user = &users_to_notify.users[0];
-    let peers = &users_to_notify.users[1..];
+    if let Some(relay_user) = pick_eligible_relay(users_to_notify) {
+        let peers: Vec<User> = users_to_notify
+            .users
+            .iter()
+            .cloned()
+            .filter(|u| u.name != relay_user.name)
+            .collect();
 
-    mark_relay_in_channel(state, server_id, channel_name, relay_user).await;
-    notify_relay_about_peers(socket, relay_user, peers).await;
-    notify_peers_about_relay(socket, relay_user, peers).await;
-    send_relay_mode_to_relay(socket, relay_user).await;
+        mark_relay_in_channel(state, server_id, channel_name, &relay_user).await;
+        notify_relay_about_peers(socket, &relay_user, &peers).await;
+        notify_peers_about_relay(socket, &relay_user, &peers).await;
+        send_relay_mode_to_relay(socket, &relay_user).await;
+    } else {
+        // nici un user eligibil -> nu promovam pe nimeni, lasam serverul ca relay
+        // anuntam ca serverul va face relay pentru fiecare user din canal
+        for u in &users_to_notify.users {
+            let notify = format!("MODE SERVER_RELAY {}\n", u.name);
+            for usr in &users_to_notify.users {
+                let _ = socket.send_to(notify.as_bytes(), usr.addr).await;
+            }
+        }
+
+        // si marcam in state ca nu exista relay de user
+        let mut st = state.lock().await;
+        if let Some(chans) = st.get_mut(server_id) {
+            if let Some(ch) = chans.get_mut(channel_name) {
+                ch.relay = None;
+            }
+        }
+    }
 }
 
 pub async fn handle_single_user_scenario(
@@ -183,15 +215,59 @@ pub async fn handle_single_user_scenario(
 pub async fn handle_relay_transition(
     socket: &Arc<UdpSocket>,
     was_relay: bool,
-    remaining_users: &[User],
+    state: &Arc<Mutex<ServerMap>>,
+    server_id: &str,
+    channel_name: &str,
 ) {
-    if was_relay && remaining_users.len() > 1 {
-        let new_relay = &remaining_users[0];
-        let peers = &remaining_users[1..];
+    if !was_relay {
+        return;
+    }
 
-        promote_new_relay(socket, new_relay).await;
-        notify_peers_about_new_relay(socket, new_relay, peers).await;
-        notify_new_relay_about_peers(socket, new_relay, peers).await;
+    //luam canalul curent ca sa vedem users + need_server_relay
+    let channel_opt = {
+        let st = state.lock().await;
+        st.get(server_id)
+            .and_then(|chans| chans.get(channel_name))
+            .cloned()
+    };
+
+    if let Some(channel) = channel_opt {
+        //alegem un nou relay eligibil
+        if let Some(new_relay) = pick_eligible_relay(&channel) {
+            let peers: Vec<User> = channel
+                .users
+                .iter()
+                .cloned()
+                .filter(|u| u.name != new_relay.name)
+                .collect();
+
+            promote_new_relay(socket, &new_relay).await;
+            notify_peers_about_new_relay(socket, &new_relay, &peers).await;
+            notify_new_relay_about_peers(socket, &new_relay, &peers).await;
+
+            //actualizam relay in state
+            let mut st = state.lock().await;
+            if let Some(chans) = st.get_mut(server_id) {
+                if let Some(ch) = chans.get_mut(channel_name) {
+                    ch.relay = Some(new_relay.name.clone());
+                }
+            }
+        } else {
+            //nici un user eligibil -> ramane serverul ca relay, anuntam SERVER_RELAY pentru toti
+            for u in &channel.users {
+                let notify = format!("MODE SERVER_RELAY {}\n", u.name);
+                for usr in &channel.users {
+                    let _ = socket.send_to(notify.as_bytes(), usr.addr).await;
+                }
+            }
+
+            let mut st = state.lock().await;
+            if let Some(chans) = st.get_mut(server_id) {
+                if let Some(ch) = chans.get_mut(channel_name) {
+                    ch.relay = None;
+                }
+            }
+        }
     }
 }
 
@@ -202,9 +278,12 @@ pub async fn handle_disconnect_notifications(
     lone_user_addr: Option<SocketAddr>,
     user_name: &str,
     socket: Arc<UdpSocket>,
+    state: &Arc<Mutex<ServerMap>>,
+    server_id: String,
+    channel_name: String,
 ) {
     notify_lone_user(&socket, lone_user_addr).await;
-    handle_relay_transition(&socket, was_relay, &remaining_users).await;
+    handle_relay_transition(&socket, was_relay, &state, &server_id, &channel_name).await;
     notify_all_about_departure(&socket, remaining_users, user_name, leaving_user_addr).await;
 }
 

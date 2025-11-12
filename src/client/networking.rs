@@ -251,16 +251,28 @@ fn handle_user_message(
     message: &str,
     send_via_server: bool,
     signaling_addr: &str,
+    is_relay: &Arc<Mutex<bool>>,
+    channel_has_server_relays: &Arc<AtomicBool>,
 ) {
     let payload = format!("DATA {} {}\n", username, message);
+
+    // if i am simmetric, send via server
     if send_via_server {
         println!("Sending DATA via server relay: {}", message);
         let _ = socket.send_to(payload.as_bytes(), signaling_addr);
-    } else {
-        let peers_guard = peers.lock().unwrap();
-        for peer in peers_guard.iter() {
-            let _ = socket.send_to(payload.as_bytes(), peer.addr);
-        }
+        return;
+    }
+
+    // we on DIRECT, send directly only to peers that are not server relayed
+    let peers_guard = peers.lock().unwrap();
+    for peer in peers_guard.iter().filter(|p| !p.use_server_relay) {
+        let _ = socket.send_to(payload.as_bytes(), peer.addr);
+    }
+
+    // if i am relay and channel has server relayed peers, mirror to server
+    // otherwise symmetric users can not receive my message
+    if *is_relay.lock().unwrap() && channel_has_server_relays.load(Ordering::Acquire) {
+        let _ = socket.send_to(payload.as_bytes(), signaling_addr);
     }
 }
 
@@ -270,6 +282,8 @@ fn user_input_loop(
     username: String,
     send_via_server: Arc<AtomicBool>,
     signaling_addr: String,
+    is_relay: Arc<Mutex<bool>>,
+    channel_has_server_relays: Arc<AtomicBool>,
 ) {
     use std::io::{self, BufRead};
     let stdin = io::stdin();
@@ -280,7 +294,16 @@ fn user_input_loop(
                 continue;
             }
             let s = send_via_server.load(Ordering::Acquire);
-            handle_user_message(&socket, &peers, &username, msg, s, &signaling_addr);
+            handle_user_message(
+                &socket,
+                &peers,
+                &username,
+                msg,
+                s,
+                &signaling_addr,
+                &is_relay,
+                &channel_has_server_relays,
+            );
         }
     }
 }
@@ -291,8 +314,18 @@ pub fn start_user_input(
     username: String,
     send_via_server: Arc<AtomicBool>,
     signaling_addr: String,
+    is_relay: Arc<Mutex<bool>>,
+    channel_has_server_relays: Arc<AtomicBool>,
 ) {
     thread::spawn(move || {
-        user_input_loop(socket, peers, username, send_via_server, signaling_addr);
+        user_input_loop(
+            socket,
+            peers,
+            username,
+            send_via_server,
+            signaling_addr,
+            is_relay,
+            channel_has_server_relays,
+        );
     });
 }

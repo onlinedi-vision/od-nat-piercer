@@ -355,6 +355,8 @@ fn main() -> std::io::Result<()> {
         user.to_string(),
         Arc::clone(&send_via_server),
         signaling_addr.clone(),
+        Arc::clone(&is_relay),
+        Arc::clone(&channel_has_server_relays),
     );
 
     main_loop(

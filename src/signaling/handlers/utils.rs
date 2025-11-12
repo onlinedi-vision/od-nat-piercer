@@ -53,7 +53,7 @@ pub async fn create_new_user(user_name: &str, src_addr: SocketAddr) -> User {
 
 pub async fn handle_lone_user_scenario(channel: &mut Channel, socket: &Arc<UdpSocket>) {
     if channel.relay.is_none() && channel.users.len() == 1 {
-        let reply = "MODE SERVER_RELAY\n";
+        let reply = format!("MODE SERVER_RELAY {}\n", channel.users[0].name);
         if let Err(e) = socket
             .send_to(reply.as_bytes(), channel.users[0].addr)
             .await
@@ -61,7 +61,7 @@ pub async fn handle_lone_user_scenario(channel: &mut Channel, socket: &Arc<UdpSo
             eprintln!("Failed to notify lone user about server relay: {}", e);
         }
 
-        channel.relay = Some(channel.users[0].name.clone());
+        channel.relay = None;
     }
 }
 

@@ -1,4 +1,4 @@
-use crate::client::structures::{PeerInfo, PunchSync};
+use crate::client::structures::PeerInfo;
 use std::{
     net::{SocketAddr, UdpSocket},
     str::FromStr,
@@ -58,7 +58,6 @@ pub fn handle_mode_line(
     me: &str,
     is_relay: &Arc<Mutex<bool>>,
     channel_has_server_relays: &Arc<AtomicBool>,
-    punch_sync: &PunchSync,
 ) {
     let parts: Vec<&str> = line.split_whitespace().collect();
     if parts.is_empty() {
@@ -75,34 +74,24 @@ pub fn handle_mode_line(
 
                     // if the server is relaying for 'me', i must send to server
                     if username == me {
-                        // we'll set a global flag in bin/process_server_response
-                        println!("Server will relay my traffic now: {}", me);
-
-                        // stop punching thread
-                        let (lock, cvar) = &**punch_sync;
-                        let mut st = lock.lock().unwrap();
-                        if !st.paused {
-                            st.paused = true;
-                            cvar.notify_all();
+                        return;
+                    }
+                    // if i am the RELAY, note that the channel has server-relayed peers
+                    if *is_relay.lock().unwrap() {
+                        if !channel_has_server_relays.load(Ordering::Acquire) {
+                            channel_has_server_relays.store(true, Ordering::Release);
+                            println!("Relay: channel has server-relayed peers.");
                         }
                     } else {
-                        // if i am the RELAY, note that the channel has server-relayed peers
-                        if *is_relay.lock().unwrap() {
-                            if !channel_has_server_relays.load(Ordering::Acquire) {
-                                channel_has_server_relays.store(true, Ordering::Release);
-                                println!("Relay: channel has server-relayed peers.");
-                            }
-                        } else {
-                            println!("Server will relay for user: {}", username);
-                        }
+                        println!("Server will relay for user: {}", username);
+                    }
 
-                        //mark that peer as server-relayed to stop punching it
-                        let mut guard = peers.lock().unwrap();
-                        if let Some(peer) = guard.iter_mut().find(|p| p.username == username) {
-                            peer.use_server_relay = true;
-                            peer.connected = true; // stop punching
-                            peer.relay_requested = true;
-                        }
+                    //mark that peer as server-relayed to stop punching it
+                    let mut guard = peers.lock().unwrap();
+                    if let Some(peer) = guard.iter_mut().find(|p| p.username == username) {
+                        peer.use_server_relay = true;
+                        peer.connected = true; // stop punching
+                        peer.relay_requested = true;
                     }
                 } else {
                     // just a lone user :(
@@ -226,7 +215,6 @@ pub fn process_incoming_message(
     is_relay: &Arc<Mutex<bool>>,
     channel_has_server_relays: &Arc<AtomicBool>,
     signaling_addr: &str,
-    punch_sync: &PunchSync,
 ) {
     for line in message.lines() {
         let line = line.trim();
@@ -249,14 +237,7 @@ pub fn process_incoming_message(
                     );
                 } else {
                     //Handle control messages: MODE / USER_LEFT
-                    handle_mode_line(
-                        line,
-                        peers,
-                        user,
-                        is_relay,
-                        channel_has_server_relays,
-                        punch_sync,
-                    );
+                    handle_mode_line(line, peers, user, is_relay, channel_has_server_relays);
                 }
             }
         }

@@ -72,13 +72,18 @@ fn update_relay_is_active(
 
 fn process_server_response(
     response: &str,
-    peers: &Arc<Mutex<Vec<PeerInfo>>>,
     user: &str,
     is_relay: &Arc<Mutex<bool>>,
     channel_has_server_relays: &Arc<AtomicBool>,
     send_via_server: &Arc<AtomicBool>,
     punch_sync: &PunchSync,
 ) {
+    if !response
+        .lines()
+        .any(|l| l.trim_start().starts_with("MODE "))
+    {
+        return;
+    }
     println!("Server response:\n{}", response);
     for line in response.lines() {
         let line = line.trim();
@@ -127,15 +132,6 @@ fn process_server_response(
                 }
             }
         }
-
-        handle_mode_line(
-            line,
-            peers,
-            user,
-            is_relay,
-            channel_has_server_relays,
-            punch_sync,
-        );
     }
 }
 
@@ -162,10 +158,21 @@ fn handle_recv_result(
                     *saw_mode = true;
                 }
 
-                // real server response
+                // 1) Normal processing: MODE / DATA / USER_LEFT, etc
+                process_incoming_message(
+                    socket,
+                    &resp,
+                    src,
+                    peers,
+                    &user,
+                    is_relay,
+                    channel_has_server_relays,
+                    signaling_addr,
+                );
+
+                // 2) Local mode + send_via_server / punching behaviors
                 process_server_response(
                     &resp,
-                    peers,
                     user,
                     is_relay,
                     channel_has_server_relays,
@@ -187,7 +194,6 @@ fn handle_recv_result(
                     is_relay,
                     channel_has_server_relays,
                     signaling_addr,
-                    punch_sync,
                 );
             }
             true
@@ -251,6 +257,7 @@ fn main_loop(
     server_socketaddr: &std::net::SocketAddr,
     punch_sync: &PunchSync,
     relay_sync: &RelaySync,
+    send_via_server: &Arc<AtomicBool>,
 ) -> std::io::Result<()> {
     let mut buf = [0u8; 1024];
 
@@ -260,21 +267,43 @@ fn main_loop(
             Ok((len, src)) => {
                 let message = String::from_utf8_lossy(&buf[..len]).to_string();
 
-                if &src != server_socketaddr {
-                    handle_peer_message(&peers, src);
-                }
+                if &src == server_socketaddr {
+                    // 1) Process MODE / DATA / USER_LEFT etc.
+                    process_incoming_message(
+                        socket,
+                        &message,
+                        src,
+                        peers,
+                        &user,
+                        is_relay,
+                        channel_has_server_relays,
+                        signaling_addr,
+                    );
 
-                process_incoming_message(
-                    socket,
-                    &message,
-                    src,
-                    peers,
-                    &user,
-                    is_relay,
-                    channel_has_server_relays,
-                    signaling_addr,
-                    punch_sync,
-                );
+                    // 2) Update send_via_server + punching according to MODE lines
+                    process_server_response(
+                        &message,
+                        &user,
+                        is_relay,
+                        channel_has_server_relays,
+                        send_via_server,
+                        punch_sync,
+                    );
+                } else {
+                    // Peer traffic
+                    handle_peer_message(&peers, src);
+
+                    process_incoming_message(
+                        socket,
+                        &message,
+                        src,
+                        peers,
+                        &user,
+                        is_relay,
+                        channel_has_server_relays,
+                        signaling_addr,
+                    );
+                }
 
                 update_relay_is_active(is_relay, channel_has_server_relays, relay_sync);
             }
@@ -384,5 +413,6 @@ fn main() -> std::io::Result<()> {
         &server_socketaddr,
         &punch_sync,
         &relay_sync,
+        &send_via_server,
     )
 }

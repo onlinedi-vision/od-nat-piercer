@@ -131,6 +131,10 @@ fn relay_main_loop(
         {
             let mut guard = peers.lock().unwrap();
             for (i, peer) in guard.iter_mut().enumerate() {
+                if peer.use_server_relay {
+                    continue;
+                }
+
                 if peer.last_pong.elapsed() > Duration::from_secs(PEER_TIMEOUT_SEC) {
                     handle_peer_timeout(socket, server_id, channel, peer, signaling_addr);
                     to_remove.push(i);

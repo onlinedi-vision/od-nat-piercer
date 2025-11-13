@@ -49,6 +49,20 @@ pub async fn handle_data_from_client(
 
     for (_sid, channels) in st.iter_mut() {
         for (_cname, channel) in channels.iter_mut() {
+            // mirrored DATA from RELAY -> deliver to peers that need server relay
+            if let Some(relay_name) = &channel.relay {
+                if let Some(relay_user) = channel.users.iter().find(|u| &u.name == relay_name) {
+                    if relay_user.addr == src {
+                        for peer in channel.users.iter() {
+                            if peer.name != sender_name && peer.needs_server_relay {
+                                let _ = socket.send_to(raw.as_bytes(), peer.addr).await;
+                            }
+                        }
+                        return;
+                    }
+                }
+            }
+
             //find the sender in this channel by (addr, name)
             if let Some(sender_index) = channel
                 .users

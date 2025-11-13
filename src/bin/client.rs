@@ -83,6 +83,21 @@ fn process_server_response(
     for line in response.lines() {
         let line = line.trim();
 
+        if line == "MODE RELAY" {
+            if send_via_server.load(Ordering::Acquire) {
+                send_via_server.store(false, Ordering::Release);
+                println!("I am relay now - stop sending via server.");
+            }
+
+            //resume punching if it was paused
+            let (lock, cvar) = &**punch_sync;
+            let mut st = lock.lock().unwrap();
+            if st.paused {
+                st.paused = false;
+                cvar.notify_all();
+            }
+        }
+
         if line.starts_with("MODE SERVER_RELAY ") {
             // MODE SERVER_RELAY <username>
             let parts: Vec<&str> = line.split_whitespace().collect();

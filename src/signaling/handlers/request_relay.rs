@@ -95,6 +95,7 @@ pub async fn handle_data_from_client(
                             let _ = socket.send_to(raw.as_bytes(), peer.addr).await;
                         }
                     }
+                    return;
                 }
 
                 //otherwise (unexpected normal client sent to server?)

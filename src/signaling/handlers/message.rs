@@ -16,6 +16,12 @@ pub async fn handle_message(
     socket: Arc<UdpSocket>,
     state: Arc<Mutex<ServerMap>>,
 ) {
+    if msg.starts_with("NAT_PROBE") {
+        let reply = format!("NAT_SEEN {}\n", src);
+        let _ = socket.send_to(reply.as_bytes(), src).await;
+        return;
+    }
+
     let parts: Vec<&str> = msg.trim().split_whitespace().collect();
 
     if msg.trim() == "PONG" {

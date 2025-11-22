@@ -1,4 +1,4 @@
-use crate::signaling::structures::{Channel, ServerMap, User};
+use crate::signaling::structures::{Channel, NatKind, ServerMap, User};
 use std::{net::SocketAddr, sync::Arc, time::Instant};
 use tokio::{net::UdpSocket, sync::Mutex};
 
@@ -42,12 +42,13 @@ pub async fn remove_old_user_sessions(
         .retain(|u| !(u.name == user_name && u.addr != src_addr));
 }
 
-pub async fn create_new_user(user_name: &str, src_addr: SocketAddr) -> User {
+pub async fn create_new_user(user_name: &str, src_addr: SocketAddr, nat_kind: NatKind) -> User {
     User {
         name: user_name.to_string(),
         addr: src_addr,
         last_pong: Instant::now(),
-        needs_server_relay: false,
+        needs_server_relay: matches!(nat_kind, NatKind::Symmetric),
+        nat_kind,
     }
 }
 

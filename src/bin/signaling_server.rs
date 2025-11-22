@@ -7,19 +7,45 @@ use tokio::sync::Mutex;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let socket = UdpSocket::bind("0.0.0.0:5000").await?;
+    let socket_main = UdpSocket::bind("0.0.0.0:5000").await?;
+    let socket_probe = UdpSocket::bind("0.0.0.0:5001").await?;
+
     println!("Signaling server listening on 0.0.0.0:5000");
 
-    let socket = Arc::new(socket);
+    let socket_main = Arc::new(socket_main);
+    let socket_probe = Arc::new(socket_probe);
+
     let state = Arc::new(Mutex::new(ServerMap::new()));
 
-    start_heartbeat(Arc::clone(&socket), Arc::clone(&state));
+    start_heartbeat(Arc::clone(&socket_main), Arc::clone(&state));
 
-    let mut buf = [0u8; 1024];
+    run_server(socket_main, socket_probe, state).await;
+    Ok(())
+}
+
+async fn run_server(
+    socket_main: Arc<UdpSocket>,
+    socket_probe: Arc<UdpSocket>,
+    state: Arc<Mutex<ServerMap>>,
+) {
+    let mut buf_main = [0u8; 1024];
+    let mut buf_probe = [0u8; 1024];
 
     loop {
-        let (len, src) = socket.recv_from(&mut buf).await?;
-        let msg = String::from_utf8_lossy(&buf[..len]).to_string();
-        handle_message(msg, src, Arc::clone(&socket), Arc::clone(&state)).await;
+        tokio::select! {
+            res = socket_main.recv_from(&mut buf_main) => {
+                if let Ok((len,src)) = res{
+                    let msg = String::from_utf8_lossy(&buf_main[..len]).to_string();
+                    handle_message(msg, src, Arc::clone(&socket_main), Arc::clone(&state)).await;
+                }
+            }
+
+            res = socket_probe.recv_from(&mut buf_probe) => {
+                if let Ok((len,src)) = res{
+                    let msg = String::from_utf8_lossy(&buf_probe[..len]).to_string();
+                    handle_message(msg, src, Arc::clone(&socket_probe), Arc::clone(&state)).await;
+                }
+            }
+        }
     }
 }

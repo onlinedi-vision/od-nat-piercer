@@ -54,15 +54,23 @@ pub async fn create_new_user(user_name: &str, src_addr: SocketAddr, nat_kind: Na
 
 pub async fn handle_lone_user_scenario(channel: &mut Channel, socket: &Arc<UdpSocket>) {
     if channel.relay.is_none() && channel.users.len() == 1 {
-        let reply = format!("MODE SERVER_RELAY {}\n", channel.users[0].name);
-        if let Err(e) = socket
-            .send_to(reply.as_bytes(), channel.users[0].addr)
-            .await
-        {
-            eprintln!("Failed to notify lone user about server relay: {}", e);
-        }
+        let u = &channel.users[0];
+        match u.nat_kind {
+            NatKind::Symmetric => {
+                let reply = format!("MODE SERVER_RELAY {}\n", channel.users[0].name);
+                if let Err(e) = socket.send_to(reply.as_bytes(), u.addr).await {
+                    eprintln!("Failed to notify lone user about server relay: {}", e);
+                }
+                channel.relay = None;
+            }
 
-        channel.relay = None;
+            _ => {
+                if let Err(e) = socket.send_to(b"MODE RELAY\n", u.addr).await {
+                    eprintln!("Failed to notify lone user about relay mode: {}", e);
+                }
+                channel.relay = Some(u.name.clone());
+            }
+        }
     }
 }
 
@@ -71,12 +79,13 @@ pub async fn add_new_user(
     user_name: &str,
     src_addr: SocketAddr,
     socket: &Arc<UdpSocket>,
+    nat_kind: NatKind,
 ) -> Channel {
     //Remove old user sessions with same name but different address
     remove_old_user_sessions(channel, user_name, src_addr).await;
 
     //Create and add new user
-    let new_user = create_new_user(user_name, src_addr).await;
+    let new_user = create_new_user(user_name, src_addr, nat_kind).await;
     channel.users.push(new_user);
 
     //Handle lone user scenario

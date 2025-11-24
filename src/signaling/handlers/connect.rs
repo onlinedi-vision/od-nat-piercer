@@ -1,4 +1,4 @@
-use crate::signaling::structures::ServerMap;
+use crate::signaling::structures::{NatKind, ServerMap};
 use std::{net::SocketAddr, sync::Arc};
 use tokio::{net::UdpSocket, sync::Mutex};
 
@@ -18,6 +18,17 @@ pub async fn handle_connect_message(
     let user_name = parts[3].to_string();
     let src_addr = src;
 
+    let nat_kind = if parts.len() >= 5 {
+        match parts[4] {
+            "SYMMETRIC" => NatKind::Symmetric,
+            "CONE" => NatKind::Cone,
+            "PUBLIC" => NatKind::Public,
+            _ => NatKind::Unknown,
+        }
+    } else {
+        NatKind::Unknown
+    };
+
     let (users_to_notify, is_new_user) = {
         let mut st = state.lock().await;
         let channels = st.entry(server_id.clone()).or_default();
@@ -26,7 +37,8 @@ pub async fn handle_connect_message(
         if let Some(result) = update_existing_user(channel, &user_name, src_addr).await {
             result
         } else {
-            let update_channel = add_new_user(channel, &user_name, src_addr, &socket).await;
+            let update_channel =
+                add_new_user(channel, &user_name, src_addr, &socket, nat_kind).await;
             (update_channel, true)
         }
     };

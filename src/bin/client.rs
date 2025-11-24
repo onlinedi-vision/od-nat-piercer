@@ -10,7 +10,7 @@ use std::{
 use od_nat_piercer::client::{
     handlers::*,
     networking::*,
-    structures::{PeerInfo, PunchState, PunchSync, RelayState, RelaySync},
+    structures::{NatKind, PeerInfo, PunchState, PunchSync, RelayState, RelaySync},
 };
 
 const SETUP_POLL_SLEEP_MS: u64 = 20;
@@ -48,8 +48,16 @@ fn send_connect_message(
     server_id: &str,
     channel: &str,
     user: &str,
+    my_nat: NatKind,
 ) {
-    let connect_msg = format!("CONNECT {} {} {}", server_id, channel, user);
+    let nat_type = match my_nat {
+        NatKind::Symmetric => "SYMMETRIC",
+        NatKind::Cone => "CONE",
+        NatKind::Public => "PUBLIC",
+        NatKind::Unknown => "UNKOWN",
+    };
+
+    let connect_msg = format!("CONNECT {} {} {} {}", server_id, channel, user, nat_type);
     socket
         .send_to(connect_msg.as_bytes(), &signaling_addr)
         .expect("Failed to send CONNECT");
@@ -324,6 +332,10 @@ fn main() -> std::io::Result<()> {
 
     let socket = setup_socket(local_port);
 
+    // NAT detection before CONNECT
+    let my_nat = detect_nat_kind(&socket, &signaling_ip);
+    println!("My NAT kind: {:?}", my_nat);
+
     //Address for the signalization server (UDP on port 5000)
     let signaling_addr = format!("{}:5000", signaling_ip);
     let server_socketaddr: std::net::SocketAddr = signaling_addr
@@ -332,7 +344,14 @@ fn main() -> std::io::Result<()> {
         .next()
         .expect("no addr for signaling server");
 
-    send_connect_message(&socket, &signaling_addr, &server_id, &channel, &user);
+    send_connect_message(
+        &socket,
+        &signaling_addr,
+        &server_id,
+        &channel,
+        &user,
+        my_nat,
+    );
 
     let peers: Vec<PeerInfo> = Vec::new();
     let peers = Arc::new(Mutex::new(peers));
@@ -374,12 +393,16 @@ fn main() -> std::io::Result<()> {
         &relay_sync,
     );
 
-    //pass send_via_server so a symmetric user stops punching
-    start_hole_punching(
-        socket.try_clone()?,
-        Arc::clone(&peers),
-        Arc::clone(&punch_sync),
-    );
+    // start punching ONLY if NAT is not symmetric
+    if my_nat != NatKind::Symmetric {
+        start_hole_punching(
+            socket.try_clone()?,
+            Arc::clone(&peers),
+            Arc::clone(&punch_sync),
+        );
+    } else {
+        println!("Symmetric NAT detected - skipping hole punching, relying on server relay.");
+    }
 
     //Relay keepalive thread starter
     start_relay_keepalive(

@@ -1,4 +1,4 @@
-use crate::client::structures::PeerInfo;
+use crate::client::structures::{NatKind, PeerInfo};
 use std::{
     net::{SocketAddr, UdpSocket},
     str::FromStr,
@@ -30,6 +30,7 @@ fn handle_mode_direct(parts: &[&str], peers: &Arc<Mutex<Vec<PeerInfo>>>, me: &st
                     created_at: Instant::now(),
                     use_server_relay: false,
                     relay_requested: false,
+                    nat_kind: NatKind::Unknown,
                 });
                 println!("Added peer {} with addr {}", username, addr_str);
             }
@@ -48,8 +49,14 @@ fn handle_user_left(parts: &[&str], peers: &Arc<Mutex<Vec<PeerInfo>>>) {
 
 fn handle_unrecognized_command(line: &str) {
     if line != "PING" && line != "HOLE_PUNCH" {
-        println!("Unhandled control line: {}", line);
+        return;
     }
+
+    if line.starts_with("NAT_SEEN ") {
+        return;
+    }
+
+    println!("Unhandled control line: {}", line);
 }
 
 pub fn handle_mode_line(

@@ -3,9 +3,9 @@ use std::net::UdpSocket;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use crate::client::structures::{PeerInfo, PunchSync, RelaySync};
+use crate::client::structures::{NatKind, PeerInfo, PunchSync, RelaySync};
 
 const PUNCH_INITIAL_SLEEP_MS: u64 = 500; //initial sleep between punches
 const PUNCH_MAX_SLEEP_MS: u64 = 3000; // max sleep value between punches
@@ -13,6 +13,60 @@ const HEARTBEAT_SLEEP_SEC: u64 = 20; // sleep between heartbeats
 const RELAY_TICK_SEC: u64 = 15; // how often the relay does keepalive work
 const PEER_TIMEOUT_SEC: u64 = 60; //peer timeout if no PONG message in this time
 const CONNECT_GRACE_SEC: u64 = 5; // wait for connection for this time, after this, ask server for relay
+const NAT_DETECT_TOTAL_TIMEOUT_MS: u64 = 600; // maximum waiting time for server to respond to both probes
+const NAT_DETECT_POLL_SLEEP_MS: u64 = 20; // sleep between polls when socket is WouldBlock
+
+pub fn detect_nat_kind(socket: &UdpSocket, signaling_ip: &str) -> NatKind {
+    let addr1 = format!("{}:5000", signaling_ip);
+    let addr2 = format!("{}:5001", signaling_ip);
+
+    let _ = socket.send_to(b"NAT_PROBE 1\n", &addr1);
+    let _ = socket.send_to(b"NAT_PROBE 2\n", &addr2);
+
+    let mut seen = Vec::new();
+    let mut buf = [0u8; 256];
+    let deadline = Instant::now() + Duration::from_millis(NAT_DETECT_TOTAL_TIMEOUT_MS);
+
+    while seen.len() < 2 && Instant::now() < deadline {
+        match socket.recv_from(&mut buf) {
+            Ok((len, _src)) => {
+                let msg = String::from_utf8_lossy(&buf[..len]).to_string();
+                if msg.starts_with("NAT_SEEN ") {
+                    if let Some(addr_str) = msg.split_whitespace().nth(1) {
+                        if let Ok(observed) = addr_str.parse::<std::net::SocketAddr>() {
+                            seen.push(observed);
+                        }
+                    }
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                std::thread::sleep(Duration::from_millis(NAT_DETECT_POLL_SLEEP_MS));
+            }
+            Err(_) => break,
+        }
+    }
+
+    if seen.len() < 2 {
+        println!("NAT detection: insufficient responses, treating as Unknown");
+        return NatKind::Unknown;
+    }
+
+    let a = seen[0];
+    let b = seen[1];
+
+    if a.ip() != b.ip() {
+        println!("NAT detection: different public IPs, treating as Symmetric");
+        return NatKind::Symmetric;
+    }
+
+    if a.port() == b.port() {
+        println!("NAT detection: CONE(same addr on both ports): {}", a);
+        NatKind::Cone
+    } else {
+        println!("NAT detection: SYMMETRIC (different ports): {} vs {}", a, b);
+        NatKind::Symmetric
+    }
+}
 
 fn heartbeat_loop(
     socket: UdpSocket,

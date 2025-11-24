@@ -1,4 +1,4 @@
-use crate::signaling::structures::{Channel, ServerMap, User};
+use crate::signaling::structures::{Channel, NatKind, ServerMap, User};
 use std::{net::SocketAddr, sync::Arc};
 use tokio::{net::UdpSocket, sync::Mutex};
 
@@ -7,7 +7,7 @@ fn pick_eligible_relay(channel: &Channel) -> Option<User> {
     channel
         .users
         .iter()
-        .find(|u| !u.needs_server_relay)
+        .find(|u| !u.needs_server_relay && !matches!(u.nat_kind, NatKind::Symmetric))
         .cloned()
 }
 

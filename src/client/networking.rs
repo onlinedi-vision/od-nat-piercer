@@ -202,7 +202,7 @@ fn relay_main_loop(
                         && !peer.relay_requested
                     {
                         println!(
-                            "Peer {} not connected after 5s - requesting server relay",
+                            "Peer {} not connected after 10s - requesting server relay",
                             peer.username
                         );
                         peer.relay_requested = true;

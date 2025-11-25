@@ -172,20 +172,48 @@ pub async fn handle_multiple_users_scenario(
     state: &Arc<Mutex<ServerMap>>,
 ) {
     if let Some(relay_user) = pick_eligible_relay(users_to_notify) {
-        let peers: Vec<User> = users_to_notify
-            .users
-            .iter()
-            .cloned()
-            .filter(|u| u.name != relay_user.name)
-            .collect();
+        let mut relay_peers: Vec<User> = Vec::new();
+        let mut symmetric_peers: Vec<User> = Vec::new();
 
+        for u in users_to_notify.users.iter() {
+            if u.name == relay_user.name {
+                continue;
+            }
+
+            if u.needs_server_relay {
+                symmetric_peers.push(u.clone());
+            } else {
+                relay_peers.push(u.clone());
+            }
+        }
+
+        // 1) mark relay for channel
         mark_relay_in_channel(state, server_id, channel_name, &relay_user).await;
-        notify_relay_about_peers(socket, &relay_user, &peers).await;
-        notify_peers_about_relay(socket, &relay_user, &peers).await;
+
+        // 2) notify relay about DIRECT peers
+        notify_relay_about_peers(socket, &relay_user, &relay_peers).await;
+
+        // 3) notify DIRECT peers about relay
+        notify_peers_about_relay(socket, &relay_user, &relay_peers).await;
+
+        // 4) relay receives MODE RELAY
         send_relay_mode_to_relay(socket, &relay_user).await;
+
+        // 5) SYMMETRIC peers: only get MODE SERVER_RELAY
+        for symmetric in symmetric_peers.iter() {
+            let msg = format!("MODE SERVER_RELAY {}\n", symmetric.name);
+
+            //1) send to symmetric user (to send via server)
+            let _ = socket.send_to(msg.as_bytes(), symmetric.addr).await;
+
+            //2) send to relay (to mark peer as peer.use_server_relay)
+            if relay_user.addr != symmetric.addr {
+                let _ = socket.send_to(msg.as_bytes(), relay_user.addr).await;
+            }
+        }
     } else {
-        // nici un user eligibil -> nu promovam pe nimeni, lasam serverul ca relay
-        // anuntam ca serverul va face relay pentru fiecare user din canal
+        // no eligible user -> no user gets promoted to relay, let server as relay
+        // announce that server will be relay for every user in the channel
         for u in &users_to_notify.users {
             let notify = format!("MODE SERVER_RELAY {}\n", u.name);
             for usr in &users_to_notify.users {
@@ -193,7 +221,7 @@ pub async fn handle_multiple_users_scenario(
             }
         }
 
-        // si marcam in state ca nu exista relay de user
+        // mark in state that there is no user relay
         let mut st = state.lock().await;
         if let Some(chans) = st.get_mut(server_id) {
             if let Some(ch) = chans.get_mut(channel_name) {

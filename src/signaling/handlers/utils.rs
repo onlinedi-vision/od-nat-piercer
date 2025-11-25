@@ -185,3 +185,22 @@ pub async fn handle_user_removal(
         lone_user_addr,
     )
 }
+
+pub async fn remove_user_from_other_channels(
+    st: &mut ServerMap,
+    server_id: &str,
+    channel_name: &str,
+    user_name: &str,
+    src_addr: SocketAddr,
+) {
+    if let Some(channels) = st.get_mut(server_id) {
+        for (cname, ch) in channels.iter_mut() {
+            if cname == channel_name {
+                continue;
+            }
+
+            ch.users
+                .retain(|u| !(u.name == user_name && u.addr == src_addr));
+        }
+    }
+}

@@ -16,13 +16,18 @@ pub async fn mark_relay_in_channel(
     server_id: &str,
     channel_name: &str,
     relay_user: &User,
-) {
+) -> bool {
     let mut st = state.lock().await;
     if let Some(channels) = st.get_mut(server_id) {
         if let Some(channel) = channels.get_mut(channel_name) {
+            if channel.relay.as_deref() == Some(&relay_user.name) {
+                return false;
+            }
             channel.relay = Some(relay_user.name.clone());
+            return true;
         }
     }
+    false
 }
 
 pub async fn notify_relay_about_peers(socket: &Arc<UdpSocket>, relay_user: &User, peers: &[User]) {
@@ -188,7 +193,7 @@ pub async fn handle_multiple_users_scenario(
         }
 
         // 1) mark relay for channel
-        mark_relay_in_channel(state, server_id, channel_name, &relay_user).await;
+        let changed = mark_relay_in_channel(state, server_id, channel_name, &relay_user).await;
 
         // 2) notify relay about DIRECT peers
         notify_relay_about_peers(socket, &relay_user, &relay_peers).await;
@@ -197,7 +202,9 @@ pub async fn handle_multiple_users_scenario(
         notify_peers_about_relay(socket, &relay_user, &relay_peers).await;
 
         // 4) relay receives MODE RELAY
-        send_relay_mode_to_relay(socket, &relay_user).await;
+        if changed {
+            send_relay_mode_to_relay(socket, &relay_user).await;
+        }
 
         // 5) SYMMETRIC peers: only get MODE SERVER_RELAY
         for symmetric in symmetric_peers.iter() {

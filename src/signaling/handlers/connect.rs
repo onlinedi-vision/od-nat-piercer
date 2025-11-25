@@ -4,7 +4,7 @@ use tokio::{net::UdpSocket, sync::Mutex};
 
 use super::{
     notifications::handle_connect_notifications,
-    utils::{add_new_user, update_existing_user},
+    utils::{add_new_user, remove_user_from_other_channels, update_existing_user},
 };
 
 pub async fn handle_connect_message(
@@ -31,6 +31,10 @@ pub async fn handle_connect_message(
 
     let (users_to_notify, is_new_user) = {
         let mut st = state.lock().await;
+
+        remove_user_from_other_channels(&mut st, &server_id, &channel_name, &user_name, src_addr)
+            .await;
+
         let channels = st.entry(server_id.clone()).or_default();
         let channel = channels.entry(channel_name.clone()).or_default();
 

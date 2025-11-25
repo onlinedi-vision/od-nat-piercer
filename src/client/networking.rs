@@ -17,8 +17,8 @@ const NAT_DETECT_TOTAL_TIMEOUT_MS: u64 = 600; // maximum waiting time for server
 const NAT_DETECT_POLL_SLEEP_MS: u64 = 20; // sleep between polls when socket is WouldBlock
 
 pub fn detect_nat_kind(socket: &UdpSocket, signaling_ip: &str) -> NatKind {
-    let addr1 = format!("{}:5000", signaling_ip);
-    let addr2 = format!("{}:5001", signaling_ip);
+    let addr1 = format!("{}:2131", signaling_ip);
+    let addr2 = format!("{}:2132", signaling_ip);
 
     let _ = socket.send_to(b"NAT_PROBE 1\n", &addr1);
     let _ = socket.send_to(b"NAT_PROBE 2\n", &addr2);

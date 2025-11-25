@@ -336,8 +336,8 @@ fn main() -> std::io::Result<()> {
     let my_nat = detect_nat_kind(&socket, &signaling_ip);
     println!("My NAT kind: {:?}", my_nat);
 
-    //Address for the signalization server (UDP on port 5000)
-    let signaling_addr = format!("{}:5000", signaling_ip);
+    //Address for the signalization server (UDP on port 2131)
+    let signaling_addr = format!("{}:2131", signaling_ip);
     let server_socketaddr: std::net::SocketAddr = signaling_addr
         .to_socket_addrs()
         .expect("resolve signaling server")

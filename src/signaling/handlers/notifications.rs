@@ -317,8 +317,11 @@ pub async fn handle_disconnect_notifications(
     server_id: String,
     channel_name: String,
 ) {
-    notify_lone_user(&socket, lone_user_addr).await;
-    handle_relay_transition(&socket, was_relay, &state, &server_id, &channel_name).await;
+    if lone_user_addr.is_some() {
+        notify_lone_user(&socket, lone_user_addr).await;
+    } else {
+        handle_relay_transition(&socket, was_relay, &state, &server_id, &channel_name).await;
+    }
     notify_all_about_departure(&socket, remaining_users, user_name, leaving_user_addr).await;
 }
 

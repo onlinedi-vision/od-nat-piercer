@@ -7,12 +7,12 @@ use std::time::{Duration, Instant};
 
 use crate::client::structures::{NatKind, PeerInfo, PunchSync, RelaySync};
 
-const PUNCH_INITIAL_SLEEP_MS: u64 = 500; //initial sleep between punches
-const PUNCH_MAX_SLEEP_MS: u64 = 3000; // max sleep value between punches
+const PUNCH_INITIAL_SLEEP_MS: u64 = 150; //initial sleep between punches
+const PUNCH_MAX_SLEEP_MS: u64 = 1500; // max sleep value between punches
 const HEARTBEAT_SLEEP_SEC: u64 = 20; // sleep between heartbeats
 const RELAY_TICK_SEC: u64 = 15; // how often the relay does keepalive work
 const PEER_TIMEOUT_SEC: u64 = 60; //peer timeout if no PONG message in this time
-const CONNECT_GRACE_SEC: u64 = 10; // wait for connection for this time, after this, ask server for relay
+const CONNECT_GRACE_SEC: u64 = 12; // wait for connection for this time, after this, ask server for relay
 const NAT_DETECT_TOTAL_TIMEOUT_MS: u64 = 600; // maximum waiting time for server to respond to both probes
 const NAT_DETECT_POLL_SLEEP_MS: u64 = 20; // sleep between polls when socket is WouldBlock
 

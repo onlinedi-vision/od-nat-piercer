@@ -115,9 +115,7 @@ fn handle_timed_out_user(
 
     if was_relay {
         handle_relay_timeout(channel, notifications);
-    }
-
-    if channel.users.len() == 1 {
+    } else if channel.users.len() == 1 {
         channel.relay = Some(channel.users[0].name.clone());
         notifications.push((vec![channel.users[0].addr], b"MODE RELAY\n".to_vec()));
     }

@@ -28,13 +28,21 @@ async fn run_server(
     socket_probe: Arc<UdpSocket>,
     state: Arc<Mutex<ServerMap>>,
 ) {
-    let mut buf_main = [0u8; 1024];
-    let mut buf_probe = [0u8; 1024];
+    let mut buf_main = [0u8; 2048];
+    let mut buf_probe = [0u8; 2048];
 
     loop {
         tokio::select! {
             res = socket_main.recv_from(&mut buf_main) => {
                 if let Ok((len,src)) = res{
+                    if let Some((hdr, payload)) = od_nat_piercer::proto::packet::decode(&buf_main[..len]){
+                        if hdr.kind == od_nat_piercer::proto::packet::Kind::Control{
+                            if let Ok(s) = std::str::from_utf8(payload){
+                                handle_message(s.to_string(), src, Arc::clone(&socket_main), Arc::clone(&state)).await;
+                            }
+                        }
+                        continue;
+                    }
                     let msg = String::from_utf8_lossy(&buf_main[..len]).to_string();
                     handle_message(msg, src, Arc::clone(&socket_main), Arc::clone(&state)).await;
                 }
@@ -42,6 +50,15 @@ async fn run_server(
 
             res = socket_probe.recv_from(&mut buf_probe) => {
                 if let Ok((len,src)) = res{
+                    if let Some((hdr, payload)) = od_nat_piercer::proto::packet::decode(&buf_main[..len]){
+                        if hdr.kind == od_nat_piercer::proto::packet::Kind::Control{
+                            if let Ok(s) = std::str::from_utf8(payload){
+                                handle_message(s.to_string(), src, Arc::clone(&socket_probe), Arc::clone(&state)).await;
+                            }
+                        }
+                        continue;
+                    }
+
                     let msg = String::from_utf8_lossy(&buf_probe[..len]).to_string();
                     handle_message(msg, src, Arc::clone(&socket_probe), Arc::clone(&state)).await;
                 }

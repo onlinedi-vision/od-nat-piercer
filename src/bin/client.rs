@@ -7,10 +7,13 @@ use std::{
     time::{Duration, Instant},
 };
 
-use od_nat_piercer::client::{
-    handlers::*,
-    networking::*,
-    structures::{NatKind, PeerInfo, PunchState, PunchSync, RelayState, RelaySync},
+use od_nat_piercer::{
+    client::{
+        handlers::*,
+        networking::*,
+        structures::{NatKind, PeerInfo, PunchState, PunchSync, RelayState, RelaySync},
+    },
+    proto::packet::{self, BROADCAST, Header, Kind},
 };
 
 const SETUP_POLL_SLEEP_MS: u64 = 20;
@@ -76,6 +79,22 @@ fn update_relay_is_active(
         st.is_active = active;
         cvar.notify_all(); //starts/stops relay loop instantly
     }
+}
+
+fn send_control_test(socket: &UdpSocket, signaling_addr: &str) {
+    let payload = b"CONTROL_TEST\n";
+    let hdr = Header {
+        kind: Kind::Control,
+        flags: 0,
+        channel_id: 0,
+        src_peer_id: 0,
+        dst_peer_id: BROADCAST,
+        stream_id: 0,
+        payload_len: payload.len() as u16,
+    };
+
+    let pkt = packet::encode(hdr, payload);
+    let _ = socket.send_to(&pkt, signaling_addr);
 }
 
 fn process_server_response(
@@ -160,6 +179,72 @@ fn handle_recv_result(
 ) -> bool {
     match result {
         Ok((len, src)) => {
+            if let Some((hdr, payload)) = od_nat_piercer::proto::packet::decode(&buf[..len]) {
+                match hdr.kind {
+                    Kind::Control => {
+                        println!("(setup) Got CONTROL {} bytes from {}", payload.len(), src);
+
+                        //temporarly: if payload is text, process as before
+                        if let Ok(s) = std::str::from_utf8(payload) {
+                            println!("(setup) CONTROL payload: {}", s.trim());
+                            if &src == server_socketaddr {
+                                if s.lines().any(|l| l.trim_start().starts_with("MODE ")) {
+                                    *saw_mode = true;
+                                }
+
+                                // 1) Normal processing: MODE / DATA / USER_LEFT, etc
+                                process_incoming_message(
+                                    socket,
+                                    s,
+                                    src,
+                                    peers,
+                                    &user,
+                                    is_relay,
+                                    channel_has_server_relays,
+                                    signaling_addr,
+                                );
+
+                                // 2) Local mode + send_via_server / punching behaviors
+                                process_server_response(
+                                    s,
+                                    user,
+                                    is_relay,
+                                    channel_has_server_relays,
+                                    send_via_server,
+                                    punch_sync,
+                                );
+
+                                update_relay_is_active(
+                                    is_relay,
+                                    channel_has_server_relays,
+                                    relay_sync,
+                                );
+                            } else {
+                                // peer traffic (arrived during setup)
+                                handle_peer_message(peers, src);
+
+                                process_incoming_message(
+                                    socket,
+                                    s,
+                                    src,
+                                    peers,
+                                    &user,
+                                    is_relay,
+                                    channel_has_server_relays,
+                                    signaling_addr,
+                                );
+                            }
+                        }
+                    }
+                    Kind::Dtls => {
+                        println!("(setup) Got DTLS {} bytes from {}", payload.len(), src);
+                    }
+                    Kind::Srtp => {
+                        println!("(setup) Got SRTP {} bytes from {}", payload.len(), src);
+                    }
+                }
+                return true;
+            }
             let resp = String::from_utf8_lossy(&buf[..len]).to_string();
             if &src == server_socketaddr {
                 if resp.lines().any(|l| l.trim_start().starts_with("MODE ")) {
@@ -229,7 +314,7 @@ fn server_responses_during_setup(
     punch_sync: &PunchSync,
     relay_sync: &RelaySync,
 ) {
-    let mut buf = [0u8; 1024];
+    let mut buf = [0u8; 2048];
     let setup_deadline = Instant::now() + Duration::from_millis(SETUP_DEADLINE_MS);
     let mut saw_mode = false;
 
@@ -267,12 +352,37 @@ fn main_loop(
     relay_sync: &RelaySync,
     send_via_server: &Arc<AtomicBool>,
 ) -> std::io::Result<()> {
-    let mut buf = [0u8; 1024];
+    let mut buf = [0u8; 2048];
 
     println!("Starting main message loop...");
     loop {
         match socket.recv_from(&mut buf) {
             Ok((len, src)) => {
+                if let Some((hdr, payload)) = od_nat_piercer::proto::packet::decode(&buf[..len]) {
+                    match hdr.kind {
+                        Kind::Control => {
+                            println!("Got CONTROL {} bytes from {}", payload.len(), src);
+                            //temporarly: if payload is text, parse it as before
+                            if let Ok(s) = std::str::from_utf8(payload) {
+                                println!("CONTROL payload: {}", s.trim());
+                                process_incoming_message(
+                                    socket,
+                                    s,
+                                    src,
+                                    peers,
+                                    &user,
+                                    is_relay,
+                                    channel_has_server_relays,
+                                    signaling_addr,
+                                );
+                            }
+                        }
+                        Kind::Dtls => println!("Got DTLS {} bytes from {}", payload.len(), src),
+                        Kind::Srtp => println!("Got SRTP {} bytes from {}", payload.len(), src),
+                    }
+                    continue;
+                }
+
                 let message = String::from_utf8_lossy(&buf[..len]).to_string();
 
                 if &src == server_socketaddr {
@@ -352,6 +462,8 @@ fn main() -> std::io::Result<()> {
         &user,
         my_nat,
     );
+
+    send_control_test(&socket, &signaling_addr);
 
     let peers: Vec<PeerInfo> = Vec::new();
     let peers = Arc::new(Mutex::new(peers));

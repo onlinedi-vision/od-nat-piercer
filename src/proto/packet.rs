@@ -3,7 +3,6 @@ pub const VERSION: u8 = 1;
 pub const BROADCAST: u32 = 0xFFFF_FFFF;
 
 #[repr(u8)]
-// this is a rust attribute: when this enum is reprezented as a number (in memory/when we write is as bytes), use u8
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Kind {
     Control = 1,
@@ -40,7 +39,7 @@ pub fn encode(h: Header, payload: &[u8]) -> Vec<u8> {
     out.extend_from_slice(&MAGIC);
     out.push(VERSION);
     out.push(h.kind as u8);
-    out.extend_from_slice(&h.flags.to_le_bytes()); //to_le = to_little_endian - stores the least significant byte first, at the lowest memory address
+    out.extend_from_slice(&h.flags.to_le_bytes());
     out.extend_from_slice(&h.channel_id.to_le_bytes());
     out.extend_from_slice(&h.src_peer_id.to_le_bytes());
     out.extend_from_slice(&h.dst_peer_id.to_le_bytes());
@@ -160,7 +159,6 @@ mod tests {
             payload_len: payload.len() as u16,
         };
         let buf = encode(h, payload);
-        //truncate last byte
         let truncated = &buf[..buf.len() - 1];
         assert!(decode(truncated).is_none());
     }

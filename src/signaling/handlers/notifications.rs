@@ -1,4 +1,7 @@
-use crate::signaling::structures::{Channel, NatKind, ServerMap, User};
+use crate::{
+    proto::control_text::{MSG_DIRECT, MSG_MODE, MSG_RELAY, MSG_SERVER_RELAY, MSG_USER_LEFT},
+    signaling::structures::{Channel, NatKind, ServerMap, User},
+};
 use std::{net::SocketAddr, sync::Arc};
 use tokio::{net::UdpSocket, sync::Mutex};
 
@@ -32,7 +35,7 @@ pub async fn mark_relay_in_channel(
 
 pub async fn notify_relay_about_peers(socket: &Arc<UdpSocket>, relay_user: &User, peers: &[User]) {
     for peer in peers {
-        let msg = format!("MODE DIRECT {} {}\n", peer.name, peer.addr);
+        let msg = format!("{} {} {} {}\n", MSG_MODE, MSG_DIRECT, peer.name, peer.addr);
         if let Err(e) = socket.send_to(msg.as_bytes(), relay_user.addr).await {
             eprintln!(
                 "Failed to notify relay {} about {}: {}",
@@ -44,7 +47,10 @@ pub async fn notify_relay_about_peers(socket: &Arc<UdpSocket>, relay_user: &User
 
 pub async fn notify_peers_about_relay(socket: &Arc<UdpSocket>, relay_user: &User, peers: &[User]) {
     for peer in peers {
-        let msg = format!("MODE DIRECT {} {}\n", relay_user.name, relay_user.addr);
+        let msg = format!(
+            "{} {} {} {}\n",
+            MSG_MODE, MSG_DIRECT, relay_user.name, relay_user.addr
+        );
         if let Err(e) = socket.send_to(msg.as_bytes(), peer.addr).await {
             eprintln!(
                 "Failed to notify {} about new relay{}: {}",
@@ -55,7 +61,7 @@ pub async fn notify_peers_about_relay(socket: &Arc<UdpSocket>, relay_user: &User
 }
 
 pub async fn send_relay_mode_to_relay(socket: &Arc<UdpSocket>, relay_user: &User) {
-    let reply = "MODE RELAY\n";
+    let reply = format!("{MSG_MODE} {MSG_RELAY}\n");
     if let Err(e) = socket.send_to(reply.as_bytes(), relay_user.addr).await {
         eprintln!("Failed to send RELAY mode to {}: {}", relay_user.name, e);
     }
@@ -69,12 +75,13 @@ pub async fn notify_existing_users_about_new_user(
 ) {
     for user in users.iter() {
         if user.addr != new_user_addr {
-            let msg_to_existing = format!("MODE DIRECT {} {}\n", new_user_name, new_user_addr);
+            let msg_to_existing =
+                format!("{MSG_MODE} {MSG_DIRECT} {new_user_name} {new_user_addr}\n");
             if let Err(e) = socket.send_to(msg_to_existing.as_bytes(), user.addr).await {
                 eprintln!("Failed to notify {}: {}", user.name, e);
             }
 
-            let msg_to_new = format!("MODE DIRECT {} {}\n", user.name, user.addr);
+            let msg_to_new = format!("{} {} {} {}\n", MSG_MODE, MSG_DIRECT, user.name, user.addr);
             if let Err(e) = socket.send_to(msg_to_new.as_bytes(), new_user_addr).await {
                 eprintln!("Failed to notify new user: {}", e);
             }
@@ -84,7 +91,10 @@ pub async fn notify_existing_users_about_new_user(
 
 pub async fn promote_new_relay(socket: &Arc<UdpSocket>, new_relay: &User) {
     if let Err(e) = socket
-        .send_to("MODE RELAY\n".as_bytes(), new_relay.addr)
+        .send_to(
+            format!("{MSG_MODE} {MSG_RELAY}\n").as_bytes(),
+            new_relay.addr,
+        )
         .await
     {
         eprintln!(
@@ -96,7 +106,7 @@ pub async fn promote_new_relay(socket: &Arc<UdpSocket>, new_relay: &User) {
 
 pub async fn notify_lone_user(socket: &Arc<UdpSocket>, lone_user_addr: Option<SocketAddr>) {
     if let Some(lone_user_addr) = lone_user_addr {
-        let reply = "MODE RELAY\n";
+        let reply = format!("{MSG_MODE} {MSG_RELAY}\n");
         if let Err(e) = socket.send_to(reply.as_bytes(), lone_user_addr).await {
             eprintln!("Failed to notify lone user: {}", e);
         }
@@ -109,7 +119,10 @@ pub async fn notify_peers_about_new_relay(
     peers: &[User],
 ) {
     for user in peers {
-        let msg = format!("MODE DIRECT {} {}\n", new_relay.name, new_relay.addr);
+        let msg = format!(
+            "{} {} {} {}\n",
+            MSG_MODE, MSG_DIRECT, new_relay.name, new_relay.addr
+        );
         if let Err(e) = socket.send_to(msg.as_bytes(), user.addr).await {
             eprintln!("Failed to notify {} about new relay: {}", user.name, e);
         }
@@ -122,7 +135,7 @@ pub async fn notify_new_relay_about_peers(
     peers: &[User],
 ) {
     for user in peers {
-        let msg = format!("MODE DIRECT {} {}\n", user.name, user.addr);
+        let msg = format!("{} {} {} {}\n", MSG_MODE, MSG_DIRECT, user.name, user.addr);
         if let Err(e) = socket.send_to(msg.as_bytes(), new_relay.addr).await {
             eprintln!(
                 "Failed to notify {} about connected users: {}",
@@ -140,7 +153,8 @@ pub async fn notify_all_about_departure(
 ) {
     for user in remaining_users {
         let departure_msg = format!(
-            "USER_LEFT {} {}\n",
+            "{} {} {}\n",
+            MSG_USER_LEFT,
             user_name,
             leaving_user_addr
                 .map(|a| a.to_string())
@@ -208,7 +222,7 @@ pub async fn handle_multiple_users_scenario(
 
         // 5) SYMMETRIC peers: only get MODE SERVER_RELAY
         for symmetric in symmetric_peers.iter() {
-            let msg = format!("MODE SERVER_RELAY {}\n", symmetric.name);
+            let msg = format!("{} {} {}\n", MSG_MODE, MSG_SERVER_RELAY, symmetric.name);
 
             //1) send to symmetric user (to send via server)
             let _ = socket.send_to(msg.as_bytes(), symmetric.addr).await;
@@ -222,7 +236,7 @@ pub async fn handle_multiple_users_scenario(
         // no eligible user -> no user gets promoted to relay, let server as relay
         // announce that server will be relay for every user in the channel
         for u in &users_to_notify.users {
-            let notify = format!("MODE SERVER_RELAY {}\n", u.name);
+            let notify = format!("{} {} {}\n", MSG_MODE, MSG_SERVER_RELAY, u.name);
             for usr in &users_to_notify.users {
                 let _ = socket.send_to(notify.as_bytes(), usr.addr).await;
             }
@@ -290,7 +304,7 @@ pub async fn handle_relay_transition(
         } else {
             //nici un user eligibil -> ramane serverul ca relay, anuntam SERVER_RELAY pentru toti
             for u in &channel.users {
-                let notify = format!("MODE SERVER_RELAY {}\n", u.name);
+                let notify = format!("{} {} {}\n", MSG_MODE, MSG_SERVER_RELAY, u.name);
                 for usr in &channel.users {
                     let _ = socket.send_to(notify.as_bytes(), usr.addr).await;
                 }
@@ -358,7 +372,7 @@ pub async fn handle_peer_timeout(
         for u in channel.users {
             let _ = socket
                 .send_to(
-                    format!("USER_LEFT {} 0.0.0.0:0\n", peer_user).as_bytes(),
+                    format!("{MSG_USER_LEFT} {peer_user} 0.0.0.0:0\n").as_bytes(),
                     u.addr,
                 )
                 .await;

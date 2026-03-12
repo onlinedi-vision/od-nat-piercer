@@ -6,6 +6,10 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::client::structures::{NatKind, PeerInfo, PunchSync, RelaySync};
+use crate::proto::control_text::{
+    MSG_DATA, MSG_HB, MSG_HOLE_PUNCH, MSG_NAT_PROBE, MSG_NAT_SEEN, MSG_PEER_TIMEOUT, MSG_PING,
+    MSG_REQUEST_RELAY, NAT_TYPE_CONE, NAT_TYPE_SYMMETRIC,
+};
 
 const PUNCH_INITIAL_SLEEP_MS: u64 = 150; //initial sleep between punches
 const PUNCH_MAX_SLEEP_MS: u64 = 1500; // max sleep value between punches
@@ -20,8 +24,8 @@ pub fn detect_nat_kind(socket: &UdpSocket, signaling_ip: &str) -> NatKind {
     let addr1 = format!("{}:2131", signaling_ip);
     let addr2 = format!("{}:2132", signaling_ip);
 
-    let _ = socket.send_to(b"NAT_PROBE 1\n", &addr1);
-    let _ = socket.send_to(b"NAT_PROBE 2\n", &addr2);
+    let _ = socket.send_to(format!("{MSG_NAT_PROBE} 1\n").as_bytes(), &addr1);
+    let _ = socket.send_to(format!("{MSG_NAT_PROBE} 2\n").as_bytes(), &addr2);
 
     let mut seen = Vec::new();
     let mut buf = [0u8; 256];
@@ -31,7 +35,7 @@ pub fn detect_nat_kind(socket: &UdpSocket, signaling_ip: &str) -> NatKind {
         match socket.recv_from(&mut buf) {
             Ok((len, _src)) => {
                 let msg = String::from_utf8_lossy(&buf[..len]).to_string();
-                if msg.starts_with("NAT_SEEN ") {
+                if msg.starts_with(&format!("{MSG_NAT_SEEN} ")) {
                     if let Some(addr_str) = msg.split_whitespace().nth(1) {
                         if let Ok(observed) = addr_str.parse::<std::net::SocketAddr>() {
                             seen.push(observed);
@@ -60,10 +64,10 @@ pub fn detect_nat_kind(socket: &UdpSocket, signaling_ip: &str) -> NatKind {
     }
 
     if a.port() == b.port() {
-        println!("NAT detection: CONE(same addr on both ports): {}", a);
+        println!("NAT detection: {NAT_TYPE_CONE} (same addr on both ports): {a}",);
         NatKind::Cone
     } else {
-        println!("NAT detection: SYMMETRIC (different ports): {} vs {}", a, b);
+        println!("NAT detection: {NAT_TYPE_SYMMETRIC} (different ports): {a} vs {b}",);
         NatKind::Symmetric
     }
 }
@@ -76,7 +80,7 @@ fn heartbeat_loop(
     signaling_addr: String,
 ) {
     loop {
-        let hb = format!("HB {} {} {}", server_id, channel, user);
+        let hb = format!("{MSG_HB} {server_id} {channel} {user}");
         let _ = socket.send_to(hb.as_bytes(), &signaling_addr);
         thread::sleep(Duration::from_secs(HEARTBEAT_SLEEP_SEC));
     }
@@ -118,7 +122,7 @@ fn hole_punching_loop(socket: UdpSocket, peers: Arc<Mutex<Vec<PeerInfo>>>, sync:
                     continue; //don't punch server-relayed peers
                 }
 
-                if let Err(e) = socket.send_to(b"HOLE_PUNCH", p.addr) {
+                if let Err(e) = socket.send_to(MSG_HOLE_PUNCH.as_bytes(), p.addr) {
                     eprintln!("Failed to send punch to {}: {}", p.addr, e);
                 } else {
                     println!("Sent UDP punch to {} ({})", p.username, p.addr);
@@ -159,7 +163,11 @@ fn handle_peer_timeout(
 ) {
     println!("Peer {} timeout - reporting to server", peer.username);
     let _ = socket.send_to(
-        format!("PEER_TIMEOUT {} {} {}", server_id, channel, peer.username).as_bytes(),
+        format!(
+            "{MSG_PEER_TIMEOUT} {} {} {}",
+            server_id, channel, peer.username
+        )
+        .as_bytes(),
         &signaling_addr,
     );
 }
@@ -193,7 +201,7 @@ fn relay_main_loop(
                     handle_peer_timeout(socket, server_id, channel, peer, signaling_addr);
                     to_remove.push(i);
                 } else {
-                    if let Err(e) = socket.send_to(b"PING", peer.addr) {
+                    if let Err(e) = socket.send_to(MSG_PING.as_bytes(), peer.addr) {
                         eprintln!("Failed to send PING to {}: {}", peer.addr, e);
                     }
 
@@ -208,7 +216,7 @@ fn relay_main_loop(
                         peer.relay_requested = true;
                         let _ = socket.send_to(
                             format!(
-                                "REQUEST_RELAY {} {} {}\n",
+                                "{MSG_REQUEST_RELAY} {} {} {}\n",
                                 server_id, channel, peer.username
                             )
                             .as_bytes(),
@@ -312,11 +320,11 @@ fn handle_user_message(
     is_relay: &Arc<Mutex<bool>>,
     channel_has_server_relays: &Arc<AtomicBool>,
 ) {
-    let payload = format!("DATA {} {}\n", username, message);
+    let payload = format!("{MSG_DATA} {username} {message}\n");
 
     // if i am simmetric, send via server
     if send_via_server {
-        println!("Sending DATA via server relay: {}", message);
+        println!("Sending {MSG_DATA} via server relay: {message}");
         let _ = socket.send_to(payload.as_bytes(), signaling_addr);
         return;
     }

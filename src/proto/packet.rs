@@ -34,6 +34,24 @@ pub struct Header {
 
 pub const HEADER_LEN: usize = 26;
 
+impl Header {
+    pub fn control(channel_id: u32, src_peer_id: u32, dst_peer_id: u32, payload_len: u16) -> Self {
+        Self {
+            kind: Kind::Control,
+            flags: 0,
+            channel_id,
+            src_peer_id,
+            dst_peer_id,
+            stream_id: 0,
+            payload_len,
+        }
+    }
+
+    pub fn welcome(channel_id: u32, dst_peer_id: u32, payload_len: u16) -> Self {
+        Self::control(channel_id, 0, dst_peer_id, payload_len)
+    }
+}
+
 pub fn encode(h: Header, payload: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(HEADER_LEN + payload.len());
     out.extend_from_slice(&MAGIC);

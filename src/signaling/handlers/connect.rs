@@ -17,15 +17,7 @@ use super::{
 
 async fn send_welcome(socket: &Arc<UdpSocket>, dst: SocketAddr, channel_id: u32, peer_id: u32) {
     let payload = format!("{MSG_WELCOME} to cid:{channel_id} with pid:{peer_id}\n");
-    let hdr = Header {
-        kind: Kind::Control,
-        flags: 0,
-        channel_id,
-        src_peer_id: 0, //for now
-        dst_peer_id: peer_id,
-        stream_id: 0,
-        payload_len: payload.len() as u16,
-    };
+    let hdr = Header::welcome(channel_id, peer_id, payload.len() as u16);
 
     let pkt = packet::encode(hdr, payload.as_bytes());
     let _ = socket.send_to(&pkt, dst).await;

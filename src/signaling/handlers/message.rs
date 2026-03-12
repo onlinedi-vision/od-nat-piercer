@@ -1,3 +1,4 @@
+use crate::proto::packet::{BROADCAST, Header, Kind, encode};
 use crate::signaling::structures::ServerMap;
 use std::{net::SocketAddr, sync::Arc};
 use tokio::{net::UdpSocket, sync::Mutex};
@@ -54,6 +55,23 @@ pub async fn handle_message(
 
             "DATA" if parts.len() >= 3 => {
                 handle_data_from_client(&msg, src, socket, state).await;
+            }
+
+            "CONTROL_TEST" => {
+                println!("CONTROL_TEST from {}", src);
+
+                let payload = b"CONTROL_TEST_OK\n";
+                let hdr = Header {
+                    kind: Kind::Control,
+                    flags: 0,
+                    channel_id: 0,
+                    src_peer_id: 0,
+                    dst_peer_id: BROADCAST,
+                    stream_id: 0,
+                    payload_len: payload.len() as u16,
+                };
+                let pkt = encode(hdr, payload);
+                let _ = socket.send_to(&pkt, src).await;
             }
 
             _ => {

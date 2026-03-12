@@ -59,22 +59,6 @@ pub async fn remove_old_user_sessions(
         .retain(|u| !(u.name == user_name && u.addr != src_addr));
 }
 
-pub async fn create_new_user(
-    user_name: &str,
-    src_addr: SocketAddr,
-    nat_kind: NatKind,
-    peer_id: u32,
-) -> User {
-    User {
-        peer_id,
-        name: user_name.to_string(),
-        addr: src_addr,
-        last_pong: Instant::now(),
-        needs_server_relay: matches!(nat_kind, NatKind::Symmetric),
-        nat_kind,
-    }
-}
-
 pub async fn handle_lone_user_scenario(channel: &mut Channel, socket: &Arc<UdpSocket>) {
     if channel.relay.is_none() && channel.users.len() == 1 {
         let u = &channel.users[0];
@@ -116,7 +100,7 @@ pub async fn add_new_user(
     let peer_id = channel.next_peer_id;
     channel.next_peer_id += 1;
 
-    let new_user = create_new_user(user_name, src_addr, nat_kind, peer_id).await;
+    let new_user = User::new(user_name, src_addr, nat_kind, peer_id);
     channel.users.push(new_user);
 
     handle_lone_user_scenario(channel, socket).await;

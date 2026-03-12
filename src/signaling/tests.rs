@@ -1,6 +1,4 @@
-use crate::signaling::handlers::utils::{
-    add_new_user, create_new_user, make_channel_id, update_existing_user,
-};
+use crate::signaling::handlers::utils::{add_new_user, make_channel_id, update_existing_user};
 
 use crate::signaling::structures::{Channel, NatKind, User};
 use std::sync::Arc;
@@ -8,6 +6,29 @@ use std::sync::Arc;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn user_new_sets_fields_correctly() {
+        let addr: std::net::SocketAddr = "127.0.0.1:5000".parse().unwrap();
+
+        let user = User::new("name", addr, NatKind::Cone, 7);
+
+        assert_eq!(user.name, "name");
+        assert_eq!(user.addr, addr);
+        assert_eq!(user.peer_id, 7);
+        assert!(!user.needs_server_relay);
+        assert_eq!(user.nat_kind, NatKind::Cone);
+    }
+
+    #[test]
+    fn user_new_marks_symmetric_as_server_relay() {
+        let addr: std::net::SocketAddr = "127.0.0.1:5001".parse().unwrap();
+
+        let user = User::new("name", addr, NatKind::Symmetric, 9);
+
+        assert_eq!(user.peer_id, 9);
+        assert!(user.needs_server_relay);
+    }
 
     #[test]
     fn make_channel_id_is_stable_for_same_input() {
@@ -34,7 +55,7 @@ mod tests {
     async fn create_new_user_sets_fields_correctly() {
         let addr: std::net::SocketAddr = "127.0.0.1:5000".parse().unwrap();
 
-        let user = create_new_user("name", addr, NatKind::Cone, 7).await;
+        let user = User::new("name", addr, NatKind::Cone, 7);
 
         assert_eq!(user.name, "name");
         assert_eq!(user.addr, addr);
@@ -47,7 +68,7 @@ mod tests {
     async fn create_new_user_marks_symmetric_as_server_relay() {
         let addr: std::net::SocketAddr = "127.0.0.1:5000".parse().unwrap();
 
-        let user = create_new_user("name", addr, NatKind::Symmetric, 9).await;
+        let user = User::new("name", addr, NatKind::Symmetric, 9);
 
         assert_eq!(user.peer_id, 9);
         assert!(user.needs_server_relay);

@@ -18,6 +18,19 @@ pub struct User {
     pub nat_kind: NatKind,
 }
 
+impl User {
+    pub fn new(user_name: &str, addr: SocketAddr, nat_kind: NatKind, peer_id: u32) -> Self {
+        Self {
+            peer_id,
+            name: user_name.to_string(),
+            addr,
+            last_pong: Instant::now(),
+            needs_server_relay: matches!(nat_kind, NatKind::Symmetric),
+            nat_kind,
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Channel {
     pub channel_id: u32,

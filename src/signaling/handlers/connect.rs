@@ -6,7 +6,7 @@ use crate::{
     },
 };
 
-use crate::proto::packet::{self, Header, Kind};
+use crate::proto::packet::{self, Header};
 use std::{net::SocketAddr, sync::Arc};
 use tokio::{net::UdpSocket, sync::Mutex};
 

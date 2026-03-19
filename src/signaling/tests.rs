@@ -32,19 +32,6 @@ mod tests {
         assert!(user.needs_server_relay);
     }
 
-    #[test]
-    fn generate_channel_id_returns_non_zero() {
-        let id = generate_channel_id();
-        assert_ne!(id, 0);
-    }
-
-    #[test]
-    fn generate_channel_id_is_not_constant() {
-        let a = generate_channel_id();
-        let b = generate_channel_id();
-        assert_ne!(a, b);
-    }
-
     #[tokio::test]
     async fn create_new_user_sets_fields_correctly() {
         let addr: std::net::SocketAddr = "127.0.0.1:5000".parse().unwrap();

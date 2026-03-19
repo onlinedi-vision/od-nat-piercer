@@ -2,21 +2,8 @@ use crate::{
     proto::control_text::{MSG_MODE, MSG_RELAY, MSG_SERVER_RELAY},
     signaling::structures::{Channel, NatKind, ServerMap, User},
 };
-use std::{
-    collections::hash_map::DefaultHasher,
-    hash::{Hash, Hasher},
-    net::SocketAddr,
-    sync::Arc,
-    time::Instant,
-};
+use std::{net::SocketAddr, sync::Arc, time::Instant};
 use tokio::{net::UdpSocket, sync::Mutex};
-
-pub fn make_channel_id(server_id: &str, channel_name: &str) -> u32 {
-    let mut h = DefaultHasher::new();
-    server_id.hash(&mut h);
-    channel_name.hash(&mut h);
-    (h.finish() & 0xFFFF_FFFF) as u32
-}
 
 pub async fn get_remaining_users(
     state: &Arc<Mutex<ServerMap>>,

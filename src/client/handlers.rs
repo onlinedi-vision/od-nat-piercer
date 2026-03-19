@@ -10,16 +10,16 @@ use std::{
     str::FromStr,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, AtomicU32, Ordering},
+        atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
     },
     time::Instant,
 };
 
-pub fn try_handle_welcome(s: &str, channel_id: &Arc<AtomicU32>, my_peer_id: &Arc<AtomicU32>) {
+pub fn try_handle_welcome(s: &str, channel_id: &Arc<AtomicU64>, my_peer_id: &Arc<AtomicU32>) {
     for line in s.lines() {
         let parts: Vec<&str> = line.split_whitespace().collect();
         if parts.len() == 3 && parts[0] == MSG_WELCOME {
-            if let (Ok(cid), Ok(pid)) = (parts[1].parse::<u32>(), parts[2].parse::<u32>()) {
+            if let (Ok(cid), Ok(pid)) = (parts[1].parse::<u64>(), parts[2].parse::<u32>()) {
                 channel_id.store(cid, Ordering::Release);
                 my_peer_id.store(pid, Ordering::Release);
                 println!("{MSG_WELCOME} received: channel_id={cid}, my_peer_id={pid}");

@@ -1,8 +1,8 @@
 use crate::{
     proto::control_text::{MSG_WELCOME, NAT_TYPE_CONE, NAT_TYPE_PUBLIC, NAT_TYPE_SYMMETRIC},
     signaling::{
-        handlers::utils::make_channel_id,
         structures::{NatKind, ServerMap},
+        utils::generate_channel_id,
     },
 };
 
@@ -15,7 +15,7 @@ use super::{
     utils::{add_new_user, remove_user_from_other_channels, update_existing_user},
 };
 
-async fn send_welcome(socket: &Arc<UdpSocket>, dst: SocketAddr, channel_id: u32, peer_id: u32) {
+async fn send_welcome(socket: &Arc<UdpSocket>, dst: SocketAddr, channel_id: u64, peer_id: u32) {
     let payload = format!("{MSG_WELCOME} to cid:{channel_id} with pid:{peer_id}\n");
     let hdr = Header::welcome(channel_id, peer_id, payload.len() as u16);
 
@@ -55,7 +55,7 @@ pub async fn handle_connect_message(
         let channel = channels.entry(channel_name.clone()).or_default();
 
         if channel.channel_id == 0 {
-            channel.channel_id = make_channel_id(&server_id, &channel_name);
+            channel.channel_id = generate_channel_id();
         }
 
         let channel_id = channel.channel_id;

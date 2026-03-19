@@ -33,7 +33,7 @@ impl User {
 
 #[derive(Clone, Debug)]
 pub struct Channel {
-    pub channel_id: u32,
+    pub channel_id: u64,
     pub next_peer_id: u32,
     pub users: Vec<User>,
     pub relay: Option<String>,

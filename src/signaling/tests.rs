@@ -1,10 +1,12 @@
-use crate::signaling::handlers::utils::{add_new_user, make_channel_id, update_existing_user};
+use crate::signaling::handlers::utils::{add_new_user, update_existing_user};
 
 use crate::signaling::structures::{Channel, NatKind, User};
 use std::sync::Arc;
 
 #[cfg(test)]
 mod tests {
+    use crate::signaling::utils::generate_channel_id;
+
     use super::*;
 
     #[test]
@@ -31,23 +33,15 @@ mod tests {
     }
 
     #[test]
-    fn make_channel_id_is_stable_for_same_input() {
-        let a = make_channel_id("server1", "channel1");
-        let b = make_channel_id("server1", "channel1");
-        assert_eq!(a, b);
+    fn generate_channel_id_returns_non_zero() {
+        let id = generate_channel_id();
+        assert_ne!(id, 0);
     }
 
     #[test]
-    fn make_channel_id_differs_for_different_channels() {
-        let a = make_channel_id("server1", "channel1");
-        let b = make_channel_id("server1", "channel2");
-        assert_ne!(a, b);
-    }
-
-    #[test]
-    fn make_channel_id_differs_for_different_servers() {
-        let a = make_channel_id("server1", "channel1");
-        let b = make_channel_id("server2", "channel1");
+    fn generate_channel_id_is_not_constant() {
+        let a = generate_channel_id();
+        let b = generate_channel_id();
         assert_ne!(a, b);
     }
 

@@ -3,7 +3,7 @@ use std::{
     net::{ToSocketAddrs, UdpSocket},
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, AtomicU32, Ordering},
+        atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
     },
     thread,
     time::{Duration, Instant},
@@ -168,7 +168,7 @@ fn handle_recv_result(
     saw_mode: &mut bool,
     punch_sync: &PunchSync,
     relay_sync: &RelaySync,
-    channel_id: &Arc<AtomicU32>,
+    channel_id: &Arc<AtomicU64>,
     my_peer_id: &Arc<AtomicU32>,
 ) -> bool {
     match result {
@@ -316,7 +316,7 @@ fn server_responses_during_setup(
     signaling_addr: &str,
     punch_sync: &PunchSync,
     relay_sync: &RelaySync,
-    channel_id: &Arc<AtomicU32>,
+    channel_id: &Arc<AtomicU64>,
     my_peer_id: &Arc<AtomicU32>,
 ) {
     let mut buf = [0u8; 2048];
@@ -358,7 +358,7 @@ fn main_loop(
     punch_sync: &PunchSync,
     relay_sync: &RelaySync,
     send_via_server: &Arc<AtomicBool>,
-    channel_id: &Arc<AtomicU32>,
+    channel_id: &Arc<AtomicU64>,
     my_peer_id: &Arc<AtomicU32>,
 ) -> std::io::Result<()> {
     let mut buf = [0u8; 2048];
@@ -453,7 +453,7 @@ fn main() -> std::io::Result<()> {
     let socket = setup_socket(local_port);
 
     let my_peer_id = Arc::new(AtomicU32::new(0));
-    let channel_id = Arc::new(AtomicU32::new(0));
+    let channel_id = Arc::new(AtomicU64::new(0));
 
     // NAT detection before CONNECT
     let my_nat = detect_nat_kind(&socket, &signaling_ip);

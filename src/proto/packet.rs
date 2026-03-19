@@ -25,17 +25,17 @@ impl Kind {
 pub struct Header {
     pub kind: Kind,
     pub flags: u16,
-    pub channel_id: u32,
+    pub channel_id: u64,
     pub src_peer_id: u32,
     pub dst_peer_id: u32,
     pub stream_id: u32,
     pub payload_len: u16,
 }
 
-pub const HEADER_LEN: usize = 26;
+pub const HEADER_LEN: usize = 30;
 
 impl Header {
-    pub fn control(channel_id: u32, src_peer_id: u32, dst_peer_id: u32, payload_len: u16) -> Self {
+    pub fn control(channel_id: u64, src_peer_id: u32, dst_peer_id: u32, payload_len: u16) -> Self {
         Self {
             kind: Kind::Control,
             flags: 0,
@@ -47,7 +47,7 @@ impl Header {
         }
     }
 
-    pub fn welcome(channel_id: u32, dst_peer_id: u32, payload_len: u16) -> Self {
+    pub fn welcome(channel_id: u64, dst_peer_id: u32, payload_len: u16) -> Self {
         Self::control(channel_id, 0, dst_peer_id, payload_len)
     }
 }
@@ -80,11 +80,11 @@ pub fn decode(buf: &[u8]) -> Option<(Header, &[u8])> {
     }
     let kind = Kind::from_u8(buf[5])?;
     let flags = u16::from_le_bytes([buf[6], buf[7]]);
-    let channel_id = u32::from_le_bytes(buf[8..12].try_into().ok()?);
-    let src_peer_id = u32::from_le_bytes(buf[12..16].try_into().ok()?);
-    let dst_peer_id = u32::from_le_bytes(buf[16..20].try_into().ok()?);
-    let stream_id = u32::from_le_bytes(buf[20..24].try_into().ok()?);
-    let payload_len = u16::from_le_bytes([buf[24], buf[25]]);
+    let channel_id = u64::from_le_bytes(buf[8..16].try_into().ok()?);
+    let src_peer_id = u32::from_le_bytes(buf[16..20].try_into().ok()?);
+    let dst_peer_id = u32::from_le_bytes(buf[20..24].try_into().ok()?);
+    let stream_id = u32::from_le_bytes(buf[24..28].try_into().ok()?);
+    let payload_len = u16::from_le_bytes([buf[28], buf[29]]);
     let payload_len = payload_len as usize;
 
     let payload_start = HEADER_LEN;
@@ -116,7 +116,7 @@ mod tests {
         let h = Header {
             kind: Kind::Control,
             flags: 0x1224,
-            channel_id: 1,
+            channel_id: 1u64,
             src_peer_id: 2,
             dst_peer_id: BROADCAST,
             stream_id: 3,
@@ -129,6 +129,7 @@ mod tests {
         assert_eq!(h2.flags, h.flags);
         assert_eq!(h2.channel_id, h.channel_id);
         assert_eq!(h2.src_peer_id, h.src_peer_id);
+        assert_eq!(h2.dst_peer_id, h.dst_peer_id);
         assert_eq!(h2.stream_id, h.stream_id);
         assert_eq!(p2, payload);
     }

@@ -302,7 +302,7 @@ pub async fn handle_relay_transition(
                 }
             }
         } else {
-            //nici un user eligibil -> ramane serverul ca relay, anuntam SERVER_RELAY pentru toti
+            //no eligible user -> server remains relay, announce SERVER_RELAY for all peers
             for u in &channel.users {
                 let notify = format!("{} {} {}\n", MSG_MODE, MSG_SERVER_RELAY, u.name);
                 for usr in &channel.users {

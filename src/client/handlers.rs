@@ -1,11 +1,32 @@
-use crate::client::structures::{NatKind, PeerInfo};
+use crate::{
+    client::structures::{NatKind, PeerInfo},
+    proto::control_text::{
+        MSG_DATA, MSG_DIRECT, MSG_HOLE_PUNCH, MSG_MODE, MSG_NAT_SEEN, MSG_PING, MSG_PONG,
+        MSG_RELAY, MSG_SERVER_RELAY, MSG_USER_LEFT, MSG_WELCOME,
+    },
+};
 use std::{
     net::{SocketAddr, UdpSocket},
     str::FromStr,
-    sync::atomic::{AtomicBool, Ordering},
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
+    },
     time::Instant,
 };
+
+pub fn try_handle_welcome(s: &str, channel_id: &Arc<AtomicU64>, my_peer_id: &Arc<AtomicU32>) {
+    for line in s.lines() {
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        if parts.len() == 3 && parts[0] == MSG_WELCOME {
+            if let (Ok(cid), Ok(pid)) = (parts[1].parse::<u64>(), parts[2].parse::<u32>()) {
+                channel_id.store(cid, Ordering::Release);
+                my_peer_id.store(pid, Ordering::Release);
+                println!("{MSG_WELCOME} received: channel_id={cid}, my_peer_id={pid}");
+            }
+        }
+    }
+}
 
 fn handle_mode_relay(is_relay: &Arc<Mutex<bool>>) {
     let mut r = is_relay.lock().unwrap();
@@ -48,11 +69,11 @@ fn handle_user_left(parts: &[&str], peers: &Arc<Mutex<Vec<PeerInfo>>>) {
 }
 
 fn handle_unrecognized_command(line: &str) {
-    if line != "PING" && line != "HOLE_PUNCH" {
+    if line != MSG_PING && line != MSG_HOLE_PUNCH {
         return;
     }
 
-    if line.starts_with("NAT_SEEN ") {
+    if line.starts_with(&format!("{MSG_NAT_SEEN} ")) {
         return;
     }
 
@@ -72,10 +93,10 @@ pub fn handle_mode_line(
     }
 
     match parts[0] {
-        "MODE" if parts.len() >= 2 => match parts[1] {
-            "RELAY" => handle_mode_relay(is_relay),
+        MSG_MODE if parts.len() >= 2 => match parts[1] {
+            MSG_RELAY => handle_mode_relay(is_relay),
 
-            "SERVER_RELAY" => {
+            MSG_SERVER_RELAY => {
                 if parts.len() >= 3 {
                     let username = parts[2];
 
@@ -106,24 +127,24 @@ pub fn handle_mode_line(
                 }
             }
 
-            "DIRECT" if parts.len() >= 4 => handle_mode_direct(&parts, peers, me),
+            MSG_DIRECT if parts.len() >= 4 => handle_mode_direct(&parts, peers, me),
             _ => handle_unrecognized_command(line),
         },
-        "USER_LEFT" if parts.len() >= 2 => handle_user_left(&parts, peers),
+        MSG_USER_LEFT if parts.len() >= 2 => handle_user_left(&parts, peers),
         _ => handle_unrecognized_command(line),
     }
 }
 
 pub fn handle_ping(socket: &UdpSocket, src: std::net::SocketAddr) {
-    let _ = socket.send_to(b"PONG", src);
-    println!("Received PING from {}, sent PONG", src);
+    let _ = socket.send_to(MSG_PONG.as_bytes(), src);
+    println!("Received {MSG_PING} from {src}, sent {MSG_PONG}");
 }
 
 pub fn handle_pong(peers: &Arc<Mutex<Vec<PeerInfo>>>, src: std::net::SocketAddr) {
     let mut peers_guard = peers.lock().unwrap();
     if let Some(peer) = peers_guard.iter_mut().find(|p| p.addr == src) {
         peer.last_pong = Instant::now();
-        println!("Received PONG from {}", peer.username);
+        println!("Received {MSG_PONG} from {}", peer.username);
     }
 }
 
@@ -172,7 +193,7 @@ pub fn handle_data_message(
     channel_has_server_relays: &Arc<AtomicBool>,
     signaling_addr: &str,
 ) {
-    if line.starts_with("DATA ") {
+    if line.starts_with(&format!("{MSG_DATA} ")) {
         let parts: Vec<&str> = line.splitn(3, ' ').collect();
         if parts.len() >= 3 {
             let sender = parts[1];
@@ -229,11 +250,11 @@ pub fn process_incoming_message(
             continue;
         }
         match line {
-            "PING" => handle_ping(socket, src),
-            "PONG" => handle_pong(peers, src),
-            "HOLE_PUNCH" => handle_hole_punch(peers, src),
+            MSG_PING => handle_ping(socket, src),
+            MSG_PONG => handle_pong(peers, src),
+            MSG_HOLE_PUNCH => handle_hole_punch(peers, src),
             _ => {
-                if line.starts_with("DATA ") {
+                if line.starts_with(&format!("{MSG_DATA} ")) {
                     handle_data_message(
                         socket,
                         line,

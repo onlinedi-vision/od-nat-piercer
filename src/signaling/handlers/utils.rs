@@ -1,4 +1,7 @@
-use crate::signaling::structures::{Channel, NatKind, ServerMap, User};
+use crate::{
+    proto::control_text::{MSG_MODE, MSG_RELAY, MSG_SERVER_RELAY},
+    signaling::structures::{Channel, NatKind, ServerMap, User},
+};
 use std::{net::SocketAddr, sync::Arc, time::Instant};
 use tokio::{net::UdpSocket, sync::Mutex};
 
@@ -18,7 +21,7 @@ pub async fn update_existing_user(
     channel: &mut Channel,
     user_name: &str,
     src_addr: SocketAddr,
-) -> Option<(Channel, bool)> {
+) -> Option<(Channel, bool, u32)> {
     //check if user already present with same addr
     if let Some(existing) = channel
         .users
@@ -26,7 +29,8 @@ pub async fn update_existing_user(
         .find(|u| u.name == user_name && u.addr == src_addr)
     {
         existing.last_pong = Instant::now();
-        Some((channel.clone(), false))
+        let peer_id = existing.peer_id;
+        Some((channel.clone(), false, peer_id))
     } else {
         None
     }
@@ -42,22 +46,15 @@ pub async fn remove_old_user_sessions(
         .retain(|u| !(u.name == user_name && u.addr != src_addr));
 }
 
-pub async fn create_new_user(user_name: &str, src_addr: SocketAddr, nat_kind: NatKind) -> User {
-    User {
-        name: user_name.to_string(),
-        addr: src_addr,
-        last_pong: Instant::now(),
-        needs_server_relay: matches!(nat_kind, NatKind::Symmetric),
-        nat_kind,
-    }
-}
-
 pub async fn handle_lone_user_scenario(channel: &mut Channel, socket: &Arc<UdpSocket>) {
     if channel.relay.is_none() && channel.users.len() == 1 {
         let u = &channel.users[0];
         match u.nat_kind {
             NatKind::Symmetric => {
-                let reply = format!("MODE SERVER_RELAY {}\n", channel.users[0].name);
+                let reply = format!(
+                    "{} {} {}\n",
+                    MSG_MODE, MSG_SERVER_RELAY, channel.users[0].name
+                );
                 if let Err(e) = socket.send_to(reply.as_bytes(), u.addr).await {
                     eprintln!("Failed to notify lone user about server relay: {}", e);
                 }
@@ -65,7 +62,10 @@ pub async fn handle_lone_user_scenario(channel: &mut Channel, socket: &Arc<UdpSo
             }
 
             _ => {
-                if let Err(e) = socket.send_to(b"MODE RELAY\n", u.addr).await {
+                if let Err(e) = socket
+                    .send_to(format!("{MSG_MODE} {MSG_RELAY}\n").as_bytes(), u.addr)
+                    .await
+                {
                     eprintln!("Failed to notify lone user about relay mode: {}", e);
                 }
                 channel.relay = Some(u.name.clone());
@@ -80,20 +80,21 @@ pub async fn add_new_user(
     src_addr: SocketAddr,
     socket: &Arc<UdpSocket>,
     nat_kind: NatKind,
-) -> Channel {
+) -> (Channel, u32) {
     //Remove old user sessions with same name but different address
     remove_old_user_sessions(channel, user_name, src_addr).await;
 
-    //Create and add new user
-    let new_user = create_new_user(user_name, src_addr, nat_kind).await;
+    let peer_id = channel.next_peer_id;
+    channel.next_peer_id += 1;
+
+    let new_user = User::new(user_name, src_addr, nat_kind, peer_id);
     channel.users.push(new_user);
 
-    //Handle lone user scenario
     handle_lone_user_scenario(channel, socket).await;
 
     println!("User {} joined from {}", user_name, src_addr);
 
-    channel.clone()
+    (channel.clone(), peer_id)
 }
 
 pub async fn find_and_remove_user(

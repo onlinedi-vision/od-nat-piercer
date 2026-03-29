@@ -1,6 +1,11 @@
-use crate::signaling::{
-    structures::{Channel, ServerMap, User},
-    utils::cleanup_and_notify_iter,
+use crate::{
+    proto::control_text::{
+        MSG_DIRECT, MSG_MODE, MSG_PING, MSG_RELAY, MSG_SERVER_RELAY, MSG_USER_LEFT,
+    },
+    signaling::{
+        structures::{Channel, ServerMap, User},
+        utils::cleanup_and_notify_iter,
+    },
 };
 use std::{net::SocketAddr, sync::Arc, time::Duration};
 use tokio::{net::UdpSocket, sync::Mutex};
@@ -23,7 +28,10 @@ fn handle_relay_timeout(
         channel.relay = Some(new_relay_user.name.clone());
 
         //1) Send MODE RELAY just to the new relay
-        notifications.push((vec![new_relay_user.addr], b"MODE RELAY\n".to_vec()));
+        notifications.push((
+            vec![new_relay_user.addr],
+            format!("{MSG_MODE} {MSG_RELAY}\n").as_bytes().to_vec(),
+        ));
 
         //2) Send to every peer: "MODE DIRECT <relay_name> <relay_addr>"
         let peers_addrs: Vec<SocketAddr> = channel
@@ -40,8 +48,8 @@ fn handle_relay_timeout(
                 .filter(|u| u.name != new_relay_user.name)
             {
                 let m = format!(
-                    "MODE DIRECT {} {}\n",
-                    new_relay_user.name, new_relay_user.addr
+                    "{} {} {} {}\n",
+                    MSG_MODE, MSG_DIRECT, new_relay_user.name, new_relay_user.addr
                 );
                 payload.extend_from_slice(m.as_bytes());
             }
@@ -55,7 +63,7 @@ fn handle_relay_timeout(
             .iter()
             .filter(|u| u.name != new_relay_user.name)
         {
-            let m = format!("MODE DIRECT {} {}\n", peer.name, peer.addr);
+            let m = format!("{} {} {} {}\n", MSG_MODE, MSG_DIRECT, peer.name, peer.addr);
             peers_to_new_msg.extend_from_slice(m.as_bytes());
         }
         if !peers_to_new_msg.is_empty() {
@@ -68,7 +76,7 @@ fn handle_relay_timeout(
         if !channel.users.is_empty() {
             let mut payload = Vec::new();
             for u in &channel.users {
-                let m = format!("MODE SERVER_RELAY {}\n", u.name);
+                let m = format!("{} {} {}\n", MSG_MODE, MSG_SERVER_RELAY, u.name);
                 payload.extend_from_slice(m.as_bytes());
             }
 
@@ -93,7 +101,7 @@ fn handle_timed_out_user(
         user_name, server_id, channel_name
     );
 
-    let msg = format!("USER_LEFT {} {}\n", user_name, user_addr);
+    let msg = format!("{MSG_USER_LEFT} {user_name} {user_addr}\n");
     let peers_to_notify: Vec<SocketAddr> = channel
         .users
         .iter()
@@ -117,7 +125,10 @@ fn handle_timed_out_user(
         handle_relay_timeout(channel, notifications);
     } else if channel.users.len() == 1 {
         channel.relay = Some(channel.users[0].name.clone());
-        notifications.push((vec![channel.users[0].addr], b"MODE RELAY\n".to_vec()));
+        notifications.push((
+            vec![channel.users[0].addr],
+            format!("{MSG_MODE} {MSG_RELAY}\n").as_bytes().to_vec(),
+        ));
     }
 }
 
@@ -164,7 +175,7 @@ fn process_channel_heartbeat(
             //announce it
             notifications.push((
                 vec![solo.addr],
-                format!("MODE SERVER_RELAY {}\n", solo.name).into_bytes(),
+                format!("{} {} {}\n", MSG_MODE, MSG_SERVER_RELAY, solo.name).into_bytes(),
             ));
         }
     }
@@ -209,8 +220,8 @@ async fn collect_heartbeat_data(
 
 async fn send_pings(socket: Arc<UdpSocket>, to_ping: Vec<SocketAddr>) {
     for addr in to_ping {
-        if let Err(e) = socket.send_to(b"PING", addr).await {
-            eprintln!("Failed to send PING: {}", e);
+        if let Err(e) = socket.send_to(MSG_PING.as_bytes(), addr).await {
+            eprintln!("Failed to send {MSG_PING}: {e}");
         }
     }
 }

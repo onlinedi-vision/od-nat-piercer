@@ -1,8 +1,10 @@
 use std::{
     env,
     net::{ToSocketAddrs, UdpSocket},
-    sync::atomic::{AtomicBool, Ordering},
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
+    },
     thread,
     time::{Duration, Instant},
 };
@@ -13,7 +15,13 @@ use od_nat_piercer::{
         networking::*,
         structures::{NatKind, PeerInfo, PunchState, PunchSync, RelayState, RelaySync},
     },
-    proto::packet::{self, BROADCAST, Header, Kind},
+    proto::{
+        control_text::{
+            MSG_CONNECT, MSG_CONTROL, MSG_MODE, MSG_RELAY, MSG_SERVER_RELAY, NAT_TYPE_CONE,
+            NAT_TYPE_PUBLIC, NAT_TYPE_SYMMETRIC, NAT_TYPE_UNKNOWN,
+        },
+        packet::Kind,
+    },
 };
 
 const SETUP_POLL_SLEEP_MS: u64 = 20;
@@ -54,17 +62,17 @@ fn send_connect_message(
     my_nat: NatKind,
 ) {
     let nat_type = match my_nat {
-        NatKind::Symmetric => "SYMMETRIC",
-        NatKind::Cone => "CONE",
-        NatKind::Public => "PUBLIC",
-        NatKind::Unknown => "UNKOWN",
+        NatKind::Symmetric => NAT_TYPE_SYMMETRIC,
+        NatKind::Cone => NAT_TYPE_CONE,
+        NatKind::Public => NAT_TYPE_PUBLIC,
+        NatKind::Unknown => NAT_TYPE_UNKNOWN,
     };
 
-    let connect_msg = format!("CONNECT {} {} {} {}", server_id, channel, user, nat_type);
+    let connect_msg = format!("{MSG_CONNECT} {server_id} {channel} {user} {nat_type}");
     socket
         .send_to(connect_msg.as_bytes(), &signaling_addr)
         .expect("Failed to send CONNECT");
-    println!("Sent CONNECT to signaling server");
+    println!("Sent {MSG_CONNECT} to signaling server");
 }
 
 fn update_relay_is_active(
@@ -81,22 +89,6 @@ fn update_relay_is_active(
     }
 }
 
-fn send_control_test(socket: &UdpSocket, signaling_addr: &str) {
-    let payload = b"CONTROL_TEST\n";
-    let hdr = Header {
-        kind: Kind::Control,
-        flags: 0,
-        channel_id: 0,
-        src_peer_id: 0,
-        dst_peer_id: BROADCAST,
-        stream_id: 0,
-        payload_len: payload.len() as u16,
-    };
-
-    let pkt = packet::encode(hdr, payload);
-    let _ = socket.send_to(&pkt, signaling_addr);
-}
-
 fn process_server_response(
     response: &str,
     user: &str,
@@ -107,7 +99,7 @@ fn process_server_response(
 ) {
     if !response
         .lines()
-        .any(|l| l.trim_start().starts_with("MODE "))
+        .any(|l| l.trim_start().starts_with(&format!("{MSG_MODE} ")))
     {
         return;
     }
@@ -115,7 +107,7 @@ fn process_server_response(
     for line in response.lines() {
         let line = line.trim();
 
-        if line == "MODE RELAY" {
+        if line == format!("{MSG_MODE} {MSG_RELAY}") {
             if send_via_server.load(Ordering::Acquire) {
                 send_via_server.store(false, Ordering::Release);
                 println!("I am relay now - stop sending via server.");
@@ -130,7 +122,7 @@ fn process_server_response(
             }
         }
 
-        if line.starts_with("MODE SERVER_RELAY ") {
+        if line.starts_with(&format!("{MSG_MODE} {MSG_SERVER_RELAY} ")) {
             // MODE SERVER_RELAY <username>
             let parts: Vec<&str> = line.split_whitespace().collect();
             if parts.len() >= 3 {
@@ -176,19 +168,27 @@ fn handle_recv_result(
     saw_mode: &mut bool,
     punch_sync: &PunchSync,
     relay_sync: &RelaySync,
+    channel_id: &Arc<AtomicU64>,
+    my_peer_id: &Arc<AtomicU32>,
 ) -> bool {
     match result {
         Ok((len, src)) => {
             if let Some((hdr, payload)) = od_nat_piercer::proto::packet::decode(&buf[..len]) {
                 match hdr.kind {
                     Kind::Control => {
-                        println!("(setup) Got CONTROL {} bytes from {}", payload.len(), src);
+                        println!(
+                            "(setup) Got {MSG_CONTROL} {} bytes from {src}",
+                            payload.len()
+                        );
 
                         //temporarly: if payload is text, process as before
                         if let Ok(s) = std::str::from_utf8(payload) {
-                            println!("(setup) CONTROL payload: {}", s.trim());
+                            println!("(setup) {MSG_CONTROL} payload: {}", s.trim());
+                            try_handle_welcome(s, &channel_id, &my_peer_id);
                             if &src == server_socketaddr {
-                                if s.lines().any(|l| l.trim_start().starts_with("MODE ")) {
+                                if s.lines()
+                                    .any(|l| l.trim_start().starts_with(&format!("{MSG_MODE} ")))
+                                {
                                     *saw_mode = true;
                                 }
 
@@ -247,7 +247,10 @@ fn handle_recv_result(
             }
             let resp = String::from_utf8_lossy(&buf[..len]).to_string();
             if &src == server_socketaddr {
-                if resp.lines().any(|l| l.trim_start().starts_with("MODE ")) {
+                if resp
+                    .lines()
+                    .any(|l| l.trim_start().starts_with(&format!("{MSG_MODE} ")))
+                {
                     *saw_mode = true;
                 }
 
@@ -313,6 +316,8 @@ fn server_responses_during_setup(
     signaling_addr: &str,
     punch_sync: &PunchSync,
     relay_sync: &RelaySync,
+    channel_id: &Arc<AtomicU64>,
+    my_peer_id: &Arc<AtomicU32>,
 ) {
     let mut buf = [0u8; 2048];
     let setup_deadline = Instant::now() + Duration::from_millis(SETUP_DEADLINE_MS);
@@ -334,6 +339,8 @@ fn server_responses_during_setup(
             &mut saw_mode,
             punch_sync,
             relay_sync,
+            &channel_id,
+            &my_peer_id,
         ) {
             break;
         }
@@ -351,6 +358,8 @@ fn main_loop(
     punch_sync: &PunchSync,
     relay_sync: &RelaySync,
     send_via_server: &Arc<AtomicBool>,
+    channel_id: &Arc<AtomicU64>,
+    my_peer_id: &Arc<AtomicU32>,
 ) -> std::io::Result<()> {
     let mut buf = [0u8; 2048];
 
@@ -361,10 +370,11 @@ fn main_loop(
                 if let Some((hdr, payload)) = od_nat_piercer::proto::packet::decode(&buf[..len]) {
                     match hdr.kind {
                         Kind::Control => {
-                            println!("Got CONTROL {} bytes from {}", payload.len(), src);
-                            //temporarly: if payload is text, parse it as before
+                            println!("Got {MSG_CONTROL} {} bytes from {src}", payload.len());
                             if let Ok(s) = std::str::from_utf8(payload) {
-                                println!("CONTROL payload: {}", s.trim());
+                                println!("{MSG_CONTROL} payload: {}", s.trim());
+                                try_handle_welcome(s, &channel_id, &my_peer_id);
+
                                 process_incoming_message(
                                     socket,
                                     s,
@@ -442,6 +452,9 @@ fn main() -> std::io::Result<()> {
 
     let socket = setup_socket(local_port);
 
+    let my_peer_id = Arc::new(AtomicU32::new(0));
+    let channel_id = Arc::new(AtomicU64::new(0));
+
     // NAT detection before CONNECT
     let my_nat = detect_nat_kind(&socket, &signaling_ip);
     println!("My NAT kind: {:?}", my_nat);
@@ -462,8 +475,6 @@ fn main() -> std::io::Result<()> {
         &user,
         my_nat,
     );
-
-    send_control_test(&socket, &signaling_addr);
 
     let peers: Vec<PeerInfo> = Vec::new();
     let peers = Arc::new(Mutex::new(peers));
@@ -503,6 +514,8 @@ fn main() -> std::io::Result<()> {
         &signaling_addr,
         &punch_sync,
         &relay_sync,
+        &channel_id,
+        &my_peer_id,
     );
 
     // start punching ONLY if NAT is not symmetric
@@ -549,5 +562,7 @@ fn main() -> std::io::Result<()> {
         &punch_sync,
         &relay_sync,
         &send_via_server,
+        &channel_id,
+        &my_peer_id,
     )
 }

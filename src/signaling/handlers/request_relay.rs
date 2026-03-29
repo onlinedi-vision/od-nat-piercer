@@ -1,4 +1,7 @@
-use crate::signaling::structures::ServerMap;
+use crate::{
+    proto::control_text::{MSG_MODE, MSG_SERVER_RELAY},
+    signaling::structures::ServerMap,
+};
 use std::{net::SocketAddr, sync::Arc};
 use tokio::{net::UdpSocket, sync::Mutex};
 
@@ -24,7 +27,7 @@ pub async fn handle_relay_request(
                 user.needs_server_relay = true;
             }
             // notify all users that the server will forward for the user that needs a relay
-            let notify = format!("MODE SERVER_RELAY {}\n", username);
+            let notify = format!("{MSG_MODE} {MSG_SERVER_RELAY} {username}\n");
             for u in channel.users.iter() {
                 let _ = socket.send_to(notify.as_bytes(), u.addr).await;
             }

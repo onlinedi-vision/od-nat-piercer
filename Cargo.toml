@@ -4,9 +4,6 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-local-ip-address = "0.6.5"
-tokio = { version = "1", features = ["full"]}
-warp = "0.3"
-reqwest = { version = "0.11", features = ["blocking"] }
+tokio = { version = "1", features = ["full"] }
 rand = "0.8"
-
+openssl = { version = "0.10.76", features = ["vendored"] }

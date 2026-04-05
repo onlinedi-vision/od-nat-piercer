@@ -9,10 +9,10 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     cargo build --release
 
 FROM bare AS builder
-COPY --link src Cargo* .
+COPY --link Cargo* .
+COPY --link src/ src/
+RUN touch src/main.rs
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     cargo build --release
 
-# TODO: what is the entrypoint now?
-#       how do you run the server now? 
 ENTRYPOINT ["./target/release/signaling_server"]

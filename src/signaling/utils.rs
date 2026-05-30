@@ -10,6 +10,6 @@ where
     it.into_iter().collect()
 }
 
-pub fn generate_channel_id() -> u64 {
+#[must_use] pub fn generate_channel_id() -> u64 {
     OsRng.next_u64()
 }

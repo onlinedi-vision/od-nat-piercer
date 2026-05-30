@@ -26,7 +26,7 @@ pub async fn handle_message(
         return;
     }
 
-    let parts: Vec<&str> = msg.trim().split_whitespace().collect();
+    let parts: Vec<&str> = msg.split_whitespace().collect();
 
     if msg.trim() == MSG_PONG {
         handle_pong(src, state).await;
@@ -38,7 +38,7 @@ pub async fn handle_message(
         return;
     }
 
-    if parts.len() >= 1 {
+    if !parts.is_empty() {
         match parts[0] {
             MSG_CONNECT if parts.len() >= 4 => {
                 handle_connect_message(&parts, src, socket, state).await;

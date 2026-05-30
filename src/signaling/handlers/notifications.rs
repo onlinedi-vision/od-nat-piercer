@@ -21,15 +21,14 @@ pub async fn mark_relay_in_channel(
     relay_user: &User,
 ) -> bool {
     let mut st = state.lock().await;
-    if let Some(channels) = st.get_mut(server_id) {
-        if let Some(channel) = channels.get_mut(channel_name) {
+    if let Some(channels) = st.get_mut(server_id)
+        && let Some(channel) = channels.get_mut(channel_name) {
             if channel.relay.as_deref() == Some(&relay_user.name) {
                 return false;
             }
             channel.relay = Some(relay_user.name.clone());
             return true;
         }
-    }
     false
 }
 
@@ -73,7 +72,7 @@ pub async fn notify_existing_users_about_new_user(
     new_user_name: &str,
     new_user_addr: SocketAddr,
 ) {
-    for user in users.iter() {
+    for user in users {
         if user.addr != new_user_addr {
             let msg_to_existing =
                 format!("{MSG_MODE} {MSG_DIRECT} {new_user_name} {new_user_addr}\n");
@@ -83,7 +82,7 @@ pub async fn notify_existing_users_about_new_user(
 
             let msg_to_new = format!("{} {} {} {}\n", MSG_MODE, MSG_DIRECT, user.name, user.addr);
             if let Err(e) = socket.send_to(msg_to_new.as_bytes(), new_user_addr).await {
-                eprintln!("Failed to notify new user: {}", e);
+                eprintln!("Failed to notify new user: {e}");
             }
         }
     }
@@ -108,7 +107,7 @@ pub async fn notify_lone_user(socket: &Arc<UdpSocket>, lone_user_addr: Option<So
     if let Some(lone_user_addr) = lone_user_addr {
         let reply = format!("{MSG_MODE} {MSG_RELAY}\n");
         if let Err(e) = socket.send_to(reply.as_bytes(), lone_user_addr).await {
-            eprintln!("Failed to notify lone user: {}", e);
+            eprintln!("Failed to notify lone user: {e}");
         }
     }
 }
@@ -156,9 +155,7 @@ pub async fn notify_all_about_departure(
             "{} {} {}\n",
             MSG_USER_LEFT,
             user_name,
-            leaving_user_addr
-                .map(|a| a.to_string())
-                .unwrap_or_else(|| "0.0.0.0:0".into())
+            leaving_user_addr.map_or_else(|| "0.0.0.0:0".into(), |a| a.to_string())
         );
         if let Err(e) = socket.send_to(departure_msg.as_bytes(), user.addr).await {
             eprintln!("Failed to notify {} about departure: {}", user.name, e);
@@ -194,7 +191,7 @@ pub async fn handle_multiple_users_scenario(
         let mut relay_peers: Vec<User> = Vec::new();
         let mut symmetric_peers: Vec<User> = Vec::new();
 
-        for u in users_to_notify.users.iter() {
+        for u in &users_to_notify.users {
             if u.name == relay_user.name {
                 continue;
             }
@@ -221,7 +218,7 @@ pub async fn handle_multiple_users_scenario(
         }
 
         // 5) SYMMETRIC peers: only get MODE SERVER_RELAY
-        for symmetric in symmetric_peers.iter() {
+        for symmetric in &symmetric_peers {
             let msg = format!("{} {} {}\n", MSG_MODE, MSG_SERVER_RELAY, symmetric.name);
 
             //1) send to symmetric user (to send via server)
@@ -244,11 +241,10 @@ pub async fn handle_multiple_users_scenario(
 
         // mark in state that there is no user relay
         let mut st = state.lock().await;
-        if let Some(chans) = st.get_mut(server_id) {
-            if let Some(ch) = chans.get_mut(channel_name) {
+        if let Some(chans) = st.get_mut(server_id)
+            && let Some(ch) = chans.get_mut(channel_name) {
                 ch.relay = None;
             }
-        }
     }
 }
 
@@ -285,9 +281,7 @@ pub async fn handle_relay_transition(
         if let Some(new_relay) = pick_eligible_relay(&channel) {
             let peers: Vec<User> = channel
                 .users
-                .iter()
-                .cloned()
-                .filter(|u| u.name != new_relay.name)
+                .iter().filter(|&u| u.name != new_relay.name).cloned()
                 .collect();
 
             promote_new_relay(socket, &new_relay).await;
@@ -296,11 +290,10 @@ pub async fn handle_relay_transition(
 
             //actualizam relay in state
             let mut st = state.lock().await;
-            if let Some(chans) = st.get_mut(server_id) {
-                if let Some(ch) = chans.get_mut(channel_name) {
+            if let Some(chans) = st.get_mut(server_id)
+                && let Some(ch) = chans.get_mut(channel_name) {
                     ch.relay = Some(new_relay.name.clone());
                 }
-            }
         } else {
             //no eligible user -> server remains relay, announce SERVER_RELAY for all peers
             for u in &channel.users {
@@ -311,11 +304,10 @@ pub async fn handle_relay_transition(
             }
 
             let mut st = state.lock().await;
-            if let Some(chans) = st.get_mut(server_id) {
-                if let Some(ch) = chans.get_mut(channel_name) {
+            if let Some(chans) = st.get_mut(server_id)
+                && let Some(ch) = chans.get_mut(channel_name) {
                     ch.relay = None;
                 }
-            }
         }
     }
 }
@@ -334,7 +326,7 @@ pub async fn handle_disconnect_notifications(
     if lone_user_addr.is_some() {
         notify_lone_user(&socket, lone_user_addr).await;
     } else {
-        handle_relay_transition(&socket, was_relay, &state, &server_id, &channel_name).await;
+        handle_relay_transition(&socket, was_relay, state, &server_id, &channel_name).await;
     }
     notify_all_about_departure(&socket, remaining_users, user_name, leaving_user_addr).await;
 }
@@ -351,8 +343,8 @@ pub async fn handle_peer_timeout(
 
     let remaining = {
         let mut st = state.lock().await;
-        if let Some(channels) = st.get_mut(&server_id) {
-            if let Some(channel) = channels.get_mut(&channel_name) {
+        if let Some(channels) = st.get_mut(&server_id)
+            && let Some(channel) = channels.get_mut(&channel_name) {
                 //removing by name
                 channel.users.retain(|u| u.name != peer_user);
 
@@ -361,7 +353,6 @@ pub async fn handle_peer_timeout(
                     channel.relay = Some(channel.users[0].name.clone());
                 }
             }
-        }
 
         st.get(&server_id)
             .and_then(|channels| channels.get(&channel_name))

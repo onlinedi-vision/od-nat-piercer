@@ -20,9 +20,9 @@ const CONNECT_GRACE_SEC: u64 = 12; // wait for connection for this time, after t
 const NAT_DETECT_TOTAL_TIMEOUT_MS: u64 = 600; // maximum waiting time for server to respond to both probes
 const NAT_DETECT_POLL_SLEEP_MS: u64 = 20; // sleep between polls when socket is WouldBlock
 
-pub fn detect_nat_kind(socket: &UdpSocket, signaling_ip: &str) -> NatKind {
-    let addr1 = format!("{}:2131", signaling_ip);
-    let addr2 = format!("{}:2132", signaling_ip);
+#[must_use] pub fn detect_nat_kind(socket: &UdpSocket, signaling_ip: &str) -> NatKind {
+    let addr1 = format!("{signaling_ip}:2131");
+    let addr2 = format!("{signaling_ip}:2132");
 
     let _ = socket.send_to(format!("{MSG_NAT_PROBE} 1\n").as_bytes(), &addr1);
     let _ = socket.send_to(format!("{MSG_NAT_PROBE} 2\n").as_bytes(), &addr2);
@@ -35,13 +35,11 @@ pub fn detect_nat_kind(socket: &UdpSocket, signaling_ip: &str) -> NatKind {
         match socket.recv_from(&mut buf) {
             Ok((len, _src)) => {
                 let msg = String::from_utf8_lossy(&buf[..len]).to_string();
-                if msg.starts_with(&format!("{MSG_NAT_SEEN} ")) {
-                    if let Some(addr_str) = msg.split_whitespace().nth(1) {
-                        if let Ok(observed) = addr_str.parse::<std::net::SocketAddr>() {
+                if msg.starts_with(&format!("{MSG_NAT_SEEN} "))
+                    && let Some(addr_str) = msg.split_whitespace().nth(1)
+                        && let Ok(observed) = addr_str.parse::<std::net::SocketAddr>() {
                             seen.push(observed);
                         }
-                    }
-                }
             }
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                 std::thread::sleep(Duration::from_millis(NAT_DETECT_POLL_SLEEP_MS));
@@ -168,7 +166,7 @@ fn handle_peer_timeout(
             server_id, channel, peer.username
         )
         .as_bytes(),
-        &signaling_addr,
+        signaling_addr,
     );
 }
 
@@ -263,7 +261,7 @@ fn relay_keepalive_loop(
             let mut started = relay_started.lock().unwrap();
             if !*started {
                 *started = true;
-                println!("Starting relay keepalive thread.")
+                println!("Starting relay keepalive thread.");
             }
         }
 
@@ -353,24 +351,22 @@ fn user_input_loop(
 ) {
     use std::io::{self, BufRead};
     let stdin = io::stdin();
-    for line in stdin.lock().lines() {
-        if let Ok(msg) = line {
-            let msg = msg.trim();
-            if msg.is_empty() {
-                continue;
-            }
-            let s = send_via_server.load(Ordering::Acquire);
-            handle_user_message(
-                &socket,
-                &peers,
-                &username,
-                msg,
-                s,
-                &signaling_addr,
-                &is_relay,
-                &channel_has_server_relays,
-            );
+    for msg in stdin.lock().lines().flatten() {
+        let msg = msg.trim();
+        if msg.is_empty() {
+            continue;
         }
+        let s = send_via_server.load(Ordering::Acquire);
+        handle_user_message(
+            &socket,
+            &peers,
+            &username,
+            msg,
+            s,
+            &signaling_addr,
+            &is_relay,
+            &channel_has_server_relays,
+        );
     }
 }
 

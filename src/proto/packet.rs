@@ -11,7 +11,7 @@ pub enum Kind {
 }
 
 impl Kind {
-    pub fn from_u8(v: u8) -> Option<Self> {
+    #[must_use] pub fn from_u8(v: u8) -> Option<Self> {
         match v {
             1 => Some(Kind::Control),
             2 => Some(Kind::Dtls),
@@ -35,7 +35,7 @@ pub struct Header {
 pub const HEADER_LEN: usize = 30;
 
 impl Header {
-    pub fn control(channel_id: u64, src_peer_id: u32, dst_peer_id: u32, payload_len: u16) -> Self {
+    #[must_use] pub fn control(channel_id: u64, src_peer_id: u32, dst_peer_id: u32, payload_len: u16) -> Self {
         Self {
             kind: Kind::Control,
             flags: 0,
@@ -47,12 +47,12 @@ impl Header {
         }
     }
 
-    pub fn welcome(channel_id: u64, dst_peer_id: u32, payload_len: u16) -> Self {
+    #[must_use] pub fn welcome(channel_id: u64, dst_peer_id: u32, payload_len: u16) -> Self {
         Self::control(channel_id, 0, dst_peer_id, payload_len)
     }
 }
 
-pub fn encode(h: Header, payload: &[u8]) -> Vec<u8> {
+#[must_use] pub fn encode(h: Header, payload: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(HEADER_LEN + payload.len());
     out.extend_from_slice(&MAGIC);
     out.push(VERSION);
@@ -68,7 +68,7 @@ pub fn encode(h: Header, payload: &[u8]) -> Vec<u8> {
     out
 }
 
-pub fn decode(buf: &[u8]) -> Option<(Header, &[u8])> {
+#[must_use] pub fn decode(buf: &[u8]) -> Option<(Header, &[u8])> {
     if buf.len() < HEADER_LEN {
         return None;
     }

@@ -49,27 +49,23 @@ pub async fn remove_old_user_sessions(
 pub async fn handle_lone_user_scenario(channel: &mut Channel, socket: &Arc<UdpSocket>) {
     if channel.relay.is_none() && channel.users.len() == 1 {
         let u = &channel.users[0];
-        match u.nat_kind {
-            NatKind::Symmetric => {
-                let reply = format!(
-                    "{} {} {}\n",
-                    MSG_MODE, MSG_SERVER_RELAY, channel.users[0].name
-                );
-                if let Err(e) = socket.send_to(reply.as_bytes(), u.addr).await {
-                    eprintln!("Failed to notify lone user about server relay: {}", e);
-                }
-                channel.relay = None;
+        if u.nat_kind == NatKind::Symmetric {
+            let reply = format!(
+                "{} {} {}\n",
+                MSG_MODE, MSG_SERVER_RELAY, channel.users[0].name
+            );
+            if let Err(e) = socket.send_to(reply.as_bytes(), u.addr).await {
+                eprintln!("Failed to notify lone user about server relay: {e}");
             }
-
-            _ => {
-                if let Err(e) = socket
-                    .send_to(format!("{MSG_MODE} {MSG_RELAY}\n").as_bytes(), u.addr)
-                    .await
-                {
-                    eprintln!("Failed to notify lone user about relay mode: {}", e);
-                }
-                channel.relay = Some(u.name.clone());
+            channel.relay = None;
+        } else {
+            if let Err(e) = socket
+                .send_to(format!("{MSG_MODE} {MSG_RELAY}\n").as_bytes(), u.addr)
+                .await
+            {
+                eprintln!("Failed to notify lone user about relay mode: {e}");
             }
+            channel.relay = Some(u.name.clone());
         }
     }
 }
@@ -92,7 +88,7 @@ pub async fn add_new_user(
 
     handle_lone_user_scenario(channel, socket).await;
 
-    println!("User {} joined from {}", user_name, src_addr);
+    println!("User {user_name} joined from {src_addr}");
 
     (channel.clone(), peer_id)
 }
@@ -111,8 +107,7 @@ pub async fn find_and_remove_user(
         let was_relay = channel
             .relay
             .as_ref()
-            .map(|r| r == &user_name)
-            .unwrap_or(false);
+            .is_some_and(|r| r == user_name);
 
         let leaving_user_addr = channel.users[pos].addr;
         channel.users.remove(pos);
@@ -130,11 +125,11 @@ pub async fn update_relay_after_departure(
     let mut lone_user_addr = None;
 
     if was_relay {
-        if !channel.users.is_empty() {
+        if channel.users.is_empty() {
+            channel.relay = None;
+        } else {
             let new_relay = channel.users[0].name.clone();
             channel.relay = Some(new_relay);
-        } else {
-            channel.relay = None;
         }
 
         if channel.users.len() == 1 {
@@ -158,8 +153,8 @@ pub async fn handle_user_removal(
     let mut leaving_user_addr = None;
     let mut lone_user_addr = None;
 
-    if let Some(channels) = st.get_mut(server_id) {
-        if let Some(channel) = channels.get_mut(channel_name) {
+    if let Some(channels) = st.get_mut(server_id)
+        && let Some(channel) = channels.get_mut(channel_name) {
             if let Some((found_was_relay, found_leaving_addr)) =
                 find_and_remove_user(channel, user_name, src_addr).await
             {
@@ -168,17 +163,15 @@ pub async fn handle_user_removal(
 
                 lone_user_addr = update_relay_after_departure(channel, was_relay).await;
 
-                println!("User {} left {}-{}", user_name, server_id, channel_name);
+                println!("User {user_name} left {server_id}-{channel_name}");
             } else {
                 println!(
-                    "Ignoring DISCONNECT for {} from {} (no matching session)",
-                    user_name, src_addr
+                    "Ignoring DISCONNECT for {user_name} from {src_addr} (no matching session)"
                 );
             }
         }
-    }
 
-    let remaining_users = get_remaining_users(&state, server_id, channel_name).await;
+    let remaining_users = get_remaining_users(state, server_id, channel_name).await;
     (
         remaining_users,
         was_relay,

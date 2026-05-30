@@ -1,8 +1,17 @@
-FROM rust:1.90-trixie AS builder
+FROM clux/muslrust:1.93.1-stable AS base
+WORKDIR /app
+COPY --link --from=bare-repo . .
+COPY --link Cargo* .
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    cargo build --release --target x86_64-unknown-linux-musl
 
-LABEL maintainer=kickhead13<ana.alexandru.gabriel@proton.me>
+FROM base AS builder
+COPY --link Cargo* .
+COPY --link src/ src/
+RUN touch src/main.rs
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    cargo build --release --target x86_64-unknown-linux-musl
 
-COPY . .
-RUN cargo build --release
-
-ENTRYPOINT ["./target/release/signaling_server"]
+FROM scratch AS runtime
+COPY --link --from=builder /app/target/x86_64-unknown-linux-musl/release/signaling_server .
+CMD ["/signaling_server"]

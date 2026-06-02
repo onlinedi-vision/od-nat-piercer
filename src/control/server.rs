@@ -11,7 +11,7 @@ use crate::control::messages::ControlMessage;
 pub type ControlPeers =
     Arc<Mutex<HashMap<String, Vec<tokio::sync::mpsc::UnboundedSender<Message>>>>>;
 
-fn channel_key(server_id: &str, channel: &str) -> String {
+pub(crate) fn channel_key(server_id: &str, channel: &str) -> String {
     format!("{server_id}:{channel}")
 }
 

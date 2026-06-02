@@ -6,4 +6,4 @@ pub mod utils;
 pub use handlers::handle_message;
 
 #[cfg(test)]
-mod tests;
+mod ut;

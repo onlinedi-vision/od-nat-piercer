@@ -5,7 +5,6 @@ use std::sync::Arc;
 
 #[cfg(test)]
 mod tests {
-    use crate::signaling::utils::generate_channel_id;
 
     use super::*;
 

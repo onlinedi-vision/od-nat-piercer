@@ -1,6 +1,8 @@
+use od_nat_piercer::control::server::{ControlPeers, start_control_server};
 use od_nat_piercer::signaling::{
     handlers::handle_message, heartbeat::start_heartbeat, structures::ServerMap,
 };
+use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::net::UdpSocket;
 use tokio::sync::Mutex;
@@ -16,8 +18,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let socket_probe = Arc::new(socket_probe);
 
     let state = Arc::new(Mutex::new(ServerMap::new()));
+    let control_peers: ControlPeers = Arc::new(Mutex::new(HashMap::new()));
+    let control_peers_clone = Arc::clone(&control_peers);
 
     start_heartbeat(Arc::clone(&socket_main), Arc::clone(&state));
+
+    tokio::spawn(async move {
+        if let Err(e) = start_control_server("0.0.0.0:2133", control_peers_clone).await {
+            eprintln!("control server failed: {}", e);
+        }
+    });
 
     run_server(socket_main, socket_probe, state).await;
     Ok(())

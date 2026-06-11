@@ -15,6 +15,7 @@ use od_nat_piercer::{
         networking::*,
         structures::{NatKind, PeerInfo, PunchState, PunchSync, RelayState, RelaySync},
     },
+    control::client::start_control_client,
     proto::{
         control_text::{
             MSG_CONNECT, MSG_CONTROL, MSG_MODE, MSG_RELAY, MSG_SERVER_RELAY, NAT_TYPE_CONE,

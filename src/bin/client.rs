@@ -497,9 +497,9 @@ fn main() -> std::io::Result<()> {
 
     start_heartbeat(
         socket.try_clone()?,
-        server_id.to_string(),
-        channel.to_string(),
-        user.to_string(),
+        server_id.clone(),
+        channel.clone(),
+        user.clone(),
         signaling_addr.clone(),
     );
 
@@ -534,8 +534,8 @@ fn main() -> std::io::Result<()> {
         socket.try_clone()?,
         Arc::clone(&peers),
         Arc::clone(&relay_started),
-        server_id.to_string(),
-        channel.to_string(),
+        server_id.clone(),
+        channel.clone(),
         signaling_addr.clone(),
         Arc::clone(&relay_sync),
     );
@@ -544,7 +544,7 @@ fn main() -> std::io::Result<()> {
     start_user_input(
         socket.try_clone()?,
         Arc::clone(&peers),
-        user.to_string(),
+        user.clone(),
         Arc::clone(&send_via_server),
         signaling_addr.clone(),
         Arc::clone(&is_relay),

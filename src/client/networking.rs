@@ -62,10 +62,10 @@ const NAT_DETECT_POLL_SLEEP_MS: u64 = 20; // sleep between polls when socket is 
     }
 
     if a.port() == b.port() {
-        println!("NAT detection: {NAT_TYPE_CONE} (same addr on both ports): {a}",);
+        println!("NAT detection: {NAT_TYPE_CONE} (same addr on both ports): {a}");
         NatKind::Cone
     } else {
-        println!("NAT detection: {NAT_TYPE_SYMMETRIC} (different ports): {a} vs {b}",);
+        println!("NAT detection: {NAT_TYPE_SYMMETRIC} (different ports): {a} vs {b}");
         NatKind::Symmetric
     }
 }

@@ -226,7 +226,7 @@ async fn send_pings(socket: Arc<UdpSocket>, to_ping: Vec<SocketAddr>) {
 
 async fn send_notifications(socket: Arc<UdpSocket>, notify_msgs: Vec<(Vec<SocketAddr>, Vec<u8>)>) {
     //send notifications (USER_LEFT, MODE RELAY, MODE DIRECT messages}
-    for (peers_to_notify, payload) in cleanup_and_notify_iter(notify_msgs.into_iter()) {
+    for (peers_to_notify, payload) in cleanup_and_notify_iter(notify_msgs) {
         for addr in peers_to_notify {
             if let Err(e) = socket.send_to(&payload, addr).await {
                 eprintln!("Failed to send heartbeat notification to {addr}: {e}");

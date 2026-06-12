@@ -42,20 +42,18 @@ fn handle_mode_direct(parts: &[&str], peers: &Arc<Mutex<Vec<PeerInfo>>>, me: &st
         let mut guard = peers.lock().unwrap();
         if username == me {
             println!("Server confirms you ({me}) are relay for {addr_str}");
-        } else {
-            if !guard.iter().any(|p| p.addr == addr) {
-                guard.push(PeerInfo {
-                    addr,
-                    last_pong: Instant::now(),
-                    username: username.to_string(),
-                    connected: false,
-                    created_at: Instant::now(),
-                    use_server_relay: false,
-                    relay_requested: false,
-                    nat_kind: NatKind::Unknown,
-                });
-                println!("Added peer {username} with addr {addr_str}");
-            }
+        } else if !guard.iter().any(|p| p.addr == addr) {
+            guard.push(PeerInfo {
+                addr,
+                last_pong: Instant::now(),
+                username: username.to_string(),
+                connected: false,
+                created_at: Instant::now(),
+                use_server_relay: false,
+                relay_requested: false,
+                nat_kind: NatKind::Unknown,
+            });
+            println!("Added peer {username} with addr {addr_str}");
         }
     }
 }

@@ -25,7 +25,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     tokio::spawn(async move {
         if let Err(e) = start_control_server("0.0.0.0:2133", control_peers_clone).await {
-            eprintln!("control server failed: {}", e);
+            eprintln!("control server failed: {e}");
         }
     });
 

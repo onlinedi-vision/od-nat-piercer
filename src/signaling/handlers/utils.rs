@@ -36,7 +36,7 @@ pub async fn update_existing_user(
     }
 }
 
-pub async fn remove_old_user_sessions(
+pub fn remove_old_user_sessions(
     channel: &mut Channel,
     user_name: &str,
     src_addr: SocketAddr,
@@ -78,7 +78,7 @@ pub async fn add_new_user(
     nat_kind: NatKind,
 ) -> (Channel, u32) {
     //Remove old user sessions with same name but different address
-    remove_old_user_sessions(channel, user_name, src_addr).await;
+    remove_old_user_sessions(channel, user_name, src_addr);
 
     let peer_id = channel.next_peer_id;
     channel.next_peer_id += 1;
@@ -93,7 +93,7 @@ pub async fn add_new_user(
     (channel.clone(), peer_id)
 }
 
-pub async fn find_and_remove_user(
+pub fn find_and_remove_user(
     channel: &mut Channel,
     user_name: &str,
     src_addr: SocketAddr,
@@ -118,7 +118,7 @@ pub async fn find_and_remove_user(
     }
 }
 
-pub async fn update_relay_after_departure(
+pub fn update_relay_after_departure(
     channel: &mut Channel,
     was_relay: bool,
 ) -> Option<SocketAddr> {
@@ -156,12 +156,12 @@ pub async fn handle_user_removal(
     if let Some(channels) = st.get_mut(server_id)
         && let Some(channel) = channels.get_mut(channel_name) {
             if let Some((found_was_relay, found_leaving_addr)) =
-                find_and_remove_user(channel, user_name, src_addr).await
+                find_and_remove_user(channel, user_name, src_addr)
             {
                 was_relay = found_was_relay;
                 leaving_user_addr = Some(found_leaving_addr);
 
-                lone_user_addr = update_relay_after_departure(channel, was_relay).await;
+                lone_user_addr = update_relay_after_departure(channel, was_relay);
 
                 println!("User {user_name} left {server_id}-{channel_name}");
             } else {

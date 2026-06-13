@@ -16,10 +16,12 @@ use super::{
 };
 
 async fn send_welcome(socket: &Arc<UdpSocket>, dst: SocketAddr, channel_id: u64, peer_id: u32) {
-    let payload = format!("{MSG_WELCOME} to cid:{channel_id} with pid:{peer_id}\n");
+    let payload = format!("{MSG_WELCOME} {channel_id} {peer_id}\n");
     let hdr = Header::welcome(channel_id, peer_id, payload.len() as u16);
-
     let pkt = packet::encode(hdr, payload.as_bytes());
+
+    println!("Sending WELCOME to {dst}: channel_id={channel_id}, peer_id={peer_id}");
+
     let _ = socket.send_to(&pkt, dst).await;
 }
 

@@ -11,11 +11,11 @@ use std::{
 
 use od_nat_piercer::{
     client::{
+        control_plane::start_control_client_after_welcome,
         handlers::*,
         networking::*,
         structures::{NatKind, PeerInfo, PunchState, PunchSync, RelayState, RelaySync},
     },
-    control::client::start_control_client,
     proto::{
         control_text::{
             MSG_CONNECT, MSG_CONTROL, MSG_MODE, MSG_RELAY, MSG_SERVER_RELAY, NAT_TYPE_CONE,
@@ -361,10 +361,26 @@ fn main_loop(
     send_via_server: &Arc<AtomicBool>,
     channel_id: &Arc<AtomicU64>,
     my_peer_id: &Arc<AtomicU32>,
+    signaling_ip: &str,
+    server_id: &str,
+    channel: &str,
 ) -> std::io::Result<()> {
     let mut buf = [0u8; 2048];
+    let mut control_client_started = false;
 
     println!("Starting main message loop...");
+
+    let pid = my_peer_id.load(Ordering::Acquire);
+
+    start_control_client_after_welcome(
+        &mut control_client_started,
+        signaling_ip,
+        server_id,
+        channel,
+        &user,
+        pid,
+    );
+
     loop {
         match socket.recv_from(&mut buf) {
             Ok((len, src)) => {
@@ -391,6 +407,17 @@ fn main_loop(
                         Kind::Dtls => println!("Got DTLS {} bytes from {}", payload.len(), src),
                         Kind::Srtp => println!("Got SRTP {} bytes from {}", payload.len(), src),
                     }
+                    let pid = my_peer_id.load(Ordering::Acquire);
+
+                    start_control_client_after_welcome(
+                        &mut control_client_started,
+                        signaling_ip,
+                        server_id,
+                        channel,
+                        &user,
+                        pid,
+                    );
+
                     continue;
                 }
 
@@ -565,5 +592,8 @@ fn main() -> std::io::Result<()> {
         &send_via_server,
         &channel_id,
         &my_peer_id,
+        &signaling_ip,
+        &server_id,
+        &channel,
     )
 }

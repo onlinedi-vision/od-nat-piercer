@@ -76,7 +76,6 @@ async fn run_control_client(
             match parsed {
                 ControlMessage::ControlAck { message_id } => {
                     println!("Received ControlAck for message_id={}", message_id);
-                    break;
                 }
                 other => {
                     println!("Received other control message: {:?}", other);

@@ -56,7 +56,8 @@ async fn run_control_client(
     write.send(Message::Text(join_text)).await?;
     println!("Sent JoinControl on reliable control plane.");
 
-    let test_payload = "control-plane-test".to_string();
+    let test_payload = "A".repeat(100 * 1024);
+    let payload_len = test_payload.len();
 
     let control_msg = ControlMessage::ControlMsg {
         message_id: 1,
@@ -65,7 +66,7 @@ async fn run_control_client(
 
     let msg_text = serde_json::to_string(&control_msg)?;
     write.send(Message::Text(msg_text)).await?;
-    println!("Sent ControlMsg message_id=1");
+    println!("Sent ControlMsg message_id=1 payload_len={}", payload_len);
 
     while let Some(msg) = read.next().await {
         let msg = msg?;

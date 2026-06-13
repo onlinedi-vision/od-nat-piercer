@@ -60,10 +60,16 @@ async fn handle_connection(
                 ControlMessage::JoinControl {
                     server_id,
                     channel,
-                    user: _,
-                    peer_id: _,
+                    user,
+                    peer_id,
                 } => {
                     let key = channel_key(&server_id, &channel);
+
+                    println!(
+                        "Control client joined: server_id={} channel={}, user={}, peer_id={}",
+                        server_id, channel, user, peer_id
+                    );
+
                     joined_channel = Some(key.clone());
 
                     let mut guard = peers.lock().await;
@@ -72,8 +78,13 @@ async fn handle_connection(
 
                 ControlMessage::ControlMsg {
                     message_id,
-                    payload: _,
+                    payload,
                 } => {
+                    println!(
+                        "Received ControlMsg message_id={} payload_len={}",
+                        message_id,
+                        payload.len(),
+                    );
                     let ack = ControlMessage::ControlAck { message_id };
                     let ack_text = serde_json::to_string(&ack)?;
                     let _ = tx.send(Message::Text(ack_text));

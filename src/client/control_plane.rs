@@ -1,5 +1,9 @@
 use crate::control::client::start_control_client;
 
+pub(crate) fn should_start_control_client(control_client_started: bool, peer_id: u32) -> bool {
+    !control_client_started && peer_id != 0
+}
+
 pub fn start_control_client_after_welcome(
     control_client_started: &mut bool,
     signaling_ip: &str,
@@ -8,11 +12,7 @@ pub fn start_control_client_after_welcome(
     user: &str,
     peer_id: u32,
 ) {
-    if *control_client_started {
-        return;
-    }
-
-    if peer_id == 0 {
+    if !should_start_control_client(*control_client_started, peer_id) {
         return;
     }
 

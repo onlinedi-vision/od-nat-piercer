@@ -5,6 +5,8 @@ use tokio_tungstenite::{connect_async, tungstenite::Message};
 
 use crate::control::messages::ControlMessage;
 
+const TEST_PAYLOAD_LEN: usize = 100 * 1024;
+
 pub fn start_control_client(
     signaling_ip: String,
     server_id: String,
@@ -56,7 +58,7 @@ async fn run_control_client(
     write.send(Message::Text(join_text)).await?;
     println!("Sent JoinControl on reliable control plane.");
 
-    let test_payload = "A".repeat(100 * 1024);
+    let test_payload = "A".repeat(TEST_PAYLOAD_LEN);
     let payload_len = test_payload.len();
 
     let control_msg = ControlMessage::ControlMsg {

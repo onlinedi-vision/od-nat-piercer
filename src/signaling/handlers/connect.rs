@@ -15,8 +15,12 @@ use super::{
     utils::{add_new_user, remove_user_from_other_channels, update_existing_user},
 };
 
+fn welcome_payload(channel_id: u64, peer_id: u32) -> String {
+    format!("{MSG_WELCOME} {channel_id} {peer_id}\n")
+}
+
 async fn send_welcome(socket: &Arc<UdpSocket>, dst: SocketAddr, channel_id: u64, peer_id: u32) {
-    let payload = format!("{MSG_WELCOME} {channel_id} {peer_id}\n");
+    let payload = welcome_payload(channel_id, peer_id);
     let hdr = Header::welcome(channel_id, peer_id, payload.len() as u16);
     let pkt = packet::encode(hdr, payload.as_bytes());
 
@@ -89,4 +93,11 @@ pub async fn handle_connect_message(
         state,
     )
     .await;
+}
+
+#[test]
+fn welcome_payload_uses_machine_readable_format() {
+    let payload = welcome_payload(123456789, 42);
+
+    assert_eq!(payload, "WELCOME 123456789 42\n");
 }

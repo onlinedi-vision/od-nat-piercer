@@ -96,9 +96,7 @@ fn handle_timed_out_user(
     user_addr: SocketAddr,
     notifications: &mut Vec<(Vec<SocketAddr>, Vec<u8>)>,
 ) {
-    println!(
-        "User {user_name} timed out from {server_id}-{channel_name}"
-    );
+    println!("User {user_name} timed out from {server_id}-{channel_name}");
 
     let msg = format!("{MSG_USER_LEFT} {user_name} {user_addr}\n");
     let peers_to_notify: Vec<SocketAddr> = channel
@@ -112,10 +110,7 @@ fn handle_timed_out_user(
         notifications.push((peers_to_notify, msg.as_bytes().to_vec()));
     }
 
-    let was_relay = channel
-        .relay
-        .as_ref()
-        .is_some_and(|r| r == user_name);
+    let was_relay = channel.relay.as_ref().is_some_and(|r| r == user_name);
 
     channel.users.remove(user_index);
 

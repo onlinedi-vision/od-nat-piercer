@@ -20,11 +20,11 @@ pub async fn handle_heartbeat(parts: &[&str], src: SocketAddr, state: Arc<Mutex<
     let mut st = state.lock().await;
     if let Some(channels) = st.get_mut(server_id)
         && let Some(channel) = channels.get_mut(channel_name)
-            && let Some(u) = channel
-                .users
-                .iter_mut()
-                .find(|u| u.name == user_name && u.addr == src)
-            {
-                u.last_pong = Instant::now();
-            }
+        && let Some(u) = channel
+            .users
+            .iter_mut()
+            .find(|u| u.name == user_name && u.addr == src)
+    {
+        u.last_pong = Instant::now();
+    }
 }

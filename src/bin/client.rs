@@ -11,8 +11,11 @@ use std::{
 
 use od_nat_piercer::{
     client::{
-        handlers::{try_handle_welcome, process_incoming_message, handle_peer_message},
-        networking::{detect_nat_kind, start_heartbeat, start_hole_punching, start_relay_keepalive, start_user_input},
+        handlers::{handle_peer_message, process_incoming_message, try_handle_welcome},
+        networking::{
+            detect_nat_kind, start_heartbeat, start_hole_punching, start_relay_keepalive,
+            start_user_input,
+        },
         structures::{NatKind, PeerInfo, PunchState, PunchSync, RelayState, RelaySync},
     },
     proto::{

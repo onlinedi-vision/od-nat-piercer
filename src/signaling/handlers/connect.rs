@@ -15,12 +15,29 @@ use super::{
     utils::{add_new_user, remove_user_from_other_channels, update_existing_user},
 };
 
-async fn send_welcome(socket: &Arc<UdpSocket>, dst: SocketAddr, channel_id: u64, peer_id: u32) {
-    let payload = format!("{MSG_WELCOME} to cid:{channel_id} with pid:{peer_id}\n");
-    let hdr = Header::welcome(channel_id, peer_id, payload.len() as u16);
+fn welcome_payload(channel_id: u64, peer_id: u32) -> String {
+    format!("{MSG_WELCOME} {channel_id} {peer_id}\n")
+}
 
+async fn send_welcome(socket: &Arc<UdpSocket>, dst: SocketAddr, channel_id: u64, peer_id: u32) {
+    let payload = welcome_payload(channel_id, peer_id);
+
+    let payload_len = match u16::try_from(payload.len()) {
+        Ok(len) => len,
+        Err(err) => {
+            eprintln!("WELCOME payload too large to encode: {err}");
+            return;
+        }
+    };
+
+    let hdr = Header::welcome(channel_id, peer_id, payload_len);
     let pkt = packet::encode(hdr, payload.as_bytes());
-    let _ = socket.send_to(&pkt, dst).await;
+
+    println!("Sending WELCOME to {dst}: channel_id={channel_id}, peer_id={peer_id}");
+
+    if let Err(err) = socket.send_to(&pkt, dst).await {
+        eprintln!("Failed to send WELCOME to {dst}: {err}");
+    }
 }
 
 pub async fn handle_connect_message(

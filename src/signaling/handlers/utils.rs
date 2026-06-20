@@ -36,11 +36,7 @@ pub async fn update_existing_user(
     }
 }
 
-pub fn remove_old_user_sessions(
-    channel: &mut Channel,
-    user_name: &str,
-    src_addr: SocketAddr,
-) {
+pub fn remove_old_user_sessions(channel: &mut Channel, user_name: &str, src_addr: SocketAddr) {
     channel
         .users
         .retain(|u| !(u.name == user_name && u.addr != src_addr));
@@ -104,10 +100,7 @@ pub fn find_and_remove_user(
         .position(|u| u.name == user_name && u.addr == src_addr)
     {
         //check if leaving user was relay
-        let was_relay = channel
-            .relay
-            .as_ref()
-            .is_some_and(|r| r == user_name);
+        let was_relay = channel.relay.as_ref().is_some_and(|r| r == user_name);
 
         let leaving_user_addr = channel.users[pos].addr;
         channel.users.remove(pos);
@@ -118,10 +111,7 @@ pub fn find_and_remove_user(
     }
 }
 
-pub fn update_relay_after_departure(
-    channel: &mut Channel,
-    was_relay: bool,
-) -> Option<SocketAddr> {
+pub fn update_relay_after_departure(channel: &mut Channel, was_relay: bool) -> Option<SocketAddr> {
     let mut lone_user_addr = None;
 
     if was_relay {
@@ -154,22 +144,21 @@ pub async fn handle_user_removal(
     let mut lone_user_addr = None;
 
     if let Some(channels) = st.get_mut(server_id)
-        && let Some(channel) = channels.get_mut(channel_name) {
-            if let Some((found_was_relay, found_leaving_addr)) =
-                find_and_remove_user(channel, user_name, src_addr)
-            {
-                was_relay = found_was_relay;
-                leaving_user_addr = Some(found_leaving_addr);
+        && let Some(channel) = channels.get_mut(channel_name)
+    {
+        if let Some((found_was_relay, found_leaving_addr)) =
+            find_and_remove_user(channel, user_name, src_addr)
+        {
+            was_relay = found_was_relay;
+            leaving_user_addr = Some(found_leaving_addr);
 
-                lone_user_addr = update_relay_after_departure(channel, was_relay);
+            lone_user_addr = update_relay_after_departure(channel, was_relay);
 
-                println!("User {user_name} left {server_id}-{channel_name}");
-            } else {
-                println!(
-                    "Ignoring DISCONNECT for {user_name} from {src_addr} (no matching session)"
-                );
-            }
+            println!("User {user_name} left {server_id}-{channel_name}");
+        } else {
+            println!("Ignoring DISCONNECT for {user_name} from {src_addr} (no matching session)");
         }
+    }
 
     let remaining_users = get_remaining_users(state, server_id, channel_name).await;
     (

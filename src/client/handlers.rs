@@ -18,12 +18,14 @@ use std::{
 pub fn try_handle_welcome(s: &str, channel_id: &Arc<AtomicU64>, my_peer_id: &Arc<AtomicU32>) {
     for line in s.lines() {
         let parts: Vec<&str> = line.split_whitespace().collect();
-        if parts.len() == 3 && parts[0] == MSG_WELCOME
-            && let (Ok(cid), Ok(pid)) = (parts[1].parse::<u64>(), parts[2].parse::<u32>()) {
-                channel_id.store(cid, Ordering::Release);
-                my_peer_id.store(pid, Ordering::Release);
-                println!("{MSG_WELCOME} received: channel_id={cid}, my_peer_id={pid}");
-            }
+        if parts.len() == 3
+            && parts[0] == MSG_WELCOME
+            && let (Ok(cid), Ok(pid)) = (parts[1].parse::<u64>(), parts[2].parse::<u32>())
+        {
+            channel_id.store(cid, Ordering::Release);
+            my_peer_id.store(pid, Ordering::Release);
+            println!("{MSG_WELCOME} received: channel_id={cid}, my_peer_id={pid}");
+        }
     }
 }
 
@@ -102,7 +104,15 @@ pub fn handle_mode_line(
                         return;
                     }
                     // if i am the RELAY, note that the channel has server-relayed peers
-                    if *is_relay.lock().unwrap() {
+                    let am_relay = match is_relay.lock() {
+                        Ok(guard) => *guard,
+                        Err(err) => {
+                            eprintln!("Failed to lock is_relay while handling SERVER_RELAY: {err}");
+                            return;
+                        }
+                    };
+
+                    if am_relay {
                         if !channel_has_server_relays.load(Ordering::Acquire) {
                             channel_has_server_relays.store(true, Ordering::Release);
                             println!("Relay: channel has server-relayed peers.");
@@ -111,11 +121,18 @@ pub fn handle_mode_line(
                         println!("Server will relay for user: {username}");
                     }
 
-                    //mark that peer as server-relayed to stop punching it
-                    let mut guard = peers.lock().unwrap();
+                    // Mark that peer as server-relayed to stop punching it
+                    let mut guard = match peers.lock() {
+                        Ok(guard) => guard,
+                        Err(err) => {
+                            eprintln!("Failed to lock peers while handling SERVER_RELAY: {err}");
+                            return;
+                        }
+                    };
+
                     if let Some(peer) = guard.iter_mut().find(|p| p.username == username) {
                         peer.use_server_relay = true;
-                        peer.connected = true; // stop punching
+                        peer.connected = true;
                         peer.relay_requested = true;
                     }
                 } else {
@@ -138,7 +155,14 @@ pub fn handle_ping(socket: &UdpSocket, src: std::net::SocketAddr) {
 }
 
 pub fn handle_pong(peers: &Arc<Mutex<Vec<PeerInfo>>>, src: std::net::SocketAddr) {
-    let mut peers_guard = peers.lock().unwrap();
+    let mut peers_guard = match peers.lock() {
+        Ok(guard) => guard,
+        Err(err) => {
+            eprintln!("Failed to lock peers while handling {MSG_PONG}: {err}");
+            return;
+        }
+    };
+
     if let Some(peer) = peers_guard.iter_mut().find(|p| p.addr == src) {
         peer.last_pong = Instant::now();
         println!("Received {MSG_PONG} from {}", peer.username);
@@ -158,7 +182,15 @@ pub fn ensure_connected(p: &mut PeerInfo, con_type: &str) {
 
 pub fn handle_hole_punch(peers: &Arc<Mutex<Vec<PeerInfo>>>, src: std::net::SocketAddr) {
     println!("Received hole punch from {src}");
-    let mut peers_guard = peers.lock().unwrap();
+
+    let mut peers_guard = match peers.lock() {
+        Ok(guard) => guard,
+        Err(err) => {
+            eprintln!("Failed to lock peers while handling hole punch from {src}: {err}");
+            return;
+        }
+    };
+
     if let Some(peer) = peers_guard.iter_mut().find(|p| p.addr == src) {
         ensure_connected(peer, "punch");
     } else {
@@ -175,9 +207,10 @@ fn handle_relay_message_to_peers(
     let peers_guard = peers.lock().unwrap();
     for peer in peers_guard.iter() {
         if peer.username != sender
-            && let Err(e) = socket.send_to(message.as_bytes(), peer.addr) {
-                eprintln!("Failed to send data to {}: {}", peer.addr, e);
-            }
+            && let Err(e) = socket.send_to(message.as_bytes(), peer.addr)
+        {
+            eprintln!("Failed to send data to {}: {}", peer.addr, e);
+        }
     }
 }
 
@@ -199,11 +232,19 @@ pub fn handle_data_message(
             //NO MATTER THE SOURCE, we've observed sender activity
             mark_peer_connected_by_name(peers, sender);
 
-            if *is_relay.lock().unwrap() {
+            let am_relay = match is_relay.lock() {
+                Ok(guard) => *guard,
+                Err(err) => {
+                    eprintln!("Failed to lock is_relay while handling {MSG_DATA}: {err}");
+                    return;
+                }
+            };
+
+            if am_relay {
                 // 1) transmit to peers
                 handle_relay_message_to_peers(socket, peers, sender, line);
 
-                // 2) mirror to server only if the channel has server-relayed users
+                // 2) mirror to server if the channel has server-relayed users
                 if channel_has_server_relays.load(Ordering::Acquire) {
                     let _ = socket.send_to(line.as_bytes(), signaling_addr);
                 }
@@ -216,7 +257,14 @@ pub fn handle_data_message(
 }
 
 pub fn handle_peer_message(peers: &Arc<Mutex<Vec<PeerInfo>>>, src: std::net::SocketAddr) {
-    let mut guard = peers.lock().unwrap();
+    let mut guard = match peers.lock() {
+        Ok(guard) => guard,
+        Err(err) => {
+            eprintln!("Failed to lock peers while handling peer message from {src}: {err}");
+            return;
+        }
+    };
+
     if let Some(p) = guard.iter_mut().find(|p| p.addr == src) {
         ensure_connected(p, "direct");
     }

@@ -20,7 +20,8 @@ const CONNECT_GRACE_SEC: u64 = 12; // wait for connection for this time, after t
 const NAT_DETECT_TOTAL_TIMEOUT_MS: u64 = 600; // maximum waiting time for server to respond to both probes
 const NAT_DETECT_POLL_SLEEP_MS: u64 = 20; // sleep between polls when socket is WouldBlock
 
-#[must_use] pub fn detect_nat_kind(socket: &UdpSocket, signaling_ip: &str) -> NatKind {
+#[must_use]
+pub fn detect_nat_kind(socket: &UdpSocket, signaling_ip: &str) -> NatKind {
     let addr1 = format!("{signaling_ip}:2131");
     let addr2 = format!("{signaling_ip}:2132");
 
@@ -37,9 +38,10 @@ const NAT_DETECT_POLL_SLEEP_MS: u64 = 20; // sleep between polls when socket is 
                 let msg = String::from_utf8_lossy(&buf[..len]).to_string();
                 if msg.starts_with(&format!("{MSG_NAT_SEEN} "))
                     && let Some(addr_str) = msg.split_whitespace().nth(1)
-                        && let Ok(observed) = addr_str.parse::<std::net::SocketAddr>() {
-                            seen.push(observed);
-                        }
+                    && let Ok(observed) = addr_str.parse::<std::net::SocketAddr>()
+                {
+                    seen.push(observed);
+                }
             }
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                 std::thread::sleep(Duration::from_millis(NAT_DETECT_POLL_SLEEP_MS));
@@ -71,15 +73,15 @@ const NAT_DETECT_POLL_SLEEP_MS: u64 = 20; // sleep between polls when socket is 
 }
 
 fn heartbeat_loop(
-    socket: UdpSocket,
-    server_id: String,
-    channel: String,
-    user: String,
-    signaling_addr: String,
+    socket: &UdpSocket,
+    server_id: &String,
+    channel: &String,
+    user: &String,
+    signaling_addr: &String,
 ) {
     loop {
         let hb = format!("{MSG_HB} {server_id} {channel} {user}");
-        let _ = socket.send_to(hb.as_bytes(), &signaling_addr);
+        let _ = socket.send_to(hb.as_bytes(), signaling_addr);
         thread::sleep(Duration::from_secs(HEARTBEAT_SLEEP_SEC));
     }
 }
@@ -92,17 +94,17 @@ pub fn start_heartbeat(
     signaling_addr: String,
 ) {
     thread::spawn(move || {
-        heartbeat_loop(socket, server_id, channel, user, signaling_addr);
+        heartbeat_loop(&socket, &server_id, &channel, &user, &signaling_addr);
     });
 }
 
-fn hole_punching_loop(socket: UdpSocket, peers: Arc<Mutex<Vec<PeerInfo>>>, sync: PunchSync) {
+fn hole_punching_loop(socket: &UdpSocket, peers: &Arc<Mutex<Vec<PeerInfo>>>, sync: &PunchSync) {
     let mut backoff: HashMap<String, u64> = HashMap::new(); //username -> ms
 
     loop {
         // block if we are paused (sending via server) -> block here
         {
-            let (lock, cvar) = &*sync;
+            let (lock, cvar) = &**sync;
             let mut state = lock.lock().unwrap();
 
             while state.paused {
@@ -148,7 +150,7 @@ pub fn start_hole_punching(
     punch_sync: PunchSync,
 ) {
     thread::spawn(move || {
-        hole_punching_loop(socket, peers, punch_sync);
+        hole_punching_loop(&socket, &peers, &punch_sync);
     });
 }
 
@@ -238,18 +240,18 @@ fn relay_main_loop(
 }
 
 fn relay_keepalive_loop(
-    socket: UdpSocket,
-    peers: Arc<Mutex<Vec<PeerInfo>>>,
-    relay_started: Arc<Mutex<bool>>,
-    server_id: String,
-    channel: String,
-    signaling_addr: String,
-    relay_sync: RelaySync,
+    socket: &UdpSocket,
+    peers: &Arc<Mutex<Vec<PeerInfo>>>,
+    relay_started: &Arc<Mutex<bool>>,
+    server_id: &str,
+    channel: &str,
+    signaling_addr: &str,
+    relay_sync: &RelaySync,
 ) {
     loop {
         // wait until active
         {
-            let (lock, cvar) = &*relay_sync;
+            let (lock, cvar) = &**relay_sync;
             let mut st = lock.lock().unwrap();
             while !st.is_active {
                 st = cvar.wait(st).unwrap();
@@ -267,12 +269,12 @@ fn relay_keepalive_loop(
 
         // run main loop until deactivated
         relay_main_loop(
-            &socket,
-            &peers,
-            &server_id,
-            &channel,
-            &signaling_addr,
-            &relay_sync,
+            socket,
+            peers,
+            server_id,
+            channel,
+            signaling_addr,
+            relay_sync,
         );
 
         // mark stopped
@@ -297,13 +299,13 @@ pub fn start_relay_keepalive(
 ) {
     thread::spawn(move || {
         relay_keepalive_loop(
-            socket,
-            peers,
-            relay_started,
-            server_id,
-            channel,
-            signaling_addr,
-            relay_sync,
+            &socket,
+            &peers,
+            &relay_started,
+            &server_id,
+            &channel,
+            &signaling_addr,
+            &relay_sync,
         );
     });
 }
@@ -341,31 +343,31 @@ fn handle_user_message(
 }
 
 fn user_input_loop(
-    socket: UdpSocket,
-    peers: Arc<Mutex<Vec<PeerInfo>>>,
-    username: String,
-    send_via_server: Arc<AtomicBool>,
-    signaling_addr: String,
-    is_relay: Arc<Mutex<bool>>,
-    channel_has_server_relays: Arc<AtomicBool>,
+    socket: &UdpSocket,
+    peers: &Arc<Mutex<Vec<PeerInfo>>>,
+    username: &str,
+    send_via_server: &Arc<AtomicBool>,
+    signaling_addr: &str,
+    is_relay: &Arc<Mutex<bool>>,
+    channel_has_server_relays: &Arc<AtomicBool>,
 ) {
     use std::io::{self, BufRead};
     let stdin = io::stdin();
-    for msg in stdin.lock().lines().flatten() {
+    for msg in stdin.lock().lines().map_while(Result::ok) {
         let msg = msg.trim();
         if msg.is_empty() {
             continue;
         }
         let s = send_via_server.load(Ordering::Acquire);
         handle_user_message(
-            &socket,
-            &peers,
-            &username,
+            socket,
+            peers,
+            username,
             msg,
             s,
-            &signaling_addr,
-            &is_relay,
-            &channel_has_server_relays,
+            signaling_addr,
+            is_relay,
+            channel_has_server_relays,
         );
     }
 }
@@ -381,13 +383,13 @@ pub fn start_user_input(
 ) {
     thread::spawn(move || {
         user_input_loop(
-            socket,
-            peers,
-            username,
-            send_via_server,
-            signaling_addr,
-            is_relay,
-            channel_has_server_relays,
+            &socket,
+            &peers,
+            &username,
+            &send_via_server,
+            &signaling_addr,
+            &is_relay,
+            &channel_has_server_relays,
         );
     });
 }

@@ -22,13 +22,14 @@ pub async fn mark_relay_in_channel(
 ) -> bool {
     let mut st = state.lock().await;
     if let Some(channels) = st.get_mut(server_id)
-        && let Some(channel) = channels.get_mut(channel_name) {
-            if channel.relay.as_deref() == Some(&relay_user.name) {
-                return false;
-            }
-            channel.relay = Some(relay_user.name.clone());
-            return true;
+        && let Some(channel) = channels.get_mut(channel_name)
+    {
+        if channel.relay.as_deref() == Some(&relay_user.name) {
+            return false;
         }
+        channel.relay = Some(relay_user.name.clone());
+        return true;
+    }
     false
 }
 
@@ -242,9 +243,10 @@ pub async fn handle_multiple_users_scenario(
         // mark in state that there is no user relay
         let mut st = state.lock().await;
         if let Some(chans) = st.get_mut(server_id)
-            && let Some(ch) = chans.get_mut(channel_name) {
-                ch.relay = None;
-            }
+            && let Some(ch) = chans.get_mut(channel_name)
+        {
+            ch.relay = None;
+        }
     }
 }
 
@@ -281,7 +283,9 @@ pub async fn handle_relay_transition(
         if let Some(new_relay) = pick_eligible_relay(&channel) {
             let peers: Vec<User> = channel
                 .users
-                .iter().filter(|&u| u.name != new_relay.name).cloned()
+                .iter()
+                .filter(|&u| u.name != new_relay.name)
+                .cloned()
                 .collect();
 
             promote_new_relay(socket, &new_relay).await;
@@ -291,9 +295,10 @@ pub async fn handle_relay_transition(
             //actualizam relay in state
             let mut st = state.lock().await;
             if let Some(chans) = st.get_mut(server_id)
-                && let Some(ch) = chans.get_mut(channel_name) {
-                    ch.relay = Some(new_relay.name.clone());
-                }
+                && let Some(ch) = chans.get_mut(channel_name)
+            {
+                ch.relay = Some(new_relay.name.clone());
+            }
         } else {
             //no eligible user -> server remains relay, announce SERVER_RELAY for all peers
             for u in &channel.users {
@@ -305,9 +310,10 @@ pub async fn handle_relay_transition(
 
             let mut st = state.lock().await;
             if let Some(chans) = st.get_mut(server_id)
-                && let Some(ch) = chans.get_mut(channel_name) {
-                    ch.relay = None;
-                }
+                && let Some(ch) = chans.get_mut(channel_name)
+            {
+                ch.relay = None;
+            }
         }
     }
 }
@@ -344,15 +350,16 @@ pub async fn handle_peer_timeout(
     let remaining = {
         let mut st = state.lock().await;
         if let Some(channels) = st.get_mut(&server_id)
-            && let Some(channel) = channels.get_mut(&channel_name) {
-                //removing by name
-                channel.users.retain(|u| u.name != peer_user);
+            && let Some(channel) = channels.get_mut(&channel_name)
+        {
+            //removing by name
+            channel.users.retain(|u| u.name != peer_user);
 
-                //update relay if needed
-                if channel.users.len() == 1 {
-                    channel.relay = Some(channel.users[0].name.clone());
-                }
+            //update relay if needed
+            if channel.users.len() == 1 {
+                channel.relay = Some(channel.users[0].name.clone());
             }
+        }
 
         st.get(&server_id)
             .and_then(|channels| channels.get(&channel_name))

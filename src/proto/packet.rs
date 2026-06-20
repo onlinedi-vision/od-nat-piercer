@@ -11,7 +11,8 @@ pub enum Kind {
 }
 
 impl Kind {
-    #[must_use] pub fn from_u8(v: u8) -> Option<Self> {
+    #[must_use]
+    pub fn from_u8(v: u8) -> Option<Self> {
         match v {
             1 => Some(Kind::Control),
             2 => Some(Kind::Dtls),
@@ -35,7 +36,8 @@ pub struct Header {
 pub const HEADER_LEN: usize = 30;
 
 impl Header {
-    #[must_use] pub fn control(channel_id: u64, src_peer_id: u32, dst_peer_id: u32, payload_len: u16) -> Self {
+    #[must_use]
+    pub fn control(channel_id: u64, src_peer_id: u32, dst_peer_id: u32, payload_len: u16) -> Self {
         Self {
             kind: Kind::Control,
             flags: 0,
@@ -47,12 +49,14 @@ impl Header {
         }
     }
 
-    #[must_use] pub fn welcome(channel_id: u64, dst_peer_id: u32, payload_len: u16) -> Self {
+    #[must_use]
+    pub fn welcome(channel_id: u64, dst_peer_id: u32, payload_len: u16) -> Self {
         Self::control(channel_id, 0, dst_peer_id, payload_len)
     }
 }
 
-#[must_use] pub fn encode(h: Header, payload: &[u8]) -> Vec<u8> {
+#[must_use]
+pub fn encode(h: Header, payload: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(HEADER_LEN + payload.len());
     out.extend_from_slice(&MAGIC);
     out.push(VERSION);
@@ -68,7 +72,8 @@ impl Header {
     out
 }
 
-#[must_use] pub fn decode(buf: &[u8]) -> Option<(Header, &[u8])> {
+#[must_use]
+pub fn decode(buf: &[u8]) -> Option<(Header, &[u8])> {
     if buf.len() < HEADER_LEN {
         return None;
     }
@@ -84,8 +89,9 @@ impl Header {
     let src_peer_id = u32::from_le_bytes(buf[16..20].try_into().ok()?);
     let dst_peer_id = u32::from_le_bytes(buf[20..24].try_into().ok()?);
     let stream_id = u32::from_le_bytes(buf[24..28].try_into().ok()?);
-    let payload_len = u16::from_le_bytes([buf[28], buf[29]]);
-    let payload_len = payload_len as usize;
+
+    let payload_len_u16 = u16::from_le_bytes([buf[28], buf[29]]);
+    let payload_len = usize::from(payload_len_u16);
 
     let payload_start = HEADER_LEN;
     let payload_end = payload_start.checked_add(payload_len)?;
@@ -100,7 +106,7 @@ impl Header {
         src_peer_id,
         dst_peer_id,
         stream_id,
-        payload_len: payload_len as u16,
+        payload_len: payload_len_u16,
     };
 
     Some((hdr, &buf[payload_start..payload_end]))

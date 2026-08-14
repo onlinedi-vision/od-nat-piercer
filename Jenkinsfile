@@ -6,7 +6,7 @@ def imageTag(){
 def buildAndScanImage ={
 	def tag = imageTag()
 
-	sh 'docker buildx bake -f docker-bake.hcl --load'
+	sh 'docker buildx bake -f docker-bake.hcl --set release.output=type=docker'
 
 	sh """
 		docker run --rm \
@@ -79,7 +79,7 @@ pipeline {
 						url: 'https://registry.onlinedi.vision:5000',
 						credentialsId: 'docker-registry'
 					){
-						sh "OD_NAT_PIERCER_IMAGE='${tag}' docker compose up -d --no-build --pull always --remove-orphans"
+						sh "OD_NAT_PIERCER_IMAGE='${tag}' docker compose up -d --remove-orphans"
 					}
 				}
 			}

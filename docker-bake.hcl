@@ -7,7 +7,7 @@ group "default" {
 
 function "tag" {
     params = [branch]
-    result = "v${split("/", branch)[2]}"
+    result = "v${split("/", branch)[length(split("/", branch)) - 1]}"
 }
 
 target "release" {

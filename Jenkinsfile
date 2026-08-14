@@ -1,15 +1,13 @@
 def imageTag(){
-	return "registry.onlinedi.vision:5000/od-nat-piercer:${env.GIT_COMMIT}"
+	def branchName = env.GIT_BRANCH.tokenize('/').last()
+	return "registry.onlinedi.vision:5000/od-nat-piercer:v${branchName}"
 }
 
 def buildAndScanImage ={
 	def tag = imageTag()
 
-	sh """
-		GIT_BRANCH='refs/tags/0.0.0' docker buildx bake \
-		--set release.output='type=docker' \
-		--set release.tags='${tag}'
-	"""
+	sh 'docker buildx bake -f docker-bake.hcl --load'
+
 	sh """
 		docker run --rm \
 		-v /var/run/docker.sock:/var/run/docker.sock \
@@ -36,13 +34,8 @@ pipeline {
 	}
 
 	stages {
-		stage('Test'){
-			steps {
-				sh 'cargo test --locked'
-			}
-		}
 
-		stage('Build and Scan'){
+		stage('Test Build and Scan'){
 			steps {
 				script{
 					buildAndScanImage()
@@ -64,7 +57,29 @@ pipeline {
 						url: 'https://registry.onlinedi.vision:5000',
 						credentialsId: 'docker-registry'
 					) {
-						sh "docker push '${imageTag()}'"
+						sh 'docker buildx bake -f docker-bake.hcl --push'
+					}
+				}
+			}
+		}
+
+		stage('Deploy'){
+			when{
+				allOf{
+					branch 'main'
+					not {changeRequest()}
+				}
+			}
+
+			steps {
+				script {
+					def tag = imageTag()
+
+					withDockerRegistry(
+						url: 'https://registry.onlinedi.vision:5000',
+						credentialsId: 'docker-registry'
+					){
+						sh "OD_NAT_PIERCER_IMAGE='${tag}' docker compose up -d --no-build --pull always --remove-orphans"
 					}
 				}
 			}
@@ -72,12 +87,6 @@ pipeline {
 	}
 
 	post {
-		always {
-			script {
-				sh "docker image rm '${imageTag()}' || true"
-			}
-		}
-
 		failure{
 			emailext(
 				from: 'jenkins@mail.onlinedi.vision',

@@ -1,9 +1,7 @@
 services:
   od-nat-piercer:
-    build:
-      context: .
-      additional_contexts:
-        bare-repo: rootfs/repo
+    image: "${OD_NAT_PIERCER_IMAGE:?OD_NAT_PIERCER_IMAGE must be set}"
+    pull_policy: always
     ports: 
       - "0.0.0.0:2131:2131"
       - "0.0.0.0:2131:2131/udp"

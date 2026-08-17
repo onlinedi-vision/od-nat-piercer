@@ -46,7 +46,7 @@ pipeline {
 		stage('Push Image') {
 			when{
 				allOf {
-					branch 'main'
+					branch 'refs/heads/main'
 					not { changeRequest() }
 				}
 			}
@@ -66,7 +66,7 @@ pipeline {
 		stage('Deploy'){
 			when{
 				allOf{
-					branch 'main'
+					branch 'refs/heads/main'
 					not {changeRequest()}
 				}
 			}

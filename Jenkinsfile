@@ -44,9 +44,9 @@ pipeline {
 		}
 
 		stage('Push Image') {
-			when{
-				branch 'main'
-			}
+			when {
+        expression { env.GIT_BRANCH == 'origin/main' }
+    	}
 
 			steps {
 				script{
@@ -54,16 +54,16 @@ pipeline {
 						url: 'https://registry.onlinedi.vision:5000',
 						credentialsId: 'docker-registry'
 					) {
-						sh 'docker buildx bake -f docker-bake.hcl --push'
+						sh 'docker buildx bake -f docker-bake.hcl --set release.output=type=registry'
 					}
 				}
 			}
 		}
 
 		stage('Deploy'){
-			when{
-				branch 'main'
-			}
+			when {
+        expression { env.GIT_BRANCH == 'origin/main' }
+    	}
 
 			steps {
 				script {

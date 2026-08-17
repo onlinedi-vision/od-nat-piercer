@@ -45,7 +45,7 @@ pipeline {
 
 		stage('Push Image') {
 			when {
-        expression { env.GIT_BRANCH == 'origin/main' }
+        expression { env.GIT_BRANCH ==~ /^refs\/tags\/\d+\.\d+\.\d+$/ }
     	}
 
 			steps {
@@ -62,7 +62,7 @@ pipeline {
 
 		stage('Deploy'){
 			when {
-        expression { env.GIT_BRANCH == 'origin/main' }
+        expression { env.GIT_BRANCH ==~ /^refs\/tags\/\d+\.\d+\.\d+$/ }
     	}
 
 			steps {

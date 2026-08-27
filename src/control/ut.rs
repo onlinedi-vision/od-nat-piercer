@@ -90,4 +90,31 @@ mod tests {
             _ => panic!("expected ControlAck"),
         }
     }
+
+    #[test]
+    fn control_msg_large_payload_json_roundtrip() {
+        const PAYLOAD_LEN: usize = 100 * 1024;
+
+        let payload = "A".repeat(PAYLOAD_LEN);
+
+        let msg = ControlMessage::ControlMsg {
+            message_id: 1,
+            payload: payload.clone(),
+        };
+
+        let json = serde_json::to_string(&msg).unwrap();
+        let parsed: ControlMessage = serde_json::from_str(&json).unwrap();
+
+        match parsed {
+            ControlMessage::ControlMsg {
+                message_id,
+                payload: parsed_payload,
+            } => {
+                assert_eq!(message_id, 1);
+                assert_eq!(parsed_payload.len(), PAYLOAD_LEN);
+                assert_eq!(parsed_payload, payload);
+            }
+            _ => panic!("expected ControlMsg"),
+        }
+    }
 }

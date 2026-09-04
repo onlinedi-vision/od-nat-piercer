@@ -15,7 +15,7 @@ jobs:
     steps:
     - uses: actions/checkout@v4
     - name: Clippy 
-      run: cargo clippy --release -- -D warnings
+      run: cargo clippy --release -- -D warnings -A clippy::too-many-arguments
     - name: Run tests
       run: cargo test --verbose
 

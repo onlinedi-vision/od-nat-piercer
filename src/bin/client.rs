@@ -11,8 +11,11 @@ use std::{
 
 use od_nat_piercer::{
     client::{
-        handlers::*,
-        networking::*,
+        handlers::{handle_peer_message, process_incoming_message, try_handle_welcome},
+        networking::{
+            detect_nat_kind, start_heartbeat, start_hole_punching, start_relay_keepalive,
+            start_user_input,
+        },
         structures::{NatKind, PeerInfo, PunchState, PunchSync, RelayState, RelaySync},
     },
     proto::{
@@ -70,7 +73,7 @@ fn send_connect_message(
 
     let connect_msg = format!("{MSG_CONNECT} {server_id} {channel} {user} {nat_type}");
     socket
-        .send_to(connect_msg.as_bytes(), &signaling_addr)
+        .send_to(connect_msg.as_bytes(), signaling_addr)
         .expect("Failed to send CONNECT");
     println!("Sent {MSG_CONNECT} to signaling server");
 }
@@ -103,7 +106,7 @@ fn process_server_response(
     {
         return;
     }
-    println!("Server response:\n{}", response);
+    println!("Server response:\n{response}");
     for line in response.lines() {
         let line = line.trim();
 
@@ -184,7 +187,7 @@ fn handle_recv_result(
                         //temporarly: if payload is text, process as before
                         if let Ok(s) = std::str::from_utf8(payload) {
                             println!("(setup) {MSG_CONTROL} payload: {}", s.trim());
-                            try_handle_welcome(s, &channel_id, &my_peer_id);
+                            try_handle_welcome(s, channel_id, my_peer_id);
                             if &src == server_socketaddr {
                                 if s.lines()
                                     .any(|l| l.trim_start().starts_with(&format!("{MSG_MODE} ")))
@@ -198,7 +201,7 @@ fn handle_recv_result(
                                     s,
                                     src,
                                     peers,
-                                    &user,
+                                    user,
                                     is_relay,
                                     channel_has_server_relays,
                                     signaling_addr,
@@ -228,7 +231,7 @@ fn handle_recv_result(
                                     s,
                                     src,
                                     peers,
-                                    &user,
+                                    user,
                                     is_relay,
                                     channel_has_server_relays,
                                     signaling_addr,
@@ -260,7 +263,7 @@ fn handle_recv_result(
                     &resp,
                     src,
                     peers,
-                    &user,
+                    user,
                     is_relay,
                     channel_has_server_relays,
                     signaling_addr,
@@ -286,7 +289,7 @@ fn handle_recv_result(
                     &resp,
                     src,
                     peers,
-                    &user,
+                    user,
                     is_relay,
                     channel_has_server_relays,
                     signaling_addr,
@@ -299,7 +302,7 @@ fn handle_recv_result(
             true
         }
         Err(e) => {
-            eprintln!("recv error during setup: {}", e);
+            eprintln!("recv error during setup: {e}");
             false
         }
     }
@@ -339,8 +342,8 @@ fn server_responses_during_setup(
             &mut saw_mode,
             punch_sync,
             relay_sync,
-            &channel_id,
-            &my_peer_id,
+            channel_id,
+            my_peer_id,
         ) {
             break;
         }
@@ -373,7 +376,7 @@ fn main_loop(
                             println!("Got {MSG_CONTROL} {} bytes from {src}", payload.len());
                             if let Ok(s) = std::str::from_utf8(payload) {
                                 println!("{MSG_CONTROL} payload: {}", s.trim());
-                                try_handle_welcome(s, &channel_id, &my_peer_id);
+                                try_handle_welcome(s, channel_id, my_peer_id);
 
                                 process_incoming_message(
                                     socket,
@@ -419,7 +422,7 @@ fn main_loop(
                     );
                 } else {
                     // Peer traffic
-                    handle_peer_message(&peers, src);
+                    handle_peer_message(peers, src);
 
                     process_incoming_message(
                         socket,
@@ -439,7 +442,7 @@ fn main_loop(
                 thread::sleep(Duration::from_millis(MAIN_POLL_SLEEP_MS));
             }
             Err(e) => {
-                eprintln!("Error receiving: {}", e);
+                eprintln!("Error receiving: {e}");
                 return Err(e);
             }
         }
@@ -457,10 +460,10 @@ fn main() -> std::io::Result<()> {
 
     // NAT detection before CONNECT
     let my_nat = detect_nat_kind(&socket, &signaling_ip);
-    println!("My NAT kind: {:?}", my_nat);
+    println!("My NAT kind: {my_nat:?}");
 
     //Address for the signalization server (UDP on port 2131)
-    let signaling_addr = format!("{}:2131", signaling_ip);
+    let signaling_addr = format!("{signaling_ip}:2131");
     let server_socketaddr: std::net::SocketAddr = signaling_addr
         .to_socket_addrs()
         .expect("resolve signaling server")
@@ -497,9 +500,9 @@ fn main() -> std::io::Result<()> {
 
     start_heartbeat(
         socket.try_clone()?,
-        server_id.to_string(),
-        channel.to_string(),
-        user.to_string(),
+        server_id.clone(),
+        channel.clone(),
+        user.clone(),
         signaling_addr.clone(),
     );
 
@@ -519,14 +522,14 @@ fn main() -> std::io::Result<()> {
     );
 
     // start punching ONLY if NAT is not symmetric
-    if my_nat != NatKind::Symmetric {
+    if my_nat == NatKind::Symmetric {
+        println!("Symmetric NAT detected - skipping hole punching, relying on server relay.");
+    } else {
         start_hole_punching(
             socket.try_clone()?,
             Arc::clone(&peers),
             Arc::clone(&punch_sync),
         );
-    } else {
-        println!("Symmetric NAT detected - skipping hole punching, relying on server relay.");
     }
 
     //Relay keepalive thread starter
@@ -534,8 +537,8 @@ fn main() -> std::io::Result<()> {
         socket.try_clone()?,
         Arc::clone(&peers),
         Arc::clone(&relay_started),
-        server_id.to_string(),
-        channel.to_string(),
+        server_id.clone(),
+        channel.clone(),
         signaling_addr.clone(),
         Arc::clone(&relay_sync),
     );
@@ -544,7 +547,7 @@ fn main() -> std::io::Result<()> {
     start_user_input(
         socket.try_clone()?,
         Arc::clone(&peers),
-        user.to_string(),
+        user.clone(),
         Arc::clone(&send_via_server),
         signaling_addr.clone(),
         Arc::clone(&is_relay),

@@ -36,11 +36,7 @@ pub async fn update_existing_user(
     }
 }
 
-pub async fn remove_old_user_sessions(
-    channel: &mut Channel,
-    user_name: &str,
-    src_addr: SocketAddr,
-) {
+pub fn remove_old_user_sessions(channel: &mut Channel, user_name: &str, src_addr: SocketAddr) {
     channel
         .users
         .retain(|u| !(u.name == user_name && u.addr != src_addr));
@@ -49,27 +45,23 @@ pub async fn remove_old_user_sessions(
 pub async fn handle_lone_user_scenario(channel: &mut Channel, socket: &Arc<UdpSocket>) {
     if channel.relay.is_none() && channel.users.len() == 1 {
         let u = &channel.users[0];
-        match u.nat_kind {
-            NatKind::Symmetric => {
-                let reply = format!(
-                    "{} {} {}\n",
-                    MSG_MODE, MSG_SERVER_RELAY, channel.users[0].name
-                );
-                if let Err(e) = socket.send_to(reply.as_bytes(), u.addr).await {
-                    eprintln!("Failed to notify lone user about server relay: {}", e);
-                }
-                channel.relay = None;
+        if u.nat_kind == NatKind::Symmetric {
+            let reply = format!(
+                "{} {} {}\n",
+                MSG_MODE, MSG_SERVER_RELAY, channel.users[0].name
+            );
+            if let Err(e) = socket.send_to(reply.as_bytes(), u.addr).await {
+                eprintln!("Failed to notify lone user about server relay: {e}");
             }
-
-            _ => {
-                if let Err(e) = socket
-                    .send_to(format!("{MSG_MODE} {MSG_RELAY}\n").as_bytes(), u.addr)
-                    .await
-                {
-                    eprintln!("Failed to notify lone user about relay mode: {}", e);
-                }
-                channel.relay = Some(u.name.clone());
+            channel.relay = None;
+        } else {
+            if let Err(e) = socket
+                .send_to(format!("{MSG_MODE} {MSG_RELAY}\n").as_bytes(), u.addr)
+                .await
+            {
+                eprintln!("Failed to notify lone user about relay mode: {e}");
             }
+            channel.relay = Some(u.name.clone());
         }
     }
 }
@@ -82,7 +74,7 @@ pub async fn add_new_user(
     nat_kind: NatKind,
 ) -> (Channel, u32) {
     //Remove old user sessions with same name but different address
-    remove_old_user_sessions(channel, user_name, src_addr).await;
+    remove_old_user_sessions(channel, user_name, src_addr);
 
     let peer_id = channel.next_peer_id;
     channel.next_peer_id += 1;
@@ -92,12 +84,12 @@ pub async fn add_new_user(
 
     handle_lone_user_scenario(channel, socket).await;
 
-    println!("User {} joined from {}", user_name, src_addr);
+    println!("User {user_name} joined from {src_addr}");
 
     (channel.clone(), peer_id)
 }
 
-pub async fn find_and_remove_user(
+pub fn find_and_remove_user(
     channel: &mut Channel,
     user_name: &str,
     src_addr: SocketAddr,
@@ -108,11 +100,7 @@ pub async fn find_and_remove_user(
         .position(|u| u.name == user_name && u.addr == src_addr)
     {
         //check if leaving user was relay
-        let was_relay = channel
-            .relay
-            .as_ref()
-            .map(|r| r == &user_name)
-            .unwrap_or(false);
+        let was_relay = channel.relay.as_ref().is_some_and(|r| r == user_name);
 
         let leaving_user_addr = channel.users[pos].addr;
         channel.users.remove(pos);
@@ -123,18 +111,15 @@ pub async fn find_and_remove_user(
     }
 }
 
-pub async fn update_relay_after_departure(
-    channel: &mut Channel,
-    was_relay: bool,
-) -> Option<SocketAddr> {
+pub fn update_relay_after_departure(channel: &mut Channel, was_relay: bool) -> Option<SocketAddr> {
     let mut lone_user_addr = None;
 
     if was_relay {
-        if !channel.users.is_empty() {
+        if channel.users.is_empty() {
+            channel.relay = None;
+        } else {
             let new_relay = channel.users[0].name.clone();
             channel.relay = Some(new_relay);
-        } else {
-            channel.relay = None;
         }
 
         if channel.users.len() == 1 {
@@ -158,27 +143,24 @@ pub async fn handle_user_removal(
     let mut leaving_user_addr = None;
     let mut lone_user_addr = None;
 
-    if let Some(channels) = st.get_mut(server_id) {
-        if let Some(channel) = channels.get_mut(channel_name) {
-            if let Some((found_was_relay, found_leaving_addr)) =
-                find_and_remove_user(channel, user_name, src_addr).await
-            {
-                was_relay = found_was_relay;
-                leaving_user_addr = Some(found_leaving_addr);
+    if let Some(channels) = st.get_mut(server_id)
+        && let Some(channel) = channels.get_mut(channel_name)
+    {
+        if let Some((found_was_relay, found_leaving_addr)) =
+            find_and_remove_user(channel, user_name, src_addr)
+        {
+            was_relay = found_was_relay;
+            leaving_user_addr = Some(found_leaving_addr);
 
-                lone_user_addr = update_relay_after_departure(channel, was_relay).await;
+            lone_user_addr = update_relay_after_departure(channel, was_relay);
 
-                println!("User {} left {}-{}", user_name, server_id, channel_name);
-            } else {
-                println!(
-                    "Ignoring DISCONNECT for {} from {} (no matching session)",
-                    user_name, src_addr
-                );
-            }
+            println!("User {user_name} left {server_id}-{channel_name}");
+        } else {
+            println!("Ignoring DISCONNECT for {user_name} from {src_addr} (no matching session)");
         }
     }
 
-    let remaining_users = get_remaining_users(&state, server_id, channel_name).await;
+    let remaining_users = get_remaining_users(state, server_id, channel_name).await;
     (
         remaining_users,
         was_relay,

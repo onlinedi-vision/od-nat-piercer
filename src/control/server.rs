@@ -15,9 +15,18 @@ pub(crate) fn channel_key(server_id: &str, channel: &str) -> String {
     format!("{server_id}:{channel}")
 }
 
+/// Starts the WebSocket control server on the given address.
+///
+/// The server accepts incoming WebSocket control connections and spawns a
+/// separate async task for each client connection.
+///
+/// # Errors
+///
+/// Returns an [`std::io::Error`] if the TCP listener cannot bind to `addr` or
+/// if accepting an incoming TCP connection fails.
 pub async fn start_control_server(addr: &str, peers: ControlPeers) -> std::io::Result<()> {
     let listener = TcpListener::bind(addr).await?;
-    println!("Control WebSocket server listening on {}", addr);
+    println!("Control WebSocket server listening on {addr}");
 
     loop {
         let (stream, _) = listener.accept().await?;
@@ -25,7 +34,7 @@ pub async fn start_control_server(addr: &str, peers: ControlPeers) -> std::io::R
 
         tokio::spawn(async move {
             if let Err(e) = handle_connection(stream, peers).await {
-                eprintln!("control ws connection error: {}", e);
+                eprintln!("control ws connection error: {e}");
             }
         });
     }

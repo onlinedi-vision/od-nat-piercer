@@ -19,6 +19,7 @@ pub struct User {
 }
 
 impl User {
+    #[must_use]
     pub fn new(user_name: &str, addr: SocketAddr, nat_kind: NatKind, peer_id: u32) -> Self {
         Self {
             peer_id,

@@ -35,6 +35,16 @@ const SETUP_POLL_SLEEP_MS: u64 = 20;
 const MAIN_POLL_SLEEP_MS: u64 = 50;
 const SETUP_DEADLINE_MS: u64 = 1500;
 
+struct ClientReceiveContext<'a> {
+    incoming: IncomingMessageContext<'a>,
+    send_via_server: &'a Arc<AtomicBool>,
+    server_socketaddr: &'a std::net::SocketAddr,
+    punch_sync: &'a PunchSync,
+    relay_sync: &'a RelaySync,
+    channel_id: &'a Arc<AtomicU64>,
+    my_peer_id: &'a Arc<AtomicU32>,
+}
+
 fn parse_arguments(args: &[String]) -> std::io::Result<(String, String, String, String, u16)> {
     if args.len() < 6 {
         eprintln!("Usage: client <signaling_ip> <server_id> <channel> <user> <local_port>");
@@ -182,30 +192,12 @@ fn process_server_response(
 }
 
 fn handle_recv_result(
+    context: &ClientReceiveContext<'_>,
     result: std::io::Result<(usize, std::net::SocketAddr)>,
-    buf: &mut [u8],
-    socket: &UdpSocket,
-    peers: &Arc<Mutex<Vec<PeerInfo>>>,
-    user: &str,
-    is_relay: &Arc<Mutex<bool>>,
-    channel_has_server_relays: &Arc<AtomicBool>,
-    send_via_server: &Arc<AtomicBool>,
-    server_socketaddr: &std::net::SocketAddr,
-    signaling_addr: &str,
+    buf: &[u8],
     saw_mode: &mut bool,
-    punch_sync: &PunchSync,
-    relay_sync: &RelaySync,
-    channel_id: &Arc<AtomicU64>,
-    my_peer_id: &Arc<AtomicU32>,
 ) -> std::io::Result<bool> {
-    let incoming_message_context = IncomingMessageContext {
-        socket,
-        peers,
-        user,
-        is_relay,
-        channel_has_server_relays,
-        signaling_addr,
-    };
+    let incoming = &context.incoming;
 
     match result {
         Ok((len, src)) => {
@@ -220,8 +212,8 @@ fn handle_recv_result(
                         //temporarly: if payload is text, process as before
                         if let Ok(s) = std::str::from_utf8(payload) {
                             println!("(setup) {MSG_CONTROL} payload: {}", s.trim());
-                            try_handle_welcome(s, channel_id, my_peer_id);
-                            if &src == server_socketaddr {
+                            try_handle_welcome(s, context.channel_id, context.my_peer_id);
+                            if &src == context.server_socketaddr {
                                 if s.lines()
                                     .any(|l| l.trim_start().starts_with(&format!("{MSG_MODE} ")))
                                 {
@@ -229,28 +221,28 @@ fn handle_recv_result(
                                 }
 
                                 // 1) Normal processing: MODE / DATA / USER_LEFT, etc
-                                process_incoming_message(&incoming_message_context, s, src)?;
+                                process_incoming_message(incoming, s, src)?;
 
                                 // 2) Local mode + send_via_server / punching behaviors
                                 process_server_response(
                                     s,
-                                    user,
-                                    is_relay,
-                                    channel_has_server_relays,
-                                    send_via_server,
-                                    punch_sync,
+                                    incoming.user,
+                                    incoming.is_relay,
+                                    incoming.channel_has_server_relays,
+                                    context.send_via_server,
+                                    context.punch_sync,
                                 )?;
 
                                 update_relay_is_active(
-                                    is_relay,
-                                    channel_has_server_relays,
-                                    relay_sync,
+                                    incoming.is_relay,
+                                    incoming.channel_has_server_relays,
+                                    context.relay_sync,
                                 )?;
                             } else {
                                 // peer traffic (arrived during setup)
-                                handle_peer_message(peers, src)?;
+                                handle_peer_message(incoming.peers, src)?;
 
-                                process_incoming_message(&incoming_message_context, s, src)?;
+                                process_incoming_message(incoming, s, src)?;
                             }
                         }
                     }
@@ -264,7 +256,7 @@ fn handle_recv_result(
                 return Ok(true);
             }
             let resp = String::from_utf8_lossy(&buf[..len]).to_string();
-            if &src == server_socketaddr {
+            if &src == context.server_socketaddr {
                 if resp
                     .lines()
                     .any(|l| l.trim_start().starts_with(&format!("{MSG_MODE} ")))
@@ -273,24 +265,28 @@ fn handle_recv_result(
                 }
 
                 // 1) Normal processing: MODE / DATA / USER_LEFT, etc
-                process_incoming_message(&incoming_message_context, &resp, src)?;
+                process_incoming_message(incoming, &resp, src)?;
 
                 // 2) Local mode + send_via_server / punching behaviors
                 process_server_response(
                     &resp,
-                    user,
-                    is_relay,
-                    channel_has_server_relays,
-                    send_via_server,
-                    punch_sync,
+                    incoming.user,
+                    incoming.is_relay,
+                    incoming.channel_has_server_relays,
+                    context.send_via_server,
+                    context.punch_sync,
                 )?;
 
-                update_relay_is_active(is_relay, channel_has_server_relays, relay_sync)?;
+                update_relay_is_active(
+                    incoming.is_relay,
+                    incoming.channel_has_server_relays,
+                    context.relay_sync,
+                )?;
             } else {
                 // peer traffic (arrived during setup)
-                handle_peer_message(peers, src)?;
+                handle_peer_message(incoming.peers, src)?;
 
-                process_incoming_message(&incoming_message_context, &resp, src)?;
+                process_incoming_message(incoming, &resp, src)?;
             }
             Ok(true)
         }
@@ -306,42 +302,15 @@ fn handle_recv_result(
 }
 
 fn server_responses_during_setup(
-    socket: &UdpSocket,
-    peers: &Arc<Mutex<Vec<PeerInfo>>>,
-    user: &str,
-    is_relay: &Arc<Mutex<bool>>,
-    channel_has_server_relays: &Arc<AtomicBool>,
-    send_via_server: &Arc<AtomicBool>,
-    server_socketaddr: &std::net::SocketAddr,
-    signaling_addr: &str,
-    punch_sync: &PunchSync,
-    relay_sync: &RelaySync,
-    channel_id: &Arc<AtomicU64>,
-    my_peer_id: &Arc<AtomicU32>,
+    context: &ClientReceiveContext<'_>,
 ) -> std::io::Result<()> {
     let mut buf = [0u8; 2048];
     let setup_deadline = Instant::now() + Duration::from_millis(SETUP_DEADLINE_MS);
     let mut saw_mode = false;
 
     while Instant::now() < setup_deadline && !saw_mode {
-        let res = socket.recv_from(&mut buf);
-        if !handle_recv_result(
-            res,
-            &mut buf,
-            socket,
-            peers,
-            user,
-            is_relay,
-            channel_has_server_relays,
-            send_via_server,
-            server_socketaddr,
-            signaling_addr,
-            &mut saw_mode,
-            punch_sync,
-            relay_sync,
-            channel_id,
-            my_peer_id,
-        )? {
+        let res = context.incoming.socket.recv_from(&mut buf);
+        if !handle_recv_result(context, res, &buf, &mut saw_mode)? {
             break;
         }
     }
@@ -349,48 +318,30 @@ fn server_responses_during_setup(
 }
 
 fn main_loop(
-    socket: &UdpSocket,
-    peers: &Arc<Mutex<Vec<PeerInfo>>>,
-    user: &str,
-    is_relay: &Arc<Mutex<bool>>,
-    channel_has_server_relays: &Arc<AtomicBool>,
-    signaling_addr: &str,
-    server_socketaddr: &std::net::SocketAddr,
-    punch_sync: &PunchSync,
-    relay_sync: &RelaySync,
-    send_via_server: &Arc<AtomicBool>,
-    channel_id: &Arc<AtomicU64>,
-    my_peer_id: &Arc<AtomicU32>,
+    context: &ClientReceiveContext<'_>,
     signaling_ip: &str,
     server_id: &str,
     channel: &str,
 ) -> std::io::Result<()> {
     let mut buf = [0u8; 2048];
     let mut control_client_started = false;
-    let incoming_message_context = IncomingMessageContext {
-        socket,
-        peers,
-        user,
-        is_relay,
-        channel_has_server_relays,
-        signaling_addr,
-    };
+    let incoming = &context.incoming;
 
     println!("Starting main message loop...");
 
-    let pid = my_peer_id.load(Ordering::Acquire);
+    let pid = context.my_peer_id.load(Ordering::Acquire);
 
     start_control_client_after_welcome(
         &mut control_client_started,
         signaling_ip,
         server_id,
         channel,
-        user,
+        incoming.user,
         pid,
     );
 
     loop {
-        match socket.recv_from(&mut buf) {
+        match incoming.socket.recv_from(&mut buf) {
             Ok((len, src)) => {
                 if let Some((hdr, payload)) = od_nat_piercer::proto::packet::decode(&buf[..len]) {
                     match hdr.kind {
@@ -398,22 +349,22 @@ fn main_loop(
                             println!("Got {MSG_CONTROL} {} bytes from {src}", payload.len());
                             if let Ok(s) = std::str::from_utf8(payload) {
                                 println!("{MSG_CONTROL} payload: {}", s.trim());
-                                try_handle_welcome(s, channel_id, my_peer_id);
+                                try_handle_welcome(s, context.channel_id, context.my_peer_id);
 
-                                process_incoming_message(&incoming_message_context, s, src)?;
+                                process_incoming_message(incoming, s, src)?;
                             }
                         }
                         Kind::Dtls => println!("Got DTLS {} bytes from {}", payload.len(), src),
                         Kind::Srtp => println!("Got SRTP {} bytes from {}", payload.len(), src),
                     }
-                    let pid = my_peer_id.load(Ordering::Acquire);
+                    let pid = context.my_peer_id.load(Ordering::Acquire);
 
                     start_control_client_after_welcome(
                         &mut control_client_started,
                         signaling_ip,
                         server_id,
                         channel,
-                        user,
+                        incoming.user,
                         pid,
                     );
 
@@ -422,27 +373,31 @@ fn main_loop(
 
                 let message = String::from_utf8_lossy(&buf[..len]).to_string();
 
-                if &src == server_socketaddr {
+                if &src == context.server_socketaddr {
                     // 1) Process MODE / DATA / USER_LEFT etc.
-                    process_incoming_message(&incoming_message_context, &message, src)?;
+                    process_incoming_message(incoming, &message, src)?;
 
                     // 2) Update send_via_server + punching according to MODE lines
                     process_server_response(
                         &message,
-                        user,
-                        is_relay,
-                        channel_has_server_relays,
-                        send_via_server,
-                        punch_sync,
+                        incoming.user,
+                        incoming.is_relay,
+                        incoming.channel_has_server_relays,
+                        context.send_via_server,
+                        context.punch_sync,
                     )?;
                 } else {
                     // Peer traffic
-                    handle_peer_message(peers, src)?;
+                    handle_peer_message(incoming.peers, src)?;
 
-                    process_incoming_message(&incoming_message_context, &message, src)?;
+                    process_incoming_message(incoming, &message, src)?;
                 }
 
-                update_relay_is_active(is_relay, channel_has_server_relays, relay_sync)?;
+                update_relay_is_active(
+                    incoming.is_relay,
+                    incoming.channel_has_server_relays,
+                    context.relay_sync,
+                )?;
             }
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                 thread::sleep(Duration::from_millis(MAIN_POLL_SLEEP_MS));
@@ -516,20 +471,26 @@ fn main() -> std::io::Result<()> {
         signaling_addr.clone(),
     );
 
-    server_responses_during_setup(
-        &socket,
-        &peers,
-        &user,
-        &is_relay,
-        &channel_has_server_relays,
-        &send_via_server,
-        &server_socketaddr,
-        &signaling_addr,
-        &punch_sync,
-        &relay_sync,
-        &channel_id,
-        &my_peer_id,
-    )?;
+    let incoming = IncomingMessageContext {
+        socket: &socket,
+        peers: &peers,
+        user: &user,
+        is_relay: &is_relay,
+        channel_has_server_relays: &channel_has_server_relays,
+        signaling_addr: &signaling_addr,
+    };
+
+    let context = ClientReceiveContext {
+        incoming,
+        send_via_server: &send_via_server,
+        server_socketaddr: &server_socketaddr,
+        punch_sync: &punch_sync,
+        relay_sync: &relay_sync,
+        channel_id: &channel_id,
+        my_peer_id: &my_peer_id,
+    };
+
+    server_responses_during_setup(&context)?;
 
     // start punching ONLY if NAT is not symmetric
     if my_nat == NatKind::Symmetric {
@@ -564,21 +525,5 @@ fn main() -> std::io::Result<()> {
         Arc::clone(&channel_has_server_relays),
     );
 
-    main_loop(
-        &socket,
-        &peers,
-        &user,
-        &is_relay,
-        &channel_has_server_relays,
-        &signaling_addr,
-        &server_socketaddr,
-        &punch_sync,
-        &relay_sync,
-        &send_via_server,
-        &channel_id,
-        &my_peer_id,
-        &signaling_ip,
-        &server_id,
-        &channel,
-    )
+    main_loop(&context, &signaling_ip, &server_id, &channel)
 }

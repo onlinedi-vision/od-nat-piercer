@@ -19,18 +19,26 @@ fn welcome_payload(channel_id: u64, peer_id: u32) -> String {
     format!("{MSG_WELCOME} {channel_id} {peer_id}\n")
 }
 
-async fn send_welcome(socket: &Arc<UdpSocket>, dst: SocketAddr, channel_id: u64, peer_id: u32) {
+async fn send_welcome(
+    socket: &Arc<UdpSocket>,
+    dst: SocketAddr,
+    channel_id: u64,
+    peer_id: u32,
+) -> std::io::Result<()> {
     let payload = welcome_payload(channel_id, peer_id);
-    let hdr = Header::welcome(
-        channel_id,
-        peer_id,
-        u16::try_from(payload.len()).expect("REASON"),
-    );
+    let payload_len = u16::try_from(payload.len()).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "WELCOME payload length exceeds u16::MAX",
+        )
+    })?;
+    let hdr = Header::welcome(channel_id, peer_id, payload_len);
     let pkt = packet::encode(hdr, payload.as_bytes());
 
     println!("Sending WELCOME to {dst}: channel_id={channel_id}, peer_id={peer_id}");
 
-    let _ = socket.send_to(&pkt, dst).await;
+    socket.send_to(&pkt, dst).await?;
+    Ok(())
 }
 
 pub async fn handle_connect_message(
@@ -81,7 +89,10 @@ pub async fn handle_connect_message(
         }
     };
 
-    send_welcome(&socket, src_addr, channel_id, peer_id).await;
+    if let Err(e) = send_welcome(&socket, src_addr, channel_id, peer_id).await {
+        eprintln!("Failed to send WELCOME: {e}");
+        return;
+    }
 
     if !is_new_user {
         return;

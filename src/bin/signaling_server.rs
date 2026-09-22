@@ -8,6 +8,7 @@ use std::sync::Arc;
 use tokio::net::UdpSocket;
 use tokio::sync::Mutex;
 
+#[allow(clippy::disallowed_methods)] //tokio::main generates expect when building the runtime.
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let socket_main = UdpSocket::bind("0.0.0.0:2131").await?;

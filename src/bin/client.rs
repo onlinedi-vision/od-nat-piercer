@@ -35,7 +35,7 @@ const SETUP_POLL_SLEEP_MS: u64 = 20;
 const MAIN_POLL_SLEEP_MS: u64 = 50;
 const SETUP_DEADLINE_MS: u64 = 1500;
 
-fn parse_arguments(args: &[String]) -> (String, String, String, String, u16) {
+fn parse_arguments(args: &[String]) -> std::io::Result<(String, String, String, String, u16)> {
     if args.len() < 6 {
         eprintln!("Usage: client <signaling_ip> <server_id> <channel> <user> <local_port>");
         std::process::exit(1);
@@ -45,19 +45,22 @@ fn parse_arguments(args: &[String]) -> (String, String, String, String, u16) {
     let server_id = args[2].clone();
     let channel = args[3].clone();
     let user = args[4].clone();
-    let local_port: u16 = args[5].parse().expect("Invalid port number");
+    let local_port: u16 = args[5].parse().map_err(|e| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("Invalid local port: {e}"),
+        )
+    })?;
 
-    (signaling_ip, server_id, channel, user, local_port)
+    Ok((signaling_ip, server_id, channel, user, local_port))
 }
 
-fn setup_socket(local_port: u16) -> UdpSocket {
+fn setup_socket(local_port: u16) -> std::io::Result<UdpSocket> {
     //Socket UDP local
-    let socket = UdpSocket::bind(("0.0.0.0", local_port)).expect("Failed to bind socket");
-    socket
-        .set_nonblocking(true)
-        .expect("Failed to set non-blocking");
+    let socket = UdpSocket::bind(("0.0.0.0", local_port))?;
+    socket.set_nonblocking(true)?;
 
-    socket
+    Ok(socket)
 }
 
 fn send_connect_message(
@@ -67,7 +70,7 @@ fn send_connect_message(
     channel: &str,
     user: &str,
     my_nat: NatKind,
-) {
+) -> std::io::Result<()> {
     let nat_type = match my_nat {
         NatKind::Symmetric => NAT_TYPE_SYMMETRIC,
         NatKind::Cone => NAT_TYPE_CONE,
@@ -76,24 +79,29 @@ fn send_connect_message(
     };
 
     let connect_msg = format!("{MSG_CONNECT} {server_id} {channel} {user} {nat_type}");
-    socket
-        .send_to(connect_msg.as_bytes(), signaling_addr)
-        .expect("Failed to send CONNECT");
+    socket.send_to(connect_msg.as_bytes(), signaling_addr)?;
     println!("Sent {MSG_CONNECT} to signaling server");
+    Ok(())
 }
 
 fn update_relay_is_active(
     is_relay: &Arc<Mutex<bool>>,
     channel_has_server_relays: &Arc<AtomicBool>,
     relay_sync: &RelaySync,
-) {
-    let active = *is_relay.lock().unwrap() || channel_has_server_relays.load(Ordering::Acquire);
+) -> std::io::Result<()> {
+    let relay = *is_relay.lock().map_err(|_| {
+        std::io::Error::other("Cannot update relay activity: relay role mutex is poisoned")
+    })?;
+    let active = relay || channel_has_server_relays.load(Ordering::Acquire);
     let (lock, cvar) = &**relay_sync;
-    let mut st = lock.lock().unwrap();
+    let mut st = lock.lock().map_err(|_| {
+        std::io::Error::other("Cannot update relay activity: relay state mutex is poisoned")
+    })?;
     if st.is_active != active {
         st.is_active = active;
         cvar.notify_all(); //starts/stops relay loop instantly
     }
+    Ok(())
 }
 
 fn process_server_response(
@@ -103,26 +111,28 @@ fn process_server_response(
     channel_has_server_relays: &Arc<AtomicBool>,
     send_via_server: &Arc<AtomicBool>,
     punch_sync: &PunchSync,
-) {
+) -> std::io::Result<()> {
     if !response
         .lines()
         .any(|l| l.trim_start().starts_with(&format!("{MSG_MODE} ")))
     {
-        return;
+        return Ok(());
     }
     println!("Server response:\n{response}");
     for line in response.lines() {
         let line = line.trim();
 
         if line == format!("{MSG_MODE} {MSG_RELAY}") {
+            let (lock, cvar) = &**punch_sync;
+            let mut st = lock.lock().map_err(|_| {
+                std::io::Error::other("Cannot process server response: punch state mutex is poisoned")
+            })?;
             if send_via_server.load(Ordering::Acquire) {
                 send_via_server.store(false, Ordering::Release);
                 println!("I am relay now - stop sending via server.");
             }
 
             //resume punching if it was paused
-            let (lock, cvar) = &**punch_sync;
-            let mut st = lock.lock().unwrap();
             if st.paused {
                 st.paused = false;
                 cvar.notify_all();
@@ -136,6 +146,12 @@ fn process_server_response(
                 let who = parts[2];
 
                 if who == user {
+                    let (lock, cvar) = &**punch_sync;
+                    let mut st = lock.lock().map_err(|_| {
+                        std::io::Error::other(
+                            "Cannot process server response: punch state mutex is poisoned",
+                        )
+                    })?;
                     //i am symmetric (or lone) => send via server
                     if !send_via_server.load(Ordering::Acquire) {
                         send_via_server.store(true, Ordering::Release);
@@ -143,15 +159,18 @@ fn process_server_response(
                     }
 
                     // stop the thread of punching
-                    let (lock, cvar) = &**punch_sync;
-                    let mut st = lock.lock().unwrap();
                     if !st.paused {
                         st.paused = true;
                         cvar.notify_all();
                     }
-                } else if *is_relay.lock().unwrap() {
+                } else {
+                    let relay = *is_relay.lock().map_err(|_| {
+                        std::io::Error::other(
+                            "Cannot process server response: relay role mutex is poisoned",
+                        )
+                    })?;
                     // i am the relay -> note that channel has server-relayed peers
-                    if !channel_has_server_relays.load(Ordering::Acquire) {
+                    if relay && !channel_has_server_relays.load(Ordering::Acquire) {
                         channel_has_server_relays.store(true, Ordering::Release);
                         println!("Relay will mirror traffic to server.");
                     }
@@ -159,6 +178,7 @@ fn process_server_response(
             }
         }
     }
+    Ok(())
 }
 
 fn handle_recv_result(
@@ -177,7 +197,7 @@ fn handle_recv_result(
     relay_sync: &RelaySync,
     channel_id: &Arc<AtomicU64>,
     my_peer_id: &Arc<AtomicU32>,
-) -> bool {
+) -> std::io::Result<bool> {
     let incoming_message_context = IncomingMessageContext {
         socket,
         peers,
@@ -209,7 +229,7 @@ fn handle_recv_result(
                                 }
 
                                 // 1) Normal processing: MODE / DATA / USER_LEFT, etc
-                                process_incoming_message(&incoming_message_context, s, src);
+                                process_incoming_message(&incoming_message_context, s, src)?;
 
                                 // 2) Local mode + send_via_server / punching behaviors
                                 process_server_response(
@@ -219,18 +239,18 @@ fn handle_recv_result(
                                     channel_has_server_relays,
                                     send_via_server,
                                     punch_sync,
-                                );
+                                )?;
 
                                 update_relay_is_active(
                                     is_relay,
                                     channel_has_server_relays,
                                     relay_sync,
-                                );
+                                )?;
                             } else {
                                 // peer traffic (arrived during setup)
-                                handle_peer_message(peers, src);
+                                handle_peer_message(peers, src)?;
 
-                                process_incoming_message(&incoming_message_context, s, src);
+                                process_incoming_message(&incoming_message_context, s, src)?;
                             }
                         }
                     }
@@ -241,7 +261,7 @@ fn handle_recv_result(
                         println!("(setup) Got SRTP {} bytes from {}", payload.len(), src);
                     }
                 }
-                return true;
+                return Ok(true);
             }
             let resp = String::from_utf8_lossy(&buf[..len]).to_string();
             if &src == server_socketaddr {
@@ -253,7 +273,7 @@ fn handle_recv_result(
                 }
 
                 // 1) Normal processing: MODE / DATA / USER_LEFT, etc
-                process_incoming_message(&incoming_message_context, &resp, src);
+                process_incoming_message(&incoming_message_context, &resp, src)?;
 
                 // 2) Local mode + send_via_server / punching behaviors
                 process_server_response(
@@ -263,24 +283,24 @@ fn handle_recv_result(
                     channel_has_server_relays,
                     send_via_server,
                     punch_sync,
-                );
+                )?;
 
-                update_relay_is_active(is_relay, channel_has_server_relays, relay_sync);
+                update_relay_is_active(is_relay, channel_has_server_relays, relay_sync)?;
             } else {
                 // peer traffic (arrived during setup)
-                handle_peer_message(peers, src);
+                handle_peer_message(peers, src)?;
 
-                process_incoming_message(&incoming_message_context, &resp, src);
+                process_incoming_message(&incoming_message_context, &resp, src)?;
             }
-            true
+            Ok(true)
         }
         Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
             thread::sleep(Duration::from_millis(SETUP_POLL_SLEEP_MS));
-            true
+            Ok(true)
         }
         Err(e) => {
             eprintln!("recv error during setup: {e}");
-            false
+            Ok(false)
         }
     }
 }
@@ -298,7 +318,7 @@ fn server_responses_during_setup(
     relay_sync: &RelaySync,
     channel_id: &Arc<AtomicU64>,
     my_peer_id: &Arc<AtomicU32>,
-) {
+) -> std::io::Result<()> {
     let mut buf = [0u8; 2048];
     let setup_deadline = Instant::now() + Duration::from_millis(SETUP_DEADLINE_MS);
     let mut saw_mode = false;
@@ -321,10 +341,11 @@ fn server_responses_during_setup(
             relay_sync,
             channel_id,
             my_peer_id,
-        ) {
+        )? {
             break;
         }
     }
+    Ok(())
 }
 
 fn main_loop(
@@ -379,7 +400,7 @@ fn main_loop(
                                 println!("{MSG_CONTROL} payload: {}", s.trim());
                                 try_handle_welcome(s, channel_id, my_peer_id);
 
-                                process_incoming_message(&incoming_message_context, s, src);
+                                process_incoming_message(&incoming_message_context, s, src)?;
                             }
                         }
                         Kind::Dtls => println!("Got DTLS {} bytes from {}", payload.len(), src),
@@ -403,7 +424,7 @@ fn main_loop(
 
                 if &src == server_socketaddr {
                     // 1) Process MODE / DATA / USER_LEFT etc.
-                    process_incoming_message(&incoming_message_context, &message, src);
+                    process_incoming_message(&incoming_message_context, &message, src)?;
 
                     // 2) Update send_via_server + punching according to MODE lines
                     process_server_response(
@@ -413,15 +434,15 @@ fn main_loop(
                         channel_has_server_relays,
                         send_via_server,
                         punch_sync,
-                    );
+                    )?;
                 } else {
                     // Peer traffic
-                    handle_peer_message(peers, src);
+                    handle_peer_message(peers, src)?;
 
-                    process_incoming_message(&incoming_message_context, &message, src);
+                    process_incoming_message(&incoming_message_context, &message, src)?;
                 }
 
-                update_relay_is_active(is_relay, channel_has_server_relays, relay_sync);
+                update_relay_is_active(is_relay, channel_has_server_relays, relay_sync)?;
             }
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                 thread::sleep(Duration::from_millis(MAIN_POLL_SLEEP_MS));
@@ -436,9 +457,9 @@ fn main_loop(
 
 fn main() -> std::io::Result<()> {
     let args: Vec<String> = env::args().collect();
-    let (signaling_ip, server_id, channel, user, local_port) = parse_arguments(&args);
+    let (signaling_ip, server_id, channel, user, local_port) = parse_arguments(&args)?;
 
-    let socket = setup_socket(local_port);
+    let socket = setup_socket(local_port)?;
 
     let my_peer_id = Arc::new(AtomicU32::new(0));
     let channel_id = Arc::new(AtomicU64::new(0));
@@ -450,10 +471,14 @@ fn main() -> std::io::Result<()> {
     //Address for the signalization server (UDP on port 2131)
     let signaling_addr = format!("{signaling_ip}:2131");
     let server_socketaddr: std::net::SocketAddr = signaling_addr
-        .to_socket_addrs()
-        .expect("resolve signaling server")
+        .to_socket_addrs()?
         .next()
-        .expect("no addr for signaling server");
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::AddrNotAvailable,
+                "No address found for signaling server",
+            )
+        })?;
 
     send_connect_message(
         &socket,
@@ -462,7 +487,7 @@ fn main() -> std::io::Result<()> {
         &channel,
         &user,
         my_nat,
-    );
+    )?;
 
     let peers: Vec<PeerInfo> = Vec::new();
     let peers = Arc::new(Mutex::new(peers));
@@ -504,7 +529,7 @@ fn main() -> std::io::Result<()> {
         &relay_sync,
         &channel_id,
         &my_peer_id,
-    );
+    )?;
 
     // start punching ONLY if NAT is not symmetric
     if my_nat == NatKind::Symmetric {

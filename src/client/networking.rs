@@ -105,18 +105,28 @@ fn hole_punching_loop(socket: &UdpSocket, peers: &Arc<Mutex<Vec<PeerInfo>>>, syn
         // block if we are paused (sending via server) -> block here
         {
             let (lock, cvar) = &**sync;
-            let mut state = lock.lock().unwrap();
+            let Ok(mut state) = lock.lock() else {
+                eprintln!("Hole punching stopped: punch state mutex is poisoned");
+                return;
+            };
 
             while state.paused {
                 //here the thread doesn't consume CPU
-                state = cvar.wait(state).unwrap();
+                let Ok(next_state) = cvar.wait(state) else {
+                    eprintln!("Hole punching stopped: punch state mutex is poisoned");
+                    return;
+                };
+                state = next_state;
             }
 
             //here state.paused == false, we can punch
         }
 
         {
-            let guard = peers.lock().unwrap();
+            let Ok(guard) = peers.lock() else {
+                eprintln!("Hole punching stopped: peers mutex is poisoned");
+                return;
+            };
             for p in guard.iter() {
                 if p.connected || p.use_server_relay {
                     continue; //don't punch server-relayed peers
@@ -179,19 +189,24 @@ fn relay_main_loop(
     channel: &str,
     signaling_addr: &str,
     relay_sync: &RelaySync,
-) {
+) -> std::io::Result<()> {
     loop {
         // stop immediatly if deactivated
         {
             let (lock, _) = &**relay_sync;
-            if !lock.lock().unwrap().is_active {
-                break;
+            let st = lock.lock().map_err(|_| {
+                std::io::Error::other("Relay failed: relay state mutex is poisoned")
+            })?;
+            if !st.is_active {
+                return Ok(());
             }
         }
 
         let mut to_remove = Vec::new();
         {
-            let mut guard = peers.lock().unwrap();
+            let mut guard = peers.lock().map_err(|_| {
+                std::io::Error::other("Relay failed: peers mutex is poisoned")
+            })?;
             for (i, peer) in guard.iter_mut().enumerate() {
                 if peer.use_server_relay {
                     continue;
@@ -232,10 +247,14 @@ fn relay_main_loop(
         }
         // sleep up to 15s, but wake instantly if is_active flips
         let (lock, cvar) = &**relay_sync;
-        let st = lock.lock().unwrap();
+        let st = lock.lock().map_err(|_| {
+            std::io::Error::other("Relay failed: relay state mutex is poisoned")
+        })?;
         let _ = cvar
             .wait_timeout(st, Duration::from_secs(RELAY_TICK_SEC))
-            .unwrap();
+            .map_err(|_| {
+                std::io::Error::other("Relay failed: relay state mutex is poisoned")
+            })?;
     }
 }
 
@@ -252,15 +271,25 @@ fn relay_keepalive_loop(
         // wait until active
         {
             let (lock, cvar) = &**relay_sync;
-            let mut st = lock.lock().unwrap();
+            let Ok(mut st) = lock.lock() else {
+                eprintln!("Relay keepalive stopped: relay state mutex is poisoned");
+                return;
+            };
             while !st.is_active {
-                st = cvar.wait(st).unwrap();
+                let Ok(next_state) = cvar.wait(st) else {
+                    eprintln!("Relay keepalive stopped: relay state mutex is poisoned");
+                    return;
+                };
+                st = next_state;
             }
         }
 
         // mark started, only once
         {
-            let mut started = relay_started.lock().unwrap();
+            let Ok(mut started) = relay_started.lock() else {
+                eprintln!("Relay keepalive stopped: relay_started mutex is poisoned");
+                return;
+            };
             if !*started {
                 *started = true;
                 println!("Starting relay keepalive thread.");
@@ -268,7 +297,7 @@ fn relay_keepalive_loop(
         }
 
         // run main loop until deactivated
-        relay_main_loop(
+        let relay_result = relay_main_loop(
             socket,
             peers,
             server_id,
@@ -277,11 +306,22 @@ fn relay_keepalive_loop(
             relay_sync,
         );
 
+        if let Err(e) = &relay_result {
+            eprintln!("Relay keepalive stopped: {e}");
+        }
+
         // mark stopped
         {
-            let mut started = relay_started.lock().unwrap();
+            let Ok(mut started) = relay_started.lock() else {
+                eprintln!("Relay keepalive stopped: relay_started mutex is poisoned");
+                return;
+            };
             *started = false;
             println!("Relay loop stopped.");
+        }
+
+        if relay_result.is_err() {
+            return;
         }
 
         //go back to waiting
@@ -320,7 +360,7 @@ struct UserMessageContext {
     channel_has_server_relays: Arc<AtomicBool>,
 }
 
-fn handle_user_message(context: &UserMessageContext, message: &str) {
+fn handle_user_message(context: &UserMessageContext, message: &str) -> std::io::Result<()> {
     let payload = format!("{MSG_DATA} {} {message}\n", context.username);
 
     // if i am simmetric, send via server
@@ -329,24 +369,29 @@ fn handle_user_message(context: &UserMessageContext, message: &str) {
         let _ = context
             .socket
             .send_to(payload.as_bytes(), &context.signaling_addr);
-        return;
+        return Ok(());
     }
 
+    let is_relay = *context.is_relay.lock().map_err(|_| {
+        std::io::Error::other("Cannot send message: relay state mutex is poisoned")
+    })?;
+
     // we on DIRECT, send directly only to peers that are not server relayed
-    let peers_guard = context.peers.lock().unwrap();
+    let peers_guard = context.peers.lock().map_err(|_| {
+        std::io::Error::other("Cannot send message: peers mutex is poisoned")
+    })?;
     for peer in peers_guard.iter().filter(|p| !p.use_server_relay) {
         let _ = context.socket.send_to(payload.as_bytes(), peer.addr);
     }
 
     // if i am relay and channel has server relayed peers, mirror to server
     // otherwise symmetric users can not receive my message
-    if *context.is_relay.lock().unwrap()
-        && context.channel_has_server_relays.load(Ordering::Acquire)
-    {
+    if is_relay && context.channel_has_server_relays.load(Ordering::Acquire) {
         let _ = context
             .socket
             .send_to(payload.as_bytes(), &context.signaling_addr);
     }
+    Ok(())
 }
 
 fn user_input_loop(context: &UserMessageContext) {
@@ -357,7 +402,10 @@ fn user_input_loop(context: &UserMessageContext) {
         if msg.is_empty() {
             continue;
         }
-        handle_user_message(context, msg);
+        if let Err(e) = handle_user_message(context, msg) {
+            eprintln!("User input stopped: {e}");
+            break;
+        }
     }
 }
 

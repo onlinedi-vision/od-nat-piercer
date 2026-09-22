@@ -29,19 +29,28 @@ pub fn try_handle_welcome(s: &str, channel_id: &Arc<AtomicU64>, my_peer_id: &Arc
     }
 }
 
-fn handle_mode_relay(is_relay: &Arc<Mutex<bool>>) {
-    let mut r = is_relay.lock().unwrap();
+fn handle_mode_relay(is_relay: &Arc<Mutex<bool>>) -> std::io::Result<()> {
+    let mut r = is_relay.lock().map_err(|_| {
+        std::io::Error::other("Cannot process message: relay state mutex is poisoned")
+    })?;
     if !*r {
         *r = true;
         println!("You are in RELAY MODE");
     }
+    Ok(())
 }
 
-fn handle_mode_direct(parts: &[&str], peers: &Arc<Mutex<Vec<PeerInfo>>>, me: &str) {
+fn handle_mode_direct(
+    parts: &[&str],
+    peers: &Arc<Mutex<Vec<PeerInfo>>>,
+    me: &str,
+) -> std::io::Result<()> {
     let username = parts[2];
     let addr_str = parts[3];
     if let Ok(addr) = SocketAddr::from_str(addr_str) {
-        let mut guard = peers.lock().unwrap();
+        let mut guard = peers.lock().map_err(|_| {
+            std::io::Error::other("Cannot process message: peers mutex is poisoned")
+        })?;
         if username == me {
             println!("Server confirms you ({me}) are relay for {addr_str}");
         } else if !guard.iter().any(|p| p.addr == addr) {
@@ -58,13 +67,17 @@ fn handle_mode_direct(parts: &[&str], peers: &Arc<Mutex<Vec<PeerInfo>>>, me: &st
             println!("Added peer {username} with addr {addr_str}");
         }
     }
+    Ok(())
 }
 
-fn handle_user_left(parts: &[&str], peers: &Arc<Mutex<Vec<PeerInfo>>>) {
+fn handle_user_left(parts: &[&str], peers: &Arc<Mutex<Vec<PeerInfo>>>) -> std::io::Result<()> {
     let username = parts[1];
-    let mut guard = peers.lock().unwrap();
+    let mut guard = peers.lock().map_err(|_| {
+        std::io::Error::other("Cannot process message: peers mutex is poisoned")
+    })?;
     guard.retain(|p| p.username != username);
     println!("[CLIENT:user] {username} left, removed from list");
+    Ok(())
 }
 
 fn handle_unrecognized_command(line: &str) {
@@ -81,24 +94,24 @@ fn handle_unrecognized_command(line: &str) {
 
 /// Handles a mode-related control message.
 ///
-/// # Panics
+/// # Errors
 ///
-/// Panics if the peer or relay-state mutex is poisoned.
+/// Returns an error if a required peer or relay-state mutex is poisoned.
 pub fn handle_mode_line(
     line: &str,
     peers: &Arc<Mutex<Vec<PeerInfo>>>,
     me: &str,
     is_relay: &Arc<Mutex<bool>>,
     channel_has_server_relays: &Arc<AtomicBool>,
-) {
+) -> std::io::Result<()> {
     let parts: Vec<&str> = line.split_whitespace().collect();
     if parts.is_empty() {
-        return;
+        return Ok(());
     }
 
     match parts[0] {
         MSG_MODE if parts.len() >= 2 => match parts[1] {
-            MSG_RELAY => handle_mode_relay(is_relay),
+            MSG_RELAY => handle_mode_relay(is_relay)?,
 
             MSG_SERVER_RELAY => {
                 if parts.len() >= 3 {
@@ -106,10 +119,16 @@ pub fn handle_mode_line(
 
                     // if the server is relaying for 'me', i must send to server
                     if username == me {
-                        return;
+                        return Ok(());
                     }
+                    let relay = *is_relay.lock().map_err(|_| {
+                        std::io::Error::other("Cannot process message: relay state mutex is poisoned")
+                    })?;
+                    let mut guard = peers.lock().map_err(|_| {
+                        std::io::Error::other("Cannot process message: peers mutex is poisoned")
+                    })?;
                     // if i am the RELAY, note that the channel has server-relayed peers
-                    if *is_relay.lock().unwrap() {
+                    if relay {
                         if !channel_has_server_relays.load(Ordering::Acquire) {
                             channel_has_server_relays.store(true, Ordering::Release);
                             println!("Relay: channel has server-relayed peers.");
@@ -119,7 +138,6 @@ pub fn handle_mode_line(
                     }
 
                     //mark that peer as server-relayed to stop punching it
-                    let mut guard = peers.lock().unwrap();
                     if let Some(peer) = guard.iter_mut().find(|p| p.username == username) {
                         peer.use_server_relay = true;
                         peer.connected = true; // stop punching
@@ -131,12 +149,13 @@ pub fn handle_mode_line(
                 }
             }
 
-            MSG_DIRECT if parts.len() >= 4 => handle_mode_direct(&parts, peers, me),
+            MSG_DIRECT if parts.len() >= 4 => handle_mode_direct(&parts, peers, me)?,
             _ => handle_unrecognized_command(line),
         },
-        MSG_USER_LEFT if parts.len() >= 2 => handle_user_left(&parts, peers),
+        MSG_USER_LEFT if parts.len() >= 2 => handle_user_left(&parts, peers)?,
         _ => handle_unrecognized_command(line),
     }
+    Ok(())
 }
 
 pub fn handle_ping(socket: &UdpSocket, src: std::net::SocketAddr) {
@@ -146,15 +165,21 @@ pub fn handle_ping(socket: &UdpSocket, src: std::net::SocketAddr) {
 
 /// Records a pong received from a peer.
 ///
-/// # Panics
+/// # Errors
 ///
-/// Panics if the peer mutex is poisoned.
-pub fn handle_pong(peers: &Arc<Mutex<Vec<PeerInfo>>>, src: std::net::SocketAddr) {
-    let mut peers_guard = peers.lock().unwrap();
+/// Returns an error if the peer mutex is poisoned.
+pub fn handle_pong(
+    peers: &Arc<Mutex<Vec<PeerInfo>>>,
+    src: std::net::SocketAddr,
+) -> std::io::Result<()> {
+    let mut peers_guard = peers.lock().map_err(|_| {
+        std::io::Error::other("Cannot process message: peers mutex is poisoned")
+    })?;
     if let Some(peer) = peers_guard.iter_mut().find(|p| p.addr == src) {
         peer.last_pong = Instant::now();
         println!("Received {MSG_PONG} from {}", peer.username);
     }
+    Ok(())
 }
 
 pub fn ensure_connected(p: &mut PeerInfo, con_type: &str) {
@@ -170,17 +195,23 @@ pub fn ensure_connected(p: &mut PeerInfo, con_type: &str) {
 
 /// Handles a hole-punch message received from a peer.
 ///
-/// # Panics
+/// # Errors
 ///
-/// Panics if the peer mutex is poisoned.
-pub fn handle_hole_punch(peers: &Arc<Mutex<Vec<PeerInfo>>>, src: std::net::SocketAddr) {
+/// Returns an error if the peer mutex is poisoned.
+pub fn handle_hole_punch(
+    peers: &Arc<Mutex<Vec<PeerInfo>>>,
+    src: std::net::SocketAddr,
+) -> std::io::Result<()> {
     println!("Received hole punch from {src}");
-    let mut peers_guard = peers.lock().unwrap();
+    let mut peers_guard = peers.lock().map_err(|_| {
+        std::io::Error::other("Cannot process message: peers mutex is poisoned")
+    })?;
     if let Some(peer) = peers_guard.iter_mut().find(|p| p.addr == src) {
         ensure_connected(peer, "punch");
     } else {
         println!("Hole punch received from unknown peer: {src}");
     }
+    Ok(())
 }
 
 fn handle_relay_message_to_peers(
@@ -188,8 +219,10 @@ fn handle_relay_message_to_peers(
     peers: &Arc<Mutex<Vec<PeerInfo>>>,
     sender: &str,
     message: &str,
-) {
-    let peers_guard = peers.lock().unwrap();
+) -> std::io::Result<()> {
+    let peers_guard = peers.lock().map_err(|_| {
+        std::io::Error::other("Cannot process message: peers mutex is poisoned")
+    })?;
     for peer in peers_guard.iter() {
         if peer.username != sender
             && let Err(e) = socket.send_to(message.as_bytes(), peer.addr)
@@ -197,13 +230,14 @@ fn handle_relay_message_to_peers(
             eprintln!("Failed to send data to {}: {}", peer.addr, e);
         }
     }
+    Ok(())
 }
 
 /// Handles a data message received from a peer or the signaling server.
 ///
-/// # Panics
+/// # Errors
 ///
-/// Panics if the peer or relay-state mutex is poisoned.
+/// Returns an error if a required peer or relay-state mutex is poisoned.
 pub fn handle_data_message(
     socket: &UdpSocket,
     line: &str,
@@ -211,7 +245,7 @@ pub fn handle_data_message(
     is_relay: &Arc<Mutex<bool>>,
     channel_has_server_relays: &Arc<AtomicBool>,
     signaling_addr: &str,
-) {
+) -> std::io::Result<()> {
     if line.starts_with(&format!("{MSG_DATA} ")) {
         let parts: Vec<&str> = line.splitn(3, ' ').collect();
         if parts.len() >= 3 {
@@ -219,12 +253,16 @@ pub fn handle_data_message(
             let text = parts[2];
             println!("[{sender}]: {text}");
 
-            //NO MATTER THE SOURCE, we've observed sender activity
-            mark_peer_connected_by_name(peers, sender);
+            let relay = *is_relay.lock().map_err(|_| {
+                std::io::Error::other("Cannot process message: relay state mutex is poisoned")
+            })?;
 
-            if *is_relay.lock().unwrap() {
+            //NO MATTER THE SOURCE, we've observed sender activity
+            mark_peer_connected_by_name(peers, sender)?;
+
+            if relay {
                 // 1) transmit to peers
-                handle_relay_message_to_peers(socket, peers, sender, line);
+                handle_relay_message_to_peers(socket, peers, sender, line)?;
 
                 // 2) mirror to server only if the channel has server-relayed users
                 if channel_has_server_relays.load(Ordering::Acquire) {
@@ -236,26 +274,36 @@ pub fn handle_data_message(
             }
         }
     }
+    Ok(())
 }
 
 /// Marks a peer as connected after receiving a direct message.
 ///
-/// # Panics
+/// # Errors
 ///
-/// Panics if the peer mutex is poisoned.
-pub fn handle_peer_message(peers: &Arc<Mutex<Vec<PeerInfo>>>, src: std::net::SocketAddr) {
-    let mut guard = peers.lock().unwrap();
+/// Returns an error if the peer mutex is poisoned.
+pub fn handle_peer_message(
+    peers: &Arc<Mutex<Vec<PeerInfo>>>,
+    src: std::net::SocketAddr,
+) -> std::io::Result<()> {
+    let mut guard = peers.lock().map_err(|_| {
+        std::io::Error::other("Cannot process message: peers mutex is poisoned")
+    })?;
     if let Some(p) = guard.iter_mut().find(|p| p.addr == src) {
         ensure_connected(p, "direct");
     }
+    Ok(())
 }
 
 // we will call this function when DATA sender... is seen (even received from the server)
-fn mark_peer_connected_by_name(peers: &Arc<Mutex<Vec<PeerInfo>>>, name: &str) {
-    let mut guard = peers.lock().unwrap();
+fn mark_peer_connected_by_name(peers: &Arc<Mutex<Vec<PeerInfo>>>, name: &str) -> std::io::Result<()> {
+    let mut guard = peers.lock().map_err(|_| {
+        std::io::Error::other("Cannot process message: peers mutex is poisoned")
+    })?;
     if let Some(peer) = guard.iter_mut().find(|p| p.username == name) {
         ensure_connected(peer, "via server");
     }
+    Ok(())
 }
 
 pub struct IncomingMessageContext<'a> {
@@ -267,11 +315,16 @@ pub struct IncomingMessageContext<'a> {
     pub signaling_addr: &'a str,
 }
 
+/// Processes incoming lines, stopping at the first handler error.
+///
+/// # Errors
+///
+/// Returns an error if a handler encounters a poisoned peer or relay-state mutex.
 pub fn process_incoming_message(
     context: &IncomingMessageContext<'_>,
     message: &str,
     src: SocketAddr,
-) {
+) -> std::io::Result<()> {
     for line in message.lines() {
         let line = line.trim();
         if line.is_empty() {
@@ -279,8 +332,8 @@ pub fn process_incoming_message(
         }
         match line {
             MSG_PING => handle_ping(context.socket, src),
-            MSG_PONG => handle_pong(context.peers, src),
-            MSG_HOLE_PUNCH => handle_hole_punch(context.peers, src),
+            MSG_PONG => handle_pong(context.peers, src)?,
+            MSG_HOLE_PUNCH => handle_hole_punch(context.peers, src)?,
             _ => {
                 if line.starts_with(&format!("{MSG_DATA} ")) {
                     handle_data_message(
@@ -290,7 +343,7 @@ pub fn process_incoming_message(
                         context.is_relay,
                         context.channel_has_server_relays,
                         context.signaling_addr,
-                    );
+                    )?;
                 } else {
                     //Handle control messages: MODE / USER_LEFT
                     handle_mode_line(
@@ -299,9 +352,10 @@ pub fn process_incoming_message(
                         context.user,
                         context.is_relay,
                         context.channel_has_server_relays,
-                    );
+                    )?;
                 }
             }
         }
     }
+    Ok(())
 }

@@ -2,7 +2,7 @@ FROM clux/muslrust:1.93.1-stable AS base
 WORKDIR /app
 COPY --link --from=bare-repo . .
 COPY --link Cargo* .
-
+RUN rustup component add clippy
 RUN --mount=type=cache,target=/usr/local/cargo/registry          \
     cargo build --release --target x86_64-unknown-linux-musl     \
     && cargo test --locked --target x86_64-unknown-linux-musl    \

@@ -5,6 +5,9 @@ COPY --link Cargo* .
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     cargo build --release --target x86_64-unknown-linux-musl
 
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    cargo test --locked --target x86_64-unknown-linux-musl
+
 FROM base AS test
 COPY --link Cargo* .
 COPY --link src/ src/

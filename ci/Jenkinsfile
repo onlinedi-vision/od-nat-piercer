@@ -1,0 +1,49 @@
+pipeline {
+	agent any
+
+	options {
+		timeout(time: 2, unit: 'HOURS')
+	}
+
+	stages {
+		stage('Pull Request Checks') {
+			when {
+				changeRequest()
+			}
+
+			steps {
+				withChecks(name: 'Build, Test and Scan') {
+					sh './launch-test-env.sh -s'
+				}
+			}
+		}
+
+		stage('Main Branch Checks') {
+			when {
+				allOf {
+					branch 'main'
+					not {
+						changeRequest()
+					}
+				}
+			}
+
+			steps {
+				withChecks(name: 'Build, Test and Scan') {
+					sh './launch-test-env.sh -s'
+				}
+			}
+		}
+	}
+
+	post {
+		failure {
+			emailext(
+				from: 'jenkins@mail.onlinedi.vision',
+				subject: "Build Failed: ${env.JOB_NAME} - ${env.BUILD_NUMBER}",
+				body: "The build failed. Check the console output at ${env.BUILD_URL}.",
+				to: 'TEAM@mail.onlinedi.vision'
+			)
+		}
+	}
+}

@@ -11,6 +11,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry          \
 
 FROM base AS test
 COPY --link Cargo* .
+COPY --link clippy.toml .
 COPY --link src/ src/
 RUN touch src/main.rs
 RUN --mount=type=cache,target=/usr/local/cargo/registry \

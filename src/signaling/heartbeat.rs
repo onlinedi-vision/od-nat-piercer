@@ -3,21 +3,11 @@ use crate::{
         MSG_DIRECT, MSG_MODE, MSG_PING, MSG_RELAY, MSG_SERVER_RELAY, MSG_USER_LEFT,
     },
     signaling::{
-        structures::{Channel, ServerMap, User},
-        utils::cleanup_and_notify_iter,
+        handlers::utils::pick_eligible_relay, structures::ServerMap, utils::cleanup_and_notify_iter,
     },
 };
 use std::{net::SocketAddr, sync::Arc, time::Duration};
 use tokio::{net::UdpSocket, sync::Mutex};
-
-fn pick_eligible_relay(channel: &Channel) -> Option<User> {
-    // First user that is NOT in need_server_relay (meaning he doesn't have Symmetric NAT)
-    channel
-        .users
-        .iter()
-        .find(|u| !u.needs_server_relay)
-        .cloned()
-}
 
 fn handle_relay_timeout(
     channel: &mut crate::signaling::structures::Channel,
@@ -96,10 +86,7 @@ fn handle_timed_out_user(
     user_addr: SocketAddr,
     notifications: &mut Vec<(Vec<SocketAddr>, Vec<u8>)>,
 ) {
-    println!(
-        "User {} timed out from {}-{}",
-        user_name, server_id, channel_name
-    );
+    println!("User {user_name} timed out from {server_id}-{channel_name}");
 
     let msg = format!("{MSG_USER_LEFT} {user_name} {user_addr}\n");
     let peers_to_notify: Vec<SocketAddr> = channel
@@ -113,11 +100,7 @@ fn handle_timed_out_user(
         notifications.push((peers_to_notify, msg.as_bytes().to_vec()));
     }
 
-    let was_relay = channel
-        .relay
-        .as_ref()
-        .map(|r| r == &user_name)
-        .unwrap_or(false);
+    let was_relay = channel.relay.as_ref().is_some_and(|r| r == user_name);
 
     channel.users.remove(user_index);
 
@@ -198,10 +181,10 @@ async fn collect_heartbeat_data(
     let mut notifications: Vec<(Vec<SocketAddr>, Vec<u8>)> = Vec::new();
 
     let server_ids: Vec<String> = st.keys().cloned().collect();
-    for sid in server_ids.iter() {
+    for sid in &server_ids {
         if let Some(channels) = st.get_mut(sid) {
             let channel_names: Vec<String> = channels.keys().cloned().collect();
-            for cname in channel_names.iter() {
+            for cname in &channel_names {
                 if let Some(channel) = channels.get_mut(cname) {
                     process_channel_heartbeat(
                         sid,
@@ -228,10 +211,10 @@ async fn send_pings(socket: Arc<UdpSocket>, to_ping: Vec<SocketAddr>) {
 
 async fn send_notifications(socket: Arc<UdpSocket>, notify_msgs: Vec<(Vec<SocketAddr>, Vec<u8>)>) {
     //send notifications (USER_LEFT, MODE RELAY, MODE DIRECT messages}
-    for (peers_to_notify, payload) in cleanup_and_notify_iter(notify_msgs.into_iter()) {
+    for (peers_to_notify, payload) in cleanup_and_notify_iter(notify_msgs) {
         for addr in peers_to_notify {
             if let Err(e) = socket.send_to(&payload, addr).await {
-                eprintln!("Failed to send heartbeat notification to {}: {}", addr, e);
+                eprintln!("Failed to send heartbeat notification to {addr}: {e}");
             }
         }
     }
@@ -240,7 +223,7 @@ async fn send_notifications(socket: Arc<UdpSocket>, notify_msgs: Vec<(Vec<Socket
 async fn cleanup_empty_channels(state: Arc<Mutex<ServerMap>>, to_cleanup: Vec<(String, String)>) {
     if !to_cleanup.is_empty() {
         let mut st = state.lock().await;
-        for (sid, cname) in to_cleanup.into_iter() {
+        for (sid, cname) in to_cleanup {
             if let Some(chans) = st.get_mut(&sid) {
                 chans.remove(&cname);
                 if chans.is_empty() {

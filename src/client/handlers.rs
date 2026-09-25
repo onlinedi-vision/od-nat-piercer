@@ -18,12 +18,13 @@ use std::{
 pub fn try_handle_welcome(s: &str, channel_id: &Arc<AtomicU64>, my_peer_id: &Arc<AtomicU32>) {
     for line in s.lines() {
         let parts: Vec<&str> = line.split_whitespace().collect();
-        if parts.len() == 3 && parts[0] == MSG_WELCOME {
-            if let (Ok(cid), Ok(pid)) = (parts[1].parse::<u64>(), parts[2].parse::<u32>()) {
-                channel_id.store(cid, Ordering::Release);
-                my_peer_id.store(pid, Ordering::Release);
-                println!("{MSG_WELCOME} received: channel_id={cid}, my_peer_id={pid}");
-            }
+        if parts.len() == 3
+            && parts[0] == MSG_WELCOME
+            && let (Ok(cid), Ok(pid)) = (parts[1].parse::<u64>(), parts[2].parse::<u32>())
+        {
+            channel_id.store(cid, Ordering::Release);
+            my_peer_id.store(pid, Ordering::Release);
+            println!("{MSG_WELCOME} received: channel_id={cid}, my_peer_id={pid}");
         }
     }
 }
@@ -41,22 +42,20 @@ fn handle_mode_direct(parts: &[&str], peers: &Arc<Mutex<Vec<PeerInfo>>>, me: &st
     let addr_str = parts[3];
     if let Ok(addr) = SocketAddr::from_str(addr_str) {
         let mut guard = peers.lock().unwrap();
-        if username != me {
-            if !guard.iter().any(|p| p.addr == addr) {
-                guard.push(PeerInfo {
-                    addr,
-                    last_pong: Instant::now(),
-                    username: username.to_string(),
-                    connected: false,
-                    created_at: Instant::now(),
-                    use_server_relay: false,
-                    relay_requested: false,
-                    nat_kind: NatKind::Unknown,
-                });
-                println!("Added peer {} with addr {}", username, addr_str);
-            }
-        } else {
-            println!("Server confirms you ({}) are relay for {}", me, addr_str);
+        if username == me {
+            println!("Server confirms you ({me}) are relay for {addr_str}");
+        } else if !guard.iter().any(|p| p.addr == addr) {
+            guard.push(PeerInfo {
+                addr,
+                last_pong: Instant::now(),
+                username: username.to_string(),
+                connected: false,
+                created_at: Instant::now(),
+                use_server_relay: false,
+                relay_requested: false,
+                nat_kind: NatKind::Unknown,
+            });
+            println!("Added peer {username} with addr {addr_str}");
         }
     }
 }
@@ -64,8 +63,8 @@ fn handle_mode_direct(parts: &[&str], peers: &Arc<Mutex<Vec<PeerInfo>>>, me: &st
 fn handle_user_left(parts: &[&str], peers: &Arc<Mutex<Vec<PeerInfo>>>) {
     let username = parts[1];
     let mut guard = peers.lock().unwrap();
-    guard.retain(|p| p.username != username.to_string());
-    println!("[CLIENT:user] {} left, removed from list", username);
+    guard.retain(|p| p.username != username);
+    println!("[CLIENT:user] {username} left, removed from list");
 }
 
 fn handle_unrecognized_command(line: &str) {
@@ -77,9 +76,14 @@ fn handle_unrecognized_command(line: &str) {
         return;
     }
 
-    println!("Unhandled control line: {}", line);
+    println!("Unhandled control line: {line}");
 }
 
+/// Handles a mode-related control message.
+///
+/// # Panics
+///
+/// Panics if the peer or relay-state mutex is poisoned.
 pub fn handle_mode_line(
     line: &str,
     peers: &Arc<Mutex<Vec<PeerInfo>>>,
@@ -111,7 +115,7 @@ pub fn handle_mode_line(
                             println!("Relay: channel has server-relayed peers.");
                         }
                     } else {
-                        println!("Server will relay for user: {}", username);
+                        println!("Server will relay for user: {username}");
                     }
 
                     //mark that peer as server-relayed to stop punching it
@@ -140,6 +144,11 @@ pub fn handle_ping(socket: &UdpSocket, src: std::net::SocketAddr) {
     println!("Received {MSG_PING} from {src}, sent {MSG_PONG}");
 }
 
+/// Records a pong received from a peer.
+///
+/// # Panics
+///
+/// Panics if the peer mutex is poisoned.
 pub fn handle_pong(peers: &Arc<Mutex<Vec<PeerInfo>>>, src: std::net::SocketAddr) {
     let mut peers_guard = peers.lock().unwrap();
     if let Some(peer) = peers_guard.iter_mut().find(|p| p.addr == src) {
@@ -159,13 +168,18 @@ pub fn ensure_connected(p: &mut PeerInfo, con_type: &str) {
     p.connected = true;
 }
 
+/// Handles a hole-punch message received from a peer.
+///
+/// # Panics
+///
+/// Panics if the peer mutex is poisoned.
 pub fn handle_hole_punch(peers: &Arc<Mutex<Vec<PeerInfo>>>, src: std::net::SocketAddr) {
-    println!("Received hole punch from {}", src);
+    println!("Received hole punch from {src}");
     let mut peers_guard = peers.lock().unwrap();
     if let Some(peer) = peers_guard.iter_mut().find(|p| p.addr == src) {
         ensure_connected(peer, "punch");
     } else {
-        println!("Hole punch received from unknown peer: {}", src);
+        println!("Hole punch received from unknown peer: {src}");
     }
 }
 
@@ -177,14 +191,19 @@ fn handle_relay_message_to_peers(
 ) {
     let peers_guard = peers.lock().unwrap();
     for peer in peers_guard.iter() {
-        if peer.username != sender {
-            if let Err(e) = socket.send_to(message.as_bytes(), peer.addr) {
-                eprintln!("Failed to send data to {}: {}", peer.addr, e);
-            }
+        if peer.username != sender
+            && let Err(e) = socket.send_to(message.as_bytes(), peer.addr)
+        {
+            eprintln!("Failed to send data to {}: {}", peer.addr, e);
         }
     }
 }
 
+/// Handles a data message received from a peer or the signaling server.
+///
+/// # Panics
+///
+/// Panics if the peer or relay-state mutex is poisoned.
 pub fn handle_data_message(
     socket: &UdpSocket,
     line: &str,
@@ -198,7 +217,7 @@ pub fn handle_data_message(
         if parts.len() >= 3 {
             let sender = parts[1];
             let text = parts[2];
-            println!("[{}]: {}", sender, text);
+            println!("[{sender}]: {text}");
 
             //NO MATTER THE SOURCE, we've observed sender activity
             mark_peer_connected_by_name(peers, sender);
@@ -219,6 +238,11 @@ pub fn handle_data_message(
     }
 }
 
+/// Marks a peer as connected after receiving a direct message.
+///
+/// # Panics
+///
+/// Panics if the peer mutex is poisoned.
 pub fn handle_peer_message(peers: &Arc<Mutex<Vec<PeerInfo>>>, src: std::net::SocketAddr) {
     let mut guard = peers.lock().unwrap();
     if let Some(p) = guard.iter_mut().find(|p| p.addr == src) {
@@ -234,15 +258,19 @@ fn mark_peer_connected_by_name(peers: &Arc<Mutex<Vec<PeerInfo>>>, name: &str) {
     }
 }
 
+pub struct IncomingMessageContext<'a> {
+    pub socket: &'a UdpSocket,
+    pub peers: &'a Arc<Mutex<Vec<PeerInfo>>>,
+    pub user: &'a str,
+    pub is_relay: &'a Arc<Mutex<bool>>,
+    pub channel_has_server_relays: &'a Arc<AtomicBool>,
+    pub signaling_addr: &'a str,
+}
+
 pub fn process_incoming_message(
-    socket: &UdpSocket,
+    context: &IncomingMessageContext<'_>,
     message: &str,
-    src: std::net::SocketAddr,
-    peers: &Arc<Mutex<Vec<PeerInfo>>>,
-    user: &str,
-    is_relay: &Arc<Mutex<bool>>,
-    channel_has_server_relays: &Arc<AtomicBool>,
-    signaling_addr: &str,
+    src: SocketAddr,
 ) {
     for line in message.lines() {
         let line = line.trim();
@@ -250,22 +278,28 @@ pub fn process_incoming_message(
             continue;
         }
         match line {
-            MSG_PING => handle_ping(socket, src),
-            MSG_PONG => handle_pong(peers, src),
-            MSG_HOLE_PUNCH => handle_hole_punch(peers, src),
+            MSG_PING => handle_ping(context.socket, src),
+            MSG_PONG => handle_pong(context.peers, src),
+            MSG_HOLE_PUNCH => handle_hole_punch(context.peers, src),
             _ => {
                 if line.starts_with(&format!("{MSG_DATA} ")) {
                     handle_data_message(
-                        socket,
+                        context.socket,
                         line,
-                        peers,
-                        is_relay,
-                        channel_has_server_relays,
-                        signaling_addr,
+                        context.peers,
+                        context.is_relay,
+                        context.channel_has_server_relays,
+                        context.signaling_addr,
                     );
                 } else {
                     //Handle control messages: MODE / USER_LEFT
-                    handle_mode_line(line, peers, user, is_relay, channel_has_server_relays);
+                    handle_mode_line(
+                        line,
+                        context.peers,
+                        context.user,
+                        context.is_relay,
+                        context.channel_has_server_relays,
+                    );
                 }
             }
         }

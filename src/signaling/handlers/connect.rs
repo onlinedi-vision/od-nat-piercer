@@ -21,7 +21,11 @@ fn welcome_payload(channel_id: u64, peer_id: u32) -> String {
 
 async fn send_welcome(socket: &Arc<UdpSocket>, dst: SocketAddr, channel_id: u64, peer_id: u32) {
     let payload = welcome_payload(channel_id, peer_id);
-    let hdr = Header::welcome(channel_id, peer_id, payload.len() as u16);
+    let hdr = Header::welcome(
+        channel_id,
+        peer_id,
+        u16::try_from(payload.len()).expect("REASON"),
+    );
     let pkt = packet::encode(hdr, payload.as_bytes());
 
     println!("Sending WELCOME to {dst}: channel_id={channel_id}, peer_id={peer_id}");

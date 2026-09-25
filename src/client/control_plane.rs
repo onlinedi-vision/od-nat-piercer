@@ -26,5 +26,5 @@ pub fn start_control_client_after_welcome(
 
     *control_client_started = true;
 
-    println!("Started control WebSocket client with peer_id={}", peer_id);
+    println!("Started control WebSocket client with peer_id={peer_id}");
 }

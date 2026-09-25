@@ -2,7 +2,10 @@ use crate::signaling::structures::ServerMap;
 use std::{net::SocketAddr, sync::Arc};
 use tokio::{net::UdpSocket, sync::Mutex};
 
-use super::{notifications::handle_disconnect_notifications, utils::handle_user_removal};
+use super::{
+    notifications::{DisconnectNotificationContext, handle_disconnect_notifications},
+    utils::handle_user_removal,
+};
 
 pub async fn handle_disconnect_message(
     parts: &[&str],
@@ -19,16 +22,16 @@ pub async fn handle_disconnect_message(
     let (remaining_users, was_relay, leaving_user_addr, lone_user_addr) =
         handle_user_removal(&state, &server_id, &channel_name, &user_name, src_addr).await;
 
-    handle_disconnect_notifications(
+    handle_disconnect_notifications(DisconnectNotificationContext {
         remaining_users,
         was_relay,
         leaving_user_addr,
         lone_user_addr,
-        &user_name,
+        user_name,
         socket,
-        &Arc::clone(&state),
+        state,
         server_id,
         channel_name,
-    )
+    })
     .await;
 }

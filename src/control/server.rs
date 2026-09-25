@@ -15,9 +15,15 @@ pub(crate) fn channel_key(server_id: &str, channel: &str) -> String {
     format!("{server_id}:{channel}")
 }
 
+/// Starts the control WebSocket server.
+///
+/// # Errors
+///
+/// Returns an error if the TCP listener cannot bind to `addr` or if accepting
+/// an incoming TCP connection fails.
 pub async fn start_control_server(addr: &str, peers: ControlPeers) -> std::io::Result<()> {
     let listener = TcpListener::bind(addr).await?;
-    println!("Control WebSocket server listening on {}", addr);
+    println!("Control WebSocket server listening on {addr}");
 
     loop {
         let (stream, _) = listener.accept().await?;
@@ -25,7 +31,7 @@ pub async fn start_control_server(addr: &str, peers: ControlPeers) -> std::io::R
 
         tokio::spawn(async move {
             if let Err(e) = handle_connection(stream, peers).await {
-                eprintln!("control ws connection error: {}", e);
+                eprintln!("control ws connection error: {e}");
             }
         });
     }
@@ -66,8 +72,7 @@ async fn handle_connection(
                     let key = channel_key(&server_id, &channel);
 
                     println!(
-                        "Control client joined: server_id={} channel={}, user={}, peer_id={}",
-                        server_id, channel, user, peer_id
+                        "Control client joined: server_id={server_id} channel={channel}, user={user}, peer_id={peer_id}"
                     );
 
                     joined_channel = Some(key.clone());

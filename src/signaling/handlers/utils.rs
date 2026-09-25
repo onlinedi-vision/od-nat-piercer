@@ -160,7 +160,11 @@ pub async fn handle_user_removal(
         }
     }
 
-    let remaining_users = get_remaining_users(state, server_id, channel_name).await;
+    let remaining_users = st
+        .get(server_id)
+        .and_then(|channels| channels.get(channel_name))
+        .map(|channel| channel.users.clone())
+        .unwrap_or_default();
     (
         remaining_users,
         was_relay,

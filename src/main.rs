@@ -1,4 +1,1 @@
-fn main() -> std::io::Result<()> {
-    Ok(())
-}
-
+fn main() {}

@@ -18,7 +18,7 @@ pub fn start_control_client(
         let rt = match tokio::runtime::Runtime::new() {
             Ok(rt) => rt,
             Err(e) => {
-                eprintln!("Failed to create control client runtime: {}", e);
+                eprintln!("Failed to create control client runtime: {e}");
                 return;
             }
         };
@@ -27,7 +27,7 @@ pub fn start_control_client(
             if let Err(e) =
                 run_control_client(signaling_ip, server_id, channel, user, peer_id).await
             {
-                eprintln!("Control client error: {}", e);
+                eprintln!("Control client error: {e}");
             }
         });
     });
@@ -40,10 +40,10 @@ async fn run_control_client(
     user: String,
     peer_id: u32,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let ws_url = format!("ws://{}:2133", signaling_ip);
+    let ws_url = format!("ws://{signaling_ip}:2133");
 
     let (ws_stream, _) = connect_async(&ws_url).await?;
-    println!("Connected to control WebSocket server at {}", ws_url);
+    println!("Connected to control WebSocket server at {ws_url}");
 
     let (mut write, mut read) = ws_stream.split();
 
@@ -68,7 +68,7 @@ async fn run_control_client(
 
     let msg_text = serde_json::to_string(&control_msg)?;
     write.send(Message::Text(msg_text)).await?;
-    println!("Sent ControlMsg message_id=1 payload_len={}", payload_len);
+    println!("Sent ControlMsg message_id=1 payload_len={payload_len}");
 
     while let Some(msg) = read.next().await {
         let msg = msg?;
@@ -78,10 +78,10 @@ async fn run_control_client(
 
             match parsed {
                 ControlMessage::ControlAck { message_id } => {
-                    println!("Received ControlAck for message_id={}", message_id);
+                    println!("Received ControlAck for message_id={message_id}");
                 }
                 other => {
-                    println!("Received other control message: {:?}", other);
+                    println!("Received other control message: {other:?}");
                 }
             }
         }

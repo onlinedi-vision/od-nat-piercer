@@ -2,6 +2,7 @@ use std::{collections::HashMap, sync::Arc};
 
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Mutex;
+use tokio::task::JoinSet;
 use tokio_tungstenite::{accept_async, tungstenite::Message};
 
 use futures_util::{SinkExt, StreamExt};
@@ -37,7 +38,7 @@ pub async fn start_control_server(addr: &str, peers: ControlPeers) -> std::io::R
     }
 }
 
-async fn handle_connection(
+pub(super) async fn handle_connection(
     stream: TcpStream,
     peers: ControlPeers,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -46,7 +47,9 @@ async fn handle_connection(
 
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Message>();
 
-    let write_task = tokio::spawn(async move {
+    // Owned tasks are aborted if the connection future is cancelled.
+    let mut write_tasks = JoinSet::new();
+    write_tasks.spawn(async move {
         while let Some(msg) = rx.recv().await {
             if ws_write.send(msg).await.is_err() {
                 break;
@@ -56,53 +59,60 @@ async fn handle_connection(
 
     let mut joined_channel: Option<String> = None;
 
-    while let Some(msg) = ws_read.next().await {
-        let msg = msg?;
+    // Capture read/parse errors so they take the same teardown path as EOF.
+    let read_result: Result<(), Box<dyn std::error::Error + Send + Sync>> = async {
+        while let Some(msg) = ws_read.next().await {
+            let msg = msg?;
 
-        if let Message::Text(text) = msg {
-            let parsed: ControlMessage = serde_json::from_str(&text)?;
+            if let Message::Text(text) = msg {
+                let parsed: ControlMessage = serde_json::from_str(&text)?;
 
-            match parsed {
-                ControlMessage::JoinControl {
-                    server_id,
-                    channel,
-                    user,
-                    peer_id,
-                } => {
-                    let key = channel_key(&server_id, &channel);
+                match parsed {
+                    ControlMessage::JoinControl {
+                        server_id,
+                        channel,
+                        user,
+                        peer_id,
+                    } => {
+                        let key = channel_key(&server_id, &channel);
 
-                    println!(
-                        "Control client joined: server_id={server_id} channel={channel}, user={user}, peer_id={peer_id}"
-                    );
+                        println!(
+                            "Control client joined: server_id={server_id} channel={channel}, user={user}, peer_id={peer_id}"
+                        );
 
-                    joined_channel = Some(key.clone());
+                        joined_channel = Some(key.clone());
 
-                    let mut guard = peers.lock().await;
-                    guard.entry(key).or_default().push(tx.clone());
-                }
+                        let mut guard = peers.lock().await;
+                        guard.entry(key).or_default().push(tx.clone());
+                    }
 
-                ControlMessage::ControlMsg {
-                    message_id,
-                    payload,
-                } => {
-                    println!(
-                        "Received ControlMsg message_id={} payload_len={}",
+                    ControlMessage::ControlMsg {
                         message_id,
-                        payload.len(),
-                    );
-                    let ack = ControlMessage::ControlAck { message_id };
-                    let ack_text = serde_json::to_string(&ack)?;
-                    let _ = tx.send(Message::Text(ack_text));
-                }
+                        payload,
+                    } => {
+                        println!(
+                            "Received ControlMsg message_id={} payload_len={}",
+                            message_id,
+                            payload.len(),
+                        );
+                        let ack = ControlMessage::ControlAck { message_id };
+                        let ack_text = serde_json::to_string(&ack)?;
+                        let _ = tx.send(Message::Text(ack_text));
+                    }
 
-                ControlMessage::ControlAck { .. } => {
-                    //for part1 we don't have anything for server
+                    ControlMessage::ControlAck { .. } => {
+                        //for part1 we don't have anything for server
+                    }
                 }
             }
         }
+        Ok(())
     }
+    .await;
 
-    write_task.abort();
+    // Await cancellation before is_closed(): abort alone does not guarantee the
+    // writer has dropped its receiver when the registry is pruned.
+    write_tasks.shutdown().await;
 
     if let Some(key) = joined_channel {
         let mut guard = peers.lock().await;
@@ -111,5 +121,5 @@ async fn handle_connection(
         }
     }
 
-    Ok(())
+    read_result
 }

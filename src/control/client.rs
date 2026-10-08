@@ -1,6 +1,6 @@
 use std::thread;
 
-use futures_util::{SinkExt, StreamExt};
+use futures_util::{Sink, SinkExt, StreamExt};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 
 use crate::control::messages::ControlMessage;
@@ -54,8 +54,7 @@ async fn run_control_client(
         peer_id,
     };
 
-    let join_text = serde_json::to_string(&join)?;
-    write.send(Message::Text(join_text)).await?;
+    send_control_message(&mut write, &join).await?;
     println!("Sent JoinControl on reliable control plane.");
 
     let test_payload = "A".repeat(TEST_PAYLOAD_LEN);
@@ -66,8 +65,7 @@ async fn run_control_client(
         payload: test_payload,
     };
 
-    let msg_text = serde_json::to_string(&control_msg)?;
-    write.send(Message::Text(msg_text)).await?;
+    send_control_message(&mut write, &control_msg).await?;
     println!("Sent ControlMsg message_id=1 payload_len={payload_len}");
 
     while let Some(msg) = read.next().await {
@@ -87,5 +85,17 @@ async fn run_control_client(
         }
     }
 
+    Ok(())
+}
+
+pub(super) async fn send_control_message<S>(
+    write: &mut S,
+    message: &ControlMessage,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
+where
+    S: Sink<Message, Error = tokio_tungstenite::tungstenite::Error> + Unpin,
+{
+    let text = serde_json::to_string(message)?;
+    write.send(Message::Text(text)).await?;
     Ok(())
 }

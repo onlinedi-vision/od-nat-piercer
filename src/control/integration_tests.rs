@@ -12,7 +12,7 @@ use super::{
 
 type TestResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
 const TEST_DEADLINE: Duration = Duration::from_secs(5);
-const MESSAGE_ID: u64 = 42;
+const MESSAGE_ID: u64 = 1;
 
 #[derive(Clone, Copy)]
 enum ConnectionEnd {

@@ -1,9 +1,17 @@
 use std::thread;
 
-use futures_util::{Sink, SinkExt, StreamExt};
-use tokio_tungstenite::{connect_async, tungstenite::Message};
+use futures_util::{Sink, Stream, StreamExt};
+use tokio_tungstenite::{
+    connect_async_with_config,
+    tungstenite::{Error as WsError, Message},
+};
 
 use crate::control::messages::ControlMessage;
+
+use super::reliability::{
+    Clock, ControlResult, ReliabilityError, ReliableSender, SenderGuard, encode, websocket_config,
+    write_text,
+};
 
 const TEST_PAYLOAD_LEN: usize = 100 * 1024;
 
@@ -39,10 +47,11 @@ async fn run_control_client(
     channel: String,
     user: String,
     peer_id: u32,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+) -> ControlResult<()> {
     let ws_url = format!("ws://{signaling_ip}:2133");
 
-    let (ws_stream, _) = connect_async(&ws_url).await?;
+    let (ws_stream, _) =
+        connect_async_with_config(&ws_url, Some(websocket_config()), false).await?;
     println!("Connected to control WebSocket server at {ws_url}");
 
     let (mut write, mut read) = ws_stream.split();
@@ -60,28 +69,23 @@ async fn run_control_client(
     let test_payload = "A".repeat(TEST_PAYLOAD_LEN);
     let payload_len = test_payload.len();
 
-    let control_msg = ControlMessage::ControlMsg {
-        message_id: 1,
-        payload: test_payload,
-    };
+    let mut sender = ReliableSender::default();
+    let mut clock = Clock::default();
+    let message_id = sender.send(&mut write, &test_payload, &clock).await?;
+    println!("Sent ControlMsg message_id={message_id} payload_len={payload_len}");
 
-    send_control_message(&mut write, &control_msg).await?;
-    println!("Sent ControlMsg message_id=1 payload_len={payload_len}");
-
-    while let Some(msg) = read.next().await {
-        let msg = msg?;
-
-        if let Message::Text(text) = msg {
-            let parsed: ControlMessage = serde_json::from_str(&text)?;
-
-            match parsed {
-                ControlMessage::ControlAck { message_id } => {
-                    println!("Received ControlAck for message_id={message_id}");
-                }
-                other => {
-                    println!("Received other control message: {other:?}");
-                }
+    loop {
+        match receive_or_retry(&mut write, &mut read, &mut sender, &mut clock).await? {
+            ClientEvent::Acknowledged {
+                message_id,
+                cleared: true,
+            } => {
+                println!("Received ControlAck for pending message_id={message_id}");
             }
+            ClientEvent::Closed => break,
+            ClientEvent::Acknowledged { cleared: false, .. }
+            | ClientEvent::Retried { .. }
+            | ClientEvent::Other => {}
         }
     }
 
@@ -91,11 +95,63 @@ async fn run_control_client(
 pub(super) async fn send_control_message<S>(
     write: &mut S,
     message: &ControlMessage,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
+) -> ControlResult<()>
 where
     S: Sink<Message, Error = tokio_tungstenite::tungstenite::Error> + Unpin,
 {
-    let text = serde_json::to_string(message)?;
-    write.send(Message::Text(text)).await?;
-    Ok(())
+    write_text(write, encode(message)?).await
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum ClientEvent {
+    Acknowledged { message_id: u64, cleared: bool },
+    Retried { count: usize },
+    Other,
+    Closed,
+}
+
+/// One production receive/timer transition. The caller owns the socket and
+/// reliability state; cancellation of a transition clears and closes that state.
+pub(super) async fn receive_or_retry<S, R>(
+    write: &mut S,
+    read: &mut R,
+    sender: &mut ReliableSender,
+    clock: &mut Clock,
+) -> ControlResult<ClientEvent>
+where
+    S: Sink<Message, Error = WsError> + Unpin,
+    R: Stream<Item = Result<Message, WsError>> + Unpin,
+{
+    sender.ensure_open()?;
+    let mut guard = SenderGuard::new(sender);
+    let deadline = guard.sender.next_deadline();
+    let event = tokio::select! {
+        frame = read.next() => {
+            match frame.transpose()? {
+                None | Some(Message::Close(_)) => {
+                    let pending = guard.sender.pending_len();
+                    guard.sender.close();
+                    if pending != 0 {
+                        return Err(ReliabilityError::ConnectionClosed { pending }.into());
+                    }
+                    ClientEvent::Closed
+                }
+                Some(Message::Text(text)) => {
+                    match serde_json::from_str::<ControlMessage>(&text)? {
+                        ControlMessage::ControlAck { message_id } => ClientEvent::Acknowledged {
+                            message_id,
+                            cleared: guard.sender.acknowledge(message_id),
+                        },
+                        _ => ClientEvent::Other,
+                    }
+                }
+                Some(_) => ClientEvent::Other,
+            }
+        }
+        () = clock.wait_until(deadline) => {
+            ClientEvent::Retried { count: guard.sender.retry_due(write, clock).await? }
+        }
+    };
+    guard.complete();
+    Ok(event)
 }

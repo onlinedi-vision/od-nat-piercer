@@ -115,7 +115,7 @@ where
     Ok(())
 }
 
-/// Tests can advance ACK deadlines explicitly, including over real WebSockets.
+/// Tests can advance ACK deadlines explicitly, including over real `WebSockets`.
 /// Write timeout tests use Tokio's paused time separately.
 #[derive(Default)]
 pub(super) enum Clock {

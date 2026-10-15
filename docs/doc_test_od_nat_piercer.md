@@ -1,123 +1,137 @@
-# Testing commands and expected outputs for **Phase 1** `od_nat_piercer`
+# Local testing guide
 
-## 1. Start signaling server
+This guide exercises the current connectivity and CONTROL prototype on one
+computer. It does not test a real NAT, audio, encryption, or production capacity.
 
-### Command
-```bash
-cargo run --bin signaling_server
-```
-### Expected output
-```bash
-Signaling server listening on 0.0.0.0:5000
-```
+Use a controlled development environment: the standalone server binds on all
+IPv4 interfaces and the current transports are plaintext.
 
-## 2. Start the first client (**user1**)
-**Open a new terminal.**
-In the command line you need to add the right arguments for every user. The command follows the next pattern:
+## Build
 
-```bash
-cargo run --bin client -- <signaling_ip> <client_ip> <server_id> <channel_name> <user_name> <local_port>
-```
-One example to run this command can be:
+Install Rust/Cargo and the native build tools needed by the vendored OpenSSL
+dependency. From the repository root:
 
-```bash
-cargo run --bin <your_machine_ip> <your_machine_ip> server1 channel1 user1 4000
-````
+~~~bash
+cargo build --release --bin signaling_server --bin client
+~~~
 
-You can discover your machine's ip by running the next command in a terminal (on linux): `ip a`
+## Start the server
 
-## Expected Output for the first client
+In the first terminal:
 
-```bash
-Server response:  
- MODE RELAY
+~~~bash
+./target/release/signaling_server
+~~~
 
-You are in RELAY mode (only user in channel)
-Relay mode active: waiting for incoming messages...
+Check for both listener messages:
 
-```
+~~~text
+Signaling server listening on 0.0.0.0:2131
+Control WebSocket server listening on 0.0.0.0:2133
+~~~
 
-## 3. Start a second client
-**Open a new terminal.**
+The server also listens for NAT probes on UDP port `2132`. See the
+[server guide](doc_signaling_server.md) for listener details.
 
-```bash
-cargo run --bin client -- <your_machine_ip> <your_machine_ip> server1 channel1 user2 4002
-```
+## Start two clients
 
-## 4. Start a third client
-**Open a new terminal.**
+In a second terminal:
 
-```bash
-cargo run --bin client -- <your_machine_ip> <your_machine_ip> server1 channel1 user3 4003
-```
+~~~bash
+./target/release/client 127.0.0.1 server1 channel1 user1 4000
+~~~
 
-## Expected Outputs:
-### Output for 3rd client:
-```bash
-Server response:
- MODE DIRECT user1 <your_machine_ip>:4000
-Added peer user1 with addr <your_machine_ip>:4000
-Received from <your_machine_ip>:5000: MODE DIRECT user2 <your_machine_ip>:4002
-Received from <your_machine_ip>:5000: MODE DIRECT user3 <your_machine_ip>:4003
-Received from <your_machine_ip>:5000: MODE DIRECT user3 <your_machine_ip>:4003
-Sent UDP punch to <your_machine_ip>:4000
-Sent UDP punch to <your_machine_ip>:4000
-Sent UDP punch to <your_machine_ip>:4000
-Sent UDP punch to <your_machine_ip>:4000
-Sent UDP punch to <your_machine_ip>:4000
-Sent UDP punch to <your_machine_ip>:4000
-Sent UDP punch to <your_machine_ip>:4000
-Sent UDP punch to <your_machine_ip>:4000
-Sent UDP punch to <your_machine_ip>:4000
-Sent UDP punch to <your_machine_ip>:4000
-Finished hole punching / listening phase.
-```
+In a third terminal:
 
-### Output for 2nd client
-```bash
-Server response:
- MODE DIRECT user1 <your_machine_ip>:4000
-Added peer user1 with addr <your_machine_ip>:4000
-Received from <your_machine_ip>:5000: MODE DIRECT user2 <your_machine_ip>:4002
-Received from <your_machine_ip>:5000: MODE DIRECT user2 <your_machine_ip>:4002
-Sent UDP punch to <your_machine_ip>:4000
-Sent UDP punch to <your_machine_ip>:4000
-Sent UDP punch to <your_machine_ip>:4000
-Sent UDP punch to <your_machine_ip>:4000
-Sent UDP punch to <your_machine_ip>:4000
-Sent UDP punch to <your_machine_ip>:4000
-Sent UDP punch to <your_machine_ip>:4000
-Received from <your_machine_ip>:5000: MODE DIRECT user3 <your_machine_ip>:4003
-Sent UDP punch to <your_machine_ip>:4000
-Sent UDP punch to <your_machine_ip>:4000
-Sent UDP punch to <your_machine_ip>:4000
-Finished hole punching / listening phase.
-```
+~~~bash
+./target/release/client 127.0.0.1 server1 channel1 user2 4001
+~~~
 
-### Output for 1st client
-```bash
-Server response:
- MODE RELAY
+The arguments are `<signaling_ip> <server_id> <channel> <user> <local_port>`.
+Both clients use the same logical server and channel, with distinct usernames
+and local UDP ports. See the [client guide](doc_client.md) for each argument.
 
-You are in RELAY mode (only user in channel)
-Relay mode active: waiting for incoming messages...
-Received from <your_machine_ip>:5000: MODE DIRECT user2 <your_machine_ip>:4002
-Received from <your_machine_ip>:4002: punch
-Received from <your_machine_ip>:4002: punch
-Received from <your_machine_ip>:4002: punch
-Received from <your_machine_ip>:4002: punch
-Finished hole punching / listening phase.
-```
+## What to check
 
-## And now, you're server's output should look something like this:
-```bash
-Signaling server listening on 0.0.0.0:5000
-User user1 joined server1-channel1 from <your_machine_ip>:4000
-User user2 joined server1-channel1 from <your_machine_ip>:4002
-User user3 joined server1-channel1 from <your_machine_ip>:4003
-```
+Log ordering, numeric channel IDs, and assigned peer IDs can vary. Look for
+these events rather than an exact transcript:
 
-#For Phase 1 of this protocol, if you're receiving the same outputs, the server and client are working properly (for now)
+1. Each client receives WELCOME containing a channel ID and a nonzero peer ID.
+2. Each opens a WebSocket connection to `ws://127.0.0.1:2133` and sends
+   `JoinControl`.
+3. Each sends a demonstration CONTROL message and receives its matching ACK.
+   The current demo uses message ID `1` and a 102,400-byte payload.
+4. On a typical localhost run, the first client starts with `MODE RELAY`.
+   After the second joins, peer address messages, UDP punches, and
+   `CONNECTED (direct)` messages show the attempted direct path.
+5. Enter a short line such as `hello from user1` in the first client terminal
+   and check that the second displays it. Repeat in the other direction.
+
+Example CONTROL log lines are:
+
+~~~text
+Sent ControlMsg message_id=1 payload_len=102400
+Received ControlAck for pending message_id=1
+~~~
+
+These events check different paths: the ACK concerns client-to-server WebSocket
+CONTROL, while typed terminal text uses legacy UDP traffic. Neither demonstrates
+an audio call or authenticated communication.
+
+A third client can be started with:
+
+~~~bash
+./target/release/client 127.0.0.1 server1 channel1 user3 4002
+~~~
+
+This lets you inspect additional peer/relay announcements. It does not establish
+a tested channel capacity or prove all multi-participant routing behavior.
+
+## Stop the prototype
+
+Stop each client and the server with `Ctrl+C`. The client has no coordinated
+graceful departure, so a stopped client's membership can remain until the server
+removes it through timeout processing.
+
+## Automated tests
+
+Run the suite from the repository root:
+
+~~~bash
+cargo test
+~~~
+
+To focus on CONTROL:
+
+~~~bash
+cargo test --lib control::
+~~~
+
+The current CONTROL tests cover JSON encoding, matching and unexpected ACKs,
+pending-message limits, bounded retries, duplicate/conflicting messages,
+sequence rollover, connection errors, and cleanup.
+
+Network tests create real localhost WebSocket connections on temporary ports
+selected by the operating system. They require permission to open local sockets
+and do not depend on a separately running signaling server. Test cases use a
+five-second wait limit to fail stalled exchanges rather than hang indefinitely.
+That limit is a test safeguard, not a five-second sleep or a latency target.
+
+Retry tests advance a test clock instead of waiting through every real ACK
+deadline. Connection tasks and sockets are cleaned up after each case.
+
+## Troubleshooting and scope
+
+| Observation | Check |
+| --- | --- |
+| Address already in use | Stop the previous process or choose a different client UDP port. Server ports are fixed in the current executable. |
+| No NAT probe responses | Check that both UDP server ports are reachable; the client continues with an unknown classification after the probe deadline. |
+| No CONTROL connection | Check the separate TCP `2133` listener and whether the client received a nonzero peer ID. |
+| CONTROL ACK received but no peer text | Inspect peer addresses, route messages, and UDP reachability separately from WebSocket CONTROL. |
+| Local socket permission errors in tests | Check whether the test environment permits localhost TCP/UDP listeners. |
+
+Real NAT coverage, protected signaling/media, audio behavior, recovery under
+network changes, and performance measurements remain separate validation work.
 
 
 

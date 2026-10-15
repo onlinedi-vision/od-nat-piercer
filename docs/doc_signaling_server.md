@@ -1,67 +1,147 @@
-# Signaling Server Phase 1
+# Signaling server guide
 
-## Purpose
+The standalone signaling server tracks prototype participants, shares UDP
+addresses, coordinates relay choices, and hosts the WebSocket CONTROL endpoint.
+It also forwards legacy UDP text where server relaying is selected.
 
-This UDP server acts as signaling server for a peer-to-peer voice chat that uses UDP hole punching to connect clients/users directly.
+This executable is a development prototype. Usernames, channel names, and peer
+IDs are caller-supplied or server-assigned identifiers, not authenticated
+application identities. UDP signaling and WebSocket CONTROL are currently
+plaintext.
 
-It keeps track of users grouped into channels with different server IDs and shares their network address so they can connect to each other (this will probably be modified a little).  
-If a user is alone in a channel, the server will set him into a **RELAY** mode; if the user is not alone, he is placed into **DIRECT** mode with the addresses of their peers.
+## Build and start
 
----
+From the repository root:
 
-## Data structures
-### User
-Represents a connected user:
-  - `name` - username (`String`)
-  - `addr` - UDP socket address of the user (`SocketAddr`)
+~~~bash
+cargo build --release --bin signaling_server
+./target/release/signaling_server
+~~~
 
-### Channel
-A vector of `User` - the list of all users in the same channel
+The executable uses fixed ports and accepts no port configuration arguments:
 
-### ServerMap
-A `HashMap` that represents the current state of all users grouped by server and channel.
-`HashMap<String, HashMap<String, Channel>>`
-(`server_id` -> `channel_name` -> `Vec<User>`)
+| Listener | Bind address | Purpose |
+| --- | --- | --- |
+| UDP | `0.0.0.0:2131` | Primary signaling, NAT probes, and server relay traffic. |
+| UDP | `0.0.0.0:2132` | Second port used by NAT probing. |
+| TCP / WebSocket | `0.0.0.0:2133` | JSON CONTROL messages over `ws://`. |
 
----
+The UDP listeners share the command handler. All listeners bind on all IPv4
+interfaces; use a controlled development environment. The
+[local testing guide](doc_test_od_nat_piercer.md) connects clients through
+localhost.
 
+Successful startup normally includes:
 
-## How it works:
-### 1. Server startup
-The server binds to UDP port `5000` on all interfaces (`0.0.0.0:5000`) and starts listening for incoming UDP packets async.
+~~~text
+Signaling server listening on 0.0.0.0:2131
+Control WebSocket server listening on 0.0.0.0:2133
+~~~
 
-### 2. Receiving messages
-The server waits for incoming UDP datagrams. Each datagram is expected to be a UTF-8 encoded string command
+The WebSocket listener runs in a background task. If it fails, the UDP loop can
+continue, so check for both startup messages.
 
-### 3. Parsing messages
-The server splits the received message by whitespace into tokens. It expects commands that follow one of the patterns:
-- `CONNECT <server_id> <channel> <user> <user_addr>`
-- `DISCONNECT <server_id> <channel> <user>`
+## Joining a channel
 
-### 4. Handling `CONNECT`:
-- Extract the `server ID`, `channel name`, `user name`, and the UDP socket address of the user (derived from the source of the UDP packet)
-- Lock the shared state (`ServerMap`) to safely add or update the user list.
-- Check if the user is already present in the channel by matching both username and address:
-  - If not present, add the user to the channel.
-  - Print a message about a new user joining.
-- Determine the mode we are going to operate on, based on the number of users in the channel:
-  - **Only one user in the channel** -> Send back a `MODE RELAY` message, indicating the user is alone and should operate in relay mode.
-  - **Multiple users in the channel**
-    -> For the newly connected user, send one `MODE DIRECT` message per existing user in the channel, providing each peer's username and address (THIS MIGHT BE CHANGED SOON)
-    -> For all existing users send a `MODE DIRECT` message with the new user's information. This informs all clients about the new user peer they can connect to directly.
+The normal client sends this UDP command to port `2131`:
 
-### 5. Handling DISCONNECT:
-- Extract `server ID`, `channel` and `user name` from the message.
-- Lock the shared state and remove the user from the channel.
-- Print a message about the user leaving the channel.
-- If after removal there is exactly one user left in the channel:
-  -> Send a `MODE RELAY` message to that user, notifying them they are alone and should switch to relay mode.
+~~~text
+CONNECT server1 channel1 user1 CONE
+~~~
 
-### 6. Loop:
-The server returns to listening for more UDP messages for an unlimited period of time.
+The fields identify a logical server namespace, channel name, username, and
+client-reported NAT classification. The server takes the UDP address from the
+packet's source, rather than accepting a client address field.
 
----
+The server stores channels under their server namespace. Each channel contains
+its users, a numeric channel ID, the next peer ID, and its selected participant
+relay, if any. A new user receives a peer ID within that channel.
 
-## Notes
-- The server assumes clients maintain their connection by sending `CONNECT` and `DISCONNECT` messages (This might be changed soon)
-- The current way the server operates may be updated/changed (future **Phase 2**)
+The server returns:
+
+~~~text
+WELCOME <channel_id> <peer_id>
+~~~
+
+WELCOME is text inside an ODNP CONTROL UDP packet. The client then uses its peer
+ID when opening a separate WebSocket CONTROL connection. That join is not yet
+authenticated or checked against the UDP membership record.
+
+A repeated CONNECT from the same username and address refreshes the existing
+entry and re-sends WELCOME. A matching username from a different address replaces
+the previous entry. This behavior is not secure session resumption.
+
+## NAT probing and relay choices
+
+A `NAT_PROBE` received on either UDP listener produces a
+`NAT_SEEN <observed_source_address>` response. The client compares responses
+from the two ports to estimate NAT behavior.
+
+The server currently marks clients reporting symmetric NAT for server relaying.
+It selects an eligible participant relay when one exists and exchanges peer
+addresses through `MODE DIRECT` messages. The selected relay receives
+`MODE RELAY`. A lone eligible participant can also hold that role.
+
+Participants requiring server relaying receive `MODE SERVER_RELAY <user>`.
+If no eligible participant relay exists, the server selects server relaying for
+the channel's participants. Later relay requests can mark a participant for
+server forwarding.
+
+These are prototype policies driven partly by client-reported classifications.
+They do not guarantee connectivity across all NATs, successful migration, or
+correct recovery from every participant change.
+
+## UDP command overview
+
+| Command | Current purpose |
+| --- | --- |
+| `NAT_PROBE <probe_id>` | Ask the server which source address it observes. |
+| `CONNECT <server_id> <channel> <user> <nat_type>` | Join or refresh a prototype participant. |
+| `HB <server_id> <channel> <user>` | Refresh liveness for a matching participant and source address. |
+| `PING` / `PONG` | Probe liveness and refresh matching users on PONG. |
+| `REQUEST_RELAY <server_id> <channel> <user>` | Request server relaying for a participant. |
+| `PEER_TIMEOUT <server_id> <channel> <user>` | Report an unreachable peer; currently also affects membership. |
+| `DISCONNECT <server_id> <channel> <user>` | Handle an explicit departure; the normal client does not send it on termination. |
+| `DATA <user> <text>` | Forward legacy text according to current channel/relay state. |
+
+These commands are not a production authorization boundary. In particular,
+peer failure reporting currently affects the membership list, although a failed
+network path should eventually be handled separately from application membership.
+
+The heartbeat worker scans every 20 seconds. Users whose recorded liveness is
+older than 40 seconds can be removed on a scan, with departure notifications and
+relay reassignment where applicable. This is not an exact 40-second disconnect
+deadline.
+
+## WebSocket CONTROL
+
+The endpoint is `ws://<signaling_ip>:2133`. A normal client sends:
+
+~~~json
+{"type":"JoinControl","server_id":"server1","channel":"channel1","user":"user1","peer_id":1}
+~~~
+
+It then sends numbered `ControlMsg` messages. The server handles a new ID once,
+records it in connection-local duplicate tracking, and returns a matching
+`ControlAck`. Current handling logs the ID and payload length; it does not
+broadcast the payload to other participants.
+
+See [reliable CONTROL](doc_control.md) for message examples, sequence rules,
+limits, retries, and failure behavior.
+
+## State and shutdown limits
+
+Membership, relay selection, and CONTROL duplicate history are held in memory.
+A process restart loses that state. The UDP membership map and WebSocket
+registration map are separate; opening or closing one transport does not
+establish a complete authenticated session lifecycle.
+
+Stop the standalone server with `Ctrl+C`. Coordinated shutdown, authenticated
+membership, protected signaling, and reliable route recovery remain future work.
+
+## Source
+
+- [Server executable](../src/bin/signaling_server.rs)
+- [UDP command dispatch](../src/signaling/handlers/message.rs)
+- [Membership and channel state](../src/signaling/structures.rs)
+- [WebSocket connection handling](../src/control/server.rs)

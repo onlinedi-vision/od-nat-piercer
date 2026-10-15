@@ -1,6 +1,10 @@
 /target
 AGENTS.md
 ANALYSIS.md
-/docs
+/docs/*
+!/docs/doc_client.md
+!/docs/doc_control.md
+!/docs/doc_signaling_server.md
+!/docs/doc_test_od_nat_piercer.md
 od-nat-piercer-engineering-roadmap.md
 od-nat-piercer-roadmap-phased-version.md

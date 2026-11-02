@@ -8,8 +8,7 @@ IPv4 interfaces and the current transports are plaintext.
 
 ## Build
 
-Install Rust/Cargo and the native build tools needed by the vendored OpenSSL
-dependency. From the repository root:
+Install Rust/Cargo and a native toolchain. From the repository root:
 
 ~~~bash
 cargo build --release --bin signaling_server --bin client
@@ -58,9 +57,11 @@ these events rather than an exact transcript:
 
 1. Each client receives WELCOME containing a channel ID and a nonzero peer ID.
 2. Each opens a WebSocket connection to `ws://127.0.0.1:2133` and sends
-   `JoinControl`.
-3. Each sends a demonstration CONTROL message and receives its matching ACK.
-   The current demo uses message ID `1` and a 102,400-byte payload.
+   `JoinControl`, then waits for `JoinAccepted`.
+3. Each waits for server CONTROL messages after registration. Two idle clients
+   do not generate CONTROL broadcasts or application ACKs. Submitted messages
+   and incoming ACK behavior are exercised by the automated tests below.
+   A later join does not replay earlier messages.
 4. On a typical localhost run, the first client starts with `MODE RELAY`.
    After the second joins, peer address messages, UDP punches, and
    `CONNECTED (direct)` messages show the attempted direct path.
@@ -70,13 +71,16 @@ these events rather than an exact transcript:
 Example CONTROL log lines are:
 
 ~~~text
-Sent ControlMsg message_id=1 payload_len=102400
-Received ControlAck for pending message_id=1
+Connected to control WebSocket server at ws://127.0.0.1:2133
+CONTROL registration accepted.
 ~~~
 
-These events check different paths: the ACK concerns client-to-server WebSocket
-CONTROL, while typed terminal text uses legacy UDP traffic. Neither demonstrates
-an audio call or authenticated communication.
+Recipients log `Processed server CONTROL` when a server message arrives.
+The automated CONTROL suite uses explicit test messages to exercise broadcast,
+queue-admission results, processing ACKs, and finite unconfirmed failure.
+
+Registration checks the WebSocket connection; typed terminal text uses legacy
+UDP traffic. Neither demonstrates an audio call or authenticated communication.
 
 A third client can be started with:
 
@@ -107,18 +111,19 @@ To focus on CONTROL:
 cargo test --lib control::
 ~~~
 
-The current CONTROL tests cover JSON encoding, matching and unexpected ACKs,
-pending-message limits, bounded retries, duplicate/conflicting messages,
-sequence rollover, connection errors, and cleanup.
+The CONTROL suite covers accepted/refused/idempotent/conflicting registration,
+client registration waits, typed result matching, strict request/notification
+IDs, unknown/duplicate confirmations, handler failure without ACK, missing
+results/ACKs without retransmission, exact escaped size limits, stalled writes,
+recipient capacity, partial admission and healthy-peer progress, cancellation
+and cleanup. The production CLI session test verifies registration and processing
+ACKs without an automatic demo broadcast.
 
-Network tests create real localhost WebSocket connections on temporary ports
-selected by the operating system. They require permission to open local sockets
-and do not depend on a separately running signaling server. Test cases use a
-five-second wait limit to fail stalled exchanges rather than hang indefinitely.
-That limit is a test safeguard, not a five-second sleep or a latency target.
-
-Retry tests advance a test clock instead of waiting through every real ACK
-deadline. Connection tasks and sockets are cleaned up after each case.
+Tests use real localhost WebSockets on ephemeral ports, explicit message/Pong
+barriers, a controlled monotonic clock and a ten-second case bound. State tests
+also exercise counter exhaustion and combined queue/pending capacity. No separate
+server process, external service or arbitrary sleep is required. Fixture teardown
+joins or aborts connection tasks and releases sockets.
 
 ## Troubleshooting and scope
 
@@ -127,12 +132,8 @@ deadline. Connection tasks and sockets are cleaned up after each case.
 | Address already in use | Stop the previous process or choose a different client UDP port. Server ports are fixed in the current executable. |
 | No NAT probe responses | Check that both UDP server ports are reachable; the client continues with an unknown classification after the probe deadline. |
 | No CONTROL connection | Check the separate TCP `2133` listener and whether the client received a nonzero peer ID. |
-| CONTROL ACK received but no peer text | Inspect peer addresses, route messages, and UDP reachability separately from WebSocket CONTROL. |
+| CONTROL result received but no peer text | Inspect peer addresses, route messages, and UDP reachability separately from WebSocket CONTROL. |
 | Local socket permission errors in tests | Check whether the test environment permits localhost TCP/UDP listeners. |
 
 Real NAT coverage, protected signaling/media, audio behavior, recovery under
 network changes, and performance measurements remain separate validation work.
-
-
-
-

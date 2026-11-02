@@ -29,6 +29,7 @@ mod tests {
     #[test]
     fn join_control_json_roundtrip() {
         let msg = ControlMessage::JoinControl {
+            request_id: 1,
             server_id: "Server1".to_string(),
             channel: "Channel1".to_string(),
             user: "User1".to_string(),
@@ -40,11 +41,13 @@ mod tests {
 
         match parsed {
             ControlMessage::JoinControl {
+                request_id,
                 server_id,
                 channel,
                 user,
                 peer_id,
             } => {
+                assert_eq!(request_id, 1);
                 assert_eq!(server_id, "Server1");
                 assert_eq!(channel, "Channel1");
                 assert_eq!(user, "User1");
@@ -84,7 +87,7 @@ mod tests {
         let parsed: ControlMessage = serde_json::from_str(&json).unwrap();
 
         match parsed {
-            ControlMessage::ControlAck { message_id } => {
+            ControlMessage::ControlAck { message_id, .. } => {
                 assert_eq!(message_id, 99);
             }
             _ => panic!("expected ControlAck"),
@@ -92,29 +95,7 @@ mod tests {
     }
 
     #[test]
-    fn control_msg_large_payload_json_roundtrip() {
-        const PAYLOAD_LEN: usize = 100 * 1024;
-
-        let payload = "A".repeat(PAYLOAD_LEN);
-
-        let msg = ControlMessage::ControlMsg {
-            message_id: 1,
-            payload: payload.clone(),
-        };
-
-        let json = serde_json::to_string(&msg).unwrap();
-        let parsed: ControlMessage = serde_json::from_str(&json).unwrap();
-
-        match parsed {
-            ControlMessage::ControlMsg {
-                message_id,
-                payload: parsed_payload,
-            } => {
-                assert_eq!(message_id, 1);
-                assert_eq!(parsed_payload.len(), PAYLOAD_LEN);
-                assert_eq!(parsed_payload, payload);
-            }
-            _ => panic!("expected ControlMsg"),
-        }
+    fn channel_keys_do_not_collide_on_colons() {
+        assert_ne!(channel_key("a:b", "c"), channel_key("a", "b:c"));
     }
 }

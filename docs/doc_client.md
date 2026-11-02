@@ -2,7 +2,7 @@
 
 The prototype client joins a channel, attempts direct UDP connectivity, and uses
 participant or server relay paths where selected by the signaling server. It
-also opens a WebSocket connection for demonstration CONTROL messages.
+also opens a WebSocket connection for CONTROL registration and reception.
 
 Audio integration is future work. The current client exchanges terminal text
 and connectivity messages, without transport encryption or participant
@@ -46,14 +46,14 @@ ports. These names and IDs are not authenticated credentials.
 4. Handle the server's `WELCOME <channel_id> <peer_id>` response and route
    instructions. WELCOME currently travels inside an ODNP CONTROL UDP packet.
 5. Once a nonzero peer ID is available, open `ws://<signaling_ip>:2133`, send
-   `JoinControl`, and send a 100 KiB demonstration CONTROL payload.
-   A matching `ControlAck` clears that pending message.
+   `JoinControl`, wait for `JoinAccepted`, then receive server CONTROL messages. Incoming messages
+   are processed and ACKed.
 6. Continue handling UDP traffic, peer information, heartbeat messages, and
    terminal input until the process is stopped or a fatal error ends the client.
 
 WELCOME and route messages may arrive in either order. The WebSocket connection
 can therefore start during the main receive loop rather than immediately after
-CONNECT. See [reliable CONTROL](doc_control.md) for its separate ACK/retry rules.
+CONNECT. See [CONTROL](doc_control.md) for its separate result/ACK and timeout rules.
 
 ## NAT probing and route selection
 

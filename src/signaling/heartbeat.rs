@@ -2,9 +2,7 @@ use crate::{
     proto::control_text::{
         MSG_DIRECT, MSG_MODE, MSG_PING, MSG_RELAY, MSG_SERVER_RELAY, MSG_USER_LEFT,
     },
-    signaling::{
-        handlers::utils::pick_eligible_relay, structures::ServerMap, utils::cleanup_and_notify_iter,
-    },
+    signaling::{handlers::utils::pick_eligible_relay, structures::ServerMap},
 };
 use std::{net::SocketAddr, sync::Arc, time::Duration};
 use tokio::{net::UdpSocket, sync::Mutex};
@@ -31,19 +29,11 @@ fn handle_relay_timeout(
             .map(|u| u.addr)
             .collect();
         if !peers_addrs.is_empty() {
-            let mut payload = Vec::new();
-            for _peer in channel
-                .users
-                .iter()
-                .filter(|u| u.name != new_relay_user.name)
-            {
-                let m = format!(
-                    "{} {} {} {}\n",
-                    MSG_MODE, MSG_DIRECT, new_relay_user.name, new_relay_user.addr
-                );
-                payload.extend_from_slice(m.as_bytes());
-            }
-            notifications.push((peers_addrs, payload));
+            let notice = format!(
+                "{} {} {} {}\n",
+                MSG_MODE, MSG_DIRECT, new_relay_user.name, new_relay_user.addr
+            );
+            notifications.push((peers_addrs, notice.into_bytes()));
         }
 
         // 3) Send new relay info about all other peers: "MODE DIRECT <peer> <addr>"
@@ -211,7 +201,7 @@ async fn send_pings(socket: Arc<UdpSocket>, to_ping: Vec<SocketAddr>) {
 
 async fn send_notifications(socket: Arc<UdpSocket>, notify_msgs: Vec<(Vec<SocketAddr>, Vec<u8>)>) {
     //send notifications (USER_LEFT, MODE RELAY, MODE DIRECT messages}
-    for (peers_to_notify, payload) in cleanup_and_notify_iter(notify_msgs) {
+    for (peers_to_notify, payload) in notify_msgs {
         for addr in peers_to_notify {
             if let Err(e) = socket.send_to(&payload, addr).await {
                 eprintln!("Failed to send heartbeat notification to {addr}: {e}");
@@ -249,4 +239,46 @@ pub fn start_heartbeat(socket: Arc<UdpSocket>, state: Arc<Mutex<ServerMap>>) {
             cleanup_empty_channels(state.clone(), to_cleanup).await;
         }
     });
+}
+
+#[test]
+fn relay_handover_sends_one_direct_notice_to_each_recipient() {
+    use crate::signaling::structures::{Channel, NatKind, User};
+    use std::net::Ipv4Addr;
+
+    let mut channel = Channel {
+        users: vec![
+            User::new(
+                "new-relay",
+                (Ipv4Addr::LOCALHOST, 30001).into(),
+                NatKind::Cone,
+                1,
+            ),
+            User::new(
+                "peer-a",
+                (Ipv4Addr::LOCALHOST, 30002).into(),
+                NatKind::Cone,
+                2,
+            ),
+            User::new(
+                "peer-b",
+                (Ipv4Addr::LOCALHOST, 30003).into(),
+                NatKind::Cone,
+                3,
+            ),
+        ],
+        ..Channel::default()
+    };
+    let mut notifications = Vec::new();
+    handle_relay_timeout(&mut channel, &mut notifications);
+    let expected = b"MODE DIRECT new-relay 127.0.0.1:30001\n";
+    for peer in &channel.users[1..] {
+        let notices: Vec<_> = notifications
+            .iter()
+            .filter(|(recipients, _)| recipients.contains(&peer.addr))
+            .map(|(_, payload)| payload.as_slice())
+            .collect();
+        assert_eq!(notices, [expected.as_slice()]);
+    }
+    assert_eq!(channel.relay.as_deref(), Some("new-relay"));
 }

@@ -261,7 +261,6 @@ fn relay_main_loop(
 fn relay_keepalive_loop(
     socket: &UdpSocket,
     peers: &Arc<Mutex<Vec<PeerInfo>>>,
-    relay_started: &Arc<Mutex<bool>>,
     server_id: &str,
     channel: &str,
     signaling_addr: &str,
@@ -284,18 +283,7 @@ fn relay_keepalive_loop(
             }
         }
 
-        // mark started, only once
-        {
-            let Ok(mut started) = relay_started.lock() else {
-                eprintln!("Relay keepalive stopped: relay_started mutex is poisoned");
-                return;
-            };
-            if !*started {
-                *started = true;
-                println!("Starting relay keepalive thread.");
-            }
-        }
-
+        println!("Starting relay keepalive thread.");
         // run main loop until deactivated
         let relay_result = relay_main_loop(
             socket,
@@ -310,15 +298,7 @@ fn relay_keepalive_loop(
             eprintln!("Relay keepalive stopped: {e}");
         }
 
-        // mark stopped
-        {
-            let Ok(mut started) = relay_started.lock() else {
-                eprintln!("Relay keepalive stopped: relay_started mutex is poisoned");
-                return;
-            };
-            *started = false;
-            println!("Relay loop stopped.");
-        }
+        println!("Relay loop stopped.");
 
         if relay_result.is_err() {
             return;
@@ -331,7 +311,6 @@ fn relay_keepalive_loop(
 pub fn start_relay_keepalive(
     socket: UdpSocket,
     peers: Arc<Mutex<Vec<PeerInfo>>>,
-    relay_started: Arc<Mutex<bool>>,
     server_id: String,
     channel: String,
     signaling_addr: String,
@@ -341,7 +320,6 @@ pub fn start_relay_keepalive(
         relay_keepalive_loop(
             &socket,
             &peers,
-            &relay_started,
             &server_id,
             &channel,
             &signaling_addr,

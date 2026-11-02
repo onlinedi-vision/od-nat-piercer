@@ -118,20 +118,24 @@ deadline.
 The endpoint is `ws://<signaling_ip>:2133`. A normal client sends:
 
 ~~~json
-{"type":"JoinControl","server_id":"server1","channel":"channel1","user":"user1","peer_id":1}
+{"type":"JoinControl","request_id":1,"server_id":"server1","channel":"channel1","user":"user1","peer_id":1}
 ~~~
 
-It then sends numbered `ControlMsg` messages. The server handles a new ID once,
-records it in connection-local duplicate tracking, and returns a matching
-`ControlAck`. Current handling logs the ID and payload length; it does not
-broadcast the payload to other participants.
+The server returns `JoinAccepted` with the same request ID. The CLI waits for
+this result before receiving and acknowledging server notifications. An explicit
+`Broadcast` request is forwarded once to other registered connections in the
+exact server/channel pair. The source receives `BroadcastResult` with queued/failed
+admission counts; recipients independently ACK successful local processing.
+Results are not ACKed, and missing confirmations produce finite failure without
+retransmission. No payload contents are logged. Queue admission is not proof of
+final peer processing.
 
-See [reliable CONTROL](doc_control.md) for message examples, sequence rules,
-limits, retries, and failure behavior.
+See [CONTROL](doc_control.md) for message examples, sequence rules,
+limits, one-send deadlines, and failure behavior.
 
 ## State and shutdown limits
 
-Membership, relay selection, and CONTROL duplicate history are held in memory.
+Membership, relay selection, and CONTROL registration/pending state are held in memory.
 A process restart loses that state. The UDP membership map and WebSocket
 registration map are separate; opening or closing one transport does not
 establish a complete authenticated session lifecycle.

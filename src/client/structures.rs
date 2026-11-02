@@ -19,7 +19,6 @@ pub struct PeerInfo {
     pub created_at: Instant,
     pub use_server_relay: bool, //server will carry traffic for this peer
     pub relay_requested: bool,  //we asked server once
-    pub nat_kind: NatKind,
 }
 
 #[derive(Debug)]

@@ -1,626 +1,602 @@
-use std::{
-    collections::HashMap,
-    future::Future,
-    net::Ipv4Addr,
-    pin::Pin,
-    sync::{
-        Arc, Weak,
-        atomic::{AtomicUsize, Ordering},
-    },
-    time::Duration,
-};
+#![allow(clippy::disallowed_methods)] // Tokio test runtime and explicit test assertions.
 
-use futures_util::{
-    SinkExt, StreamExt,
-    stream::{SplitSink, SplitStream},
-};
-use tokio::{
-    net::{TcpListener, TcpStream},
-    sync::{Mutex, watch},
-    task::JoinSet,
-    time::{Instant, timeout},
-};
+use futures_util::{SinkExt, StreamExt};
+use tokio::{net::TcpListener, time::timeout};
 use tokio_tungstenite::{
-    MaybeTlsStream, WebSocketStream, connect_async_with_config,
-    tungstenite::{Error as WsError, Message},
+    accept_async_with_config, connect_async_with_config, tungstenite::Message,
 };
 
 use super::{
-    client::{ClientEvent, receive_or_retry, send_control_message},
-    messages::ControlMessage,
+    client::{ClientEvent, ClientState, receive_event, run_control_session, send_control_message},
+    integration_tests::{PAYLOAD, Socket, registration, run_case},
+    messages::{BroadcastReport, ControlMessage, RequestRejection},
     reliability::{
-        ACK_TIMEOUT, Clock, ControlResult, MAX_MESSAGE_BYTES, ReliabilityError, ReliableSender,
-        WINDOW, WRITE_TIMEOUT, encode, websocket_config,
+        ACK_TIMEOUT, Clock, ControlResult, REGISTRATION_TIMEOUT, ReliabilityError, close_socket,
+        websocket_config,
     },
-    server::{ControlPeers, channel_key, handle_connection_observed},
+    server::channel_key,
 };
 
-type Socket = WebSocketStream<MaybeTlsStream<TcpStream>>;
-type CaseFuture<'a> = Pin<Box<dyn Future<Output = ControlResult<()>> + 'a>>;
-const TEST_DEADLINE: Duration = Duration::from_secs(5);
-const PAYLOAD: &str = "\0\u{1}\u{7f}\"\\";
-
-#[derive(Clone, Copy, Default)]
-struct Observation {
-    received: usize,
-    applied: usize,
-}
-
-struct ControlTestConnection {
-    write: SplitSink<Socket, Message>,
-    read: SplitStream<Socket>,
-    sender: ReliableSender,
-    clock: Clock,
-    time: watch::Sender<Instant>,
-    observations: watch::Receiver<Observation>,
-    connections: JoinSet<ControlResult<()>>,
-    peers: ControlPeers,
-    handler_lifetime: Weak<AtomicUsize>,
-}
-
-impl ControlTestConnection {
-    async fn start<A>(mut ack: A) -> ControlResult<Self>
-    where
-        A: FnMut(u64, usize) -> Option<u64> + Send + 'static,
-    {
-        let peers: ControlPeers = Arc::new(Mutex::new(HashMap::new()));
-        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
-        let addr = listener.local_addr()?;
-        let server_peers = Arc::clone(&peers);
-        let applied = Arc::new(AtomicUsize::new(0));
-        let applied_for_ack = Arc::clone(&applied);
-        let (observe, observations) = watch::channel(Observation::default());
-        let handler_lifetime = Arc::downgrade(&applied);
-        let mut received = 0;
-        let mut connections = JoinSet::new();
-        connections.spawn(async move {
-            let (stream, _) = listener.accept().await?;
-            drop(listener);
-            handle_connection_observed(
-                stream,
-                server_peers,
-                move |_, _| {
-                    applied.fetch_add(1, Ordering::Relaxed);
-                },
-                move |id| {
-                    received += 1;
-                    observe.send_replace(Observation {
-                        received,
-                        applied: applied_for_ack.load(Ordering::Relaxed),
-                    });
-                    ack(id, received)
-                },
-            )
-            .await
-        });
-        let (socket, _) = timeout(
-            TEST_DEADLINE,
-            connect_async_with_config(format!("ws://{addr}"), Some(websocket_config()), false),
+async fn socket_pair() -> ControlResult<(
+    Socket,
+    tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>,
+)> {
+    let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).await?;
+    let connect = connect_async_with_config(
+        format!("ws://{}", listener.local_addr()?),
+        Some(websocket_config()),
+        false,
+    );
+    let accept = async {
+        let (stream, _) = listener.accept().await?;
+        Ok::<_, Box<dyn std::error::Error + Send + Sync>>(
+            accept_async_with_config(stream, Some(websocket_config())).await?,
         )
-        .await??;
-        let (mut write, read) = socket.split();
+    };
+    let (client, server) = tokio::join!(connect, accept);
+    Ok((client?.0, server?))
+}
+
+#[tokio::test]
+async fn registration_is_required_and_semantic_rejection_consumes_id() -> ControlResult<()> {
+    run_case(|h| {
+        Box::pin(async move {
+            let mut peer = h.connect().await?;
+            assert!(peer.send(PAYLOAD).await.is_err());
+            peer.raw(&ControlMessage::Broadcast {
+                request_id: 1,
+                payload: PAYLOAD.into(),
+            })
+            .await?;
+            assert_eq!(
+                peer.message().await?,
+                ControlMessage::RequestRejected {
+                    request_id: 1,
+                    reason: RequestRejection::NotRegistered,
+                }
+            );
+            let mut join = registration("server", "channel", 7);
+            if let ControlMessage::JoinControl { request_id, .. } = &mut join {
+                *request_id = 2;
+            }
+            peer.raw(&join).await?;
+            assert_eq!(
+                peer.message().await?,
+                ControlMessage::JoinAccepted { request_id: 2 }
+            );
+            peer.barrier().await?;
+            peer.finish().await?;
+            h.result(peer.index).await
+        })
+    })
+    .await
+}
+
+#[tokio::test]
+async fn identical_join_is_idempotent_and_conflict_is_rejected() -> ControlResult<()> {
+    run_case(|h| {
+        Box::pin(async move {
+            let mut peer = h.connect().await?;
+            peer.join("server", "channel").await?;
+            let same = registration("server", "channel", 7);
+            assert_eq!(
+                peer.state.join(&mut peer.write, &same, &peer.clock).await?,
+                2
+            );
+            assert_eq!(peer.event().await?, ClientEvent::Joined { request_id: 2 });
+            peer.barrier().await?;
+            let original = h.registry.lock().await[&channel_key("server", "channel")][0].clone();
+            assert_eq!(
+                h.registry.lock().await[&channel_key("server", "channel")].len(),
+                1
+            );
+            let conflict = registration("server", "other-channel", 7);
+            peer.state
+                .join(&mut peer.write, &conflict, &peer.clock)
+                .await?;
+            assert_eq!(
+                peer.event().await?,
+                ClientEvent::Rejected {
+                    request_id: 3,
+                    reason: RequestRejection::ConflictingRegistration,
+                }
+            );
+            assert!(h.result(peer.index).await.is_err());
+            assert!(original.is_closed());
+            assert!(h.registry.lock().await.is_empty());
+            Ok(())
+        })
+    })
+    .await
+}
+
+#[tokio::test]
+async fn invalid_registration_fields_get_rejection_then_close() -> ControlResult<()> {
+    run_case(|h| {
+        Box::pin(async move {
+            for field in 0..4 {
+                let mut peer = h.connect().await?;
+                let mut join = registration("server", "channel", 7);
+                if let ControlMessage::JoinControl {
+                    server_id,
+                    channel,
+                    user,
+                    peer_id,
+                    ..
+                } = &mut join
+                {
+                    match field {
+                        0 => server_id.clear(),
+                        1 => channel.clear(),
+                        2 => user.clear(),
+                        _ => *peer_id = 0,
+                    }
+                }
+                peer.raw(&join).await?;
+                assert_eq!(
+                    peer.message().await?,
+                    ControlMessage::RequestRejected {
+                        request_id: 1,
+                        reason: RequestRejection::InvalidRegistration,
+                    }
+                );
+                assert!(h.result(peer.index).await.is_err());
+            }
+            assert!(h.registry.lock().await.is_empty());
+            Ok(())
+        })
+    })
+    .await
+}
+
+#[tokio::test]
+async fn registration_timeout_is_not_extended_by_rejected_broadcast() -> ControlResult<()> {
+    run_case(|h| {
+        Box::pin(async move {
+            let mut peer = h.connect().await?;
+            peer.barrier().await?;
+            let start = *peer.server_time.borrow();
+            peer.server_time
+                .send_replace(start + REGISTRATION_TIMEOUT / 2);
+            peer.raw(&ControlMessage::Broadcast {
+                request_id: 1,
+                payload: PAYLOAD.into(),
+            })
+            .await?;
+            assert!(matches!(
+                peer.message().await?,
+                ControlMessage::RequestRejected {
+                    reason: RequestRejection::NotRegistered,
+                    ..
+                }
+            ));
+            peer.server_time.send_replace(start + REGISTRATION_TIMEOUT);
+            let error = h
+                .result(peer.index)
+                .await
+                .expect_err("registration deadline");
+            assert_eq!(
+                error.downcast_ref::<ReliabilityError>(),
+                Some(&ReliabilityError::RegistrationTimedOut)
+            );
+            Ok(())
+        })
+    })
+    .await
+}
+
+#[tokio::test]
+async fn zero_gap_and_reused_request_ids_close_connection() -> ControlResult<()> {
+    run_case(|h| {
+        Box::pin(async move {
+            for id in [0, 1, 3] {
+                let mut peer = h.connect().await?;
+                peer.join("server", "channel").await?;
+                peer.raw(&ControlMessage::Broadcast {
+                    request_id: id,
+                    payload: PAYLOAD.into(),
+                })
+                .await?;
+                let error = h.result(peer.index).await.expect_err("invalid request ID");
+                assert!(matches!(
+                    error.downcast_ref::<ReliabilityError>(),
+                    Some(ReliabilityError::InvalidSequence { .. })
+                ));
+            }
+            Ok(())
+        })
+    })
+    .await
+}
+
+#[tokio::test]
+async fn server_rejects_binary_and_wrong_direction_messages() -> ControlResult<()> {
+    run_case(|h| {
+        Box::pin(async move {
+            let messages = [
+                ControlMessage::JoinAccepted { request_id: 1 },
+                ControlMessage::BroadcastResult {
+                    request_id: 1,
+                    report: BroadcastReport::default(),
+                },
+                ControlMessage::RequestRejected {
+                    request_id: 1,
+                    reason: RequestRejection::NotRegistered,
+                },
+                ControlMessage::ControlMsg {
+                    message_id: 1,
+                    payload: PAYLOAD.into(),
+                },
+            ];
+            for message in messages {
+                let mut peer = h.connect().await?;
+                peer.raw(&message).await?;
+                assert!(h.result(peer.index).await.is_err());
+            }
+            let mut peer = h.connect().await?;
+            peer.write.send(Message::Binary(vec![1])).await?;
+            assert!(h.result(peer.index).await.is_err());
+            Ok(())
+        })
+    })
+    .await
+}
+
+#[tokio::test]
+async fn client_matches_results_by_type_and_ignores_unknown_results() -> ControlResult<()> {
+    timeout(std::time::Duration::from_secs(10), async {
+        let (client, mut server) = socket_pair().await?;
+        let (mut write, mut read) = client.split();
+        let mut state = ClientState::default();
+        let mut clock = Clock::default();
+        state
+            .join(&mut write, &registration("server", "channel", 7), &clock)
+            .await?;
+        let Some(message) = server.next().await else {
+            return Err("connection closed before registration request".into());
+        };
+        assert!(matches!(message?, Message::Text(_)));
+        for message in [
+            ControlMessage::JoinAccepted { request_id: 99 },
+            ControlMessage::RequestRejected {
+                request_id: 0,
+                reason: RequestRejection::NotRegistered,
+            },
+        ] {
+            send_control_message(&mut server, &message).await?;
+            assert_eq!(
+                receive_event(
+                    &mut write,
+                    &mut read,
+                    &mut state,
+                    &mut clock,
+                    &mut |_, _| Ok(())
+                )
+                .await?,
+                ClientEvent::Other
+            );
+            assert_eq!(state.sender.pending_len(), 1);
+            assert!(state.broadcast(&mut write, PAYLOAD, &clock).await.is_err());
+        }
         send_control_message(
-            &mut write,
-            &ControlMessage::JoinControl {
-                server_id: "reliable-server".into(),
-                channel: "reliable-channel".into(),
-                user: "reliable-peer".into(),
-                peer_id: 7,
+            &mut server,
+            &ControlMessage::BroadcastResult {
+                request_id: 1,
+                report: BroadcastReport::default(),
             },
         )
         .await?;
-        let (time, ticks) = watch::channel(Instant::now());
-        Ok(Self {
-            write,
-            read,
-            sender: ReliableSender::default(),
-            clock: Clock::Manual(ticks),
-            time,
-            observations,
-            connections,
-            peers,
-            handler_lifetime,
-        })
-    }
-
-    async fn send(&mut self, payload: &str) -> ControlResult<u64> {
-        self.sender
-            .send(&mut self.write, payload, &self.clock)
-            .await
-    }
-
-    async fn event(&mut self) -> ControlResult<ClientEvent> {
-        receive_or_retry(
-            &mut self.write,
-            &mut self.read,
-            &mut self.sender,
-            &mut self.clock,
+        let error = receive_event(
+            &mut write,
+            &mut read,
+            &mut state,
+            &mut clock,
+            &mut |_, _| Ok(()),
         )
         .await
-    }
-
-    async fn wait_received(&mut self, count: usize) -> ControlResult<Observation> {
-        while self.observations.borrow().received < count {
-            self.observations.changed().await?;
-        }
-        Ok(*self.observations.borrow())
-    }
-
-    fn expire_ack_deadline(&self) {
-        self.time.send_replace(self.clock.now() + ACK_TIMEOUT);
-    }
-
-    async fn inject_ack(&self, id: u64) -> ControlResult<()> {
-        let registry = self.peers.lock().await;
-        let senders = registry
-            .get(&channel_key("reliable-server", "reliable-channel"))
-            .expect("JoinControl must register this connection");
-        senders[0].send(Message::Text(encode(&ControlMessage::ControlAck {
-            message_id: id,
-        })?))?;
+        .expect_err("wrong result type");
+        assert!(matches!(
+            error.downcast_ref::<ReliabilityError>(),
+            Some(ReliabilityError::Protocol(_))
+        ));
+        assert_eq!(state.sender.pending_len(), 0);
         Ok(())
-    }
+    })
+    .await?
+}
 
-    async fn assert_registry_empty(&self) {
-        let registry = self.peers.lock().await;
-        assert!(
-            registry.values().all(Vec::is_empty),
-            "normal/error teardown must prune the sender"
-        );
-        assert!(
-            self.handler_lifetime.upgrade().is_none(),
-            "connection-owned callbacks must be released"
-        );
-    }
-
-    async fn finish(&mut self) -> ControlResult<()> {
-        self.write.close().await?;
-        let result = self
-            .connections
-            .join_next()
-            .await
-            .expect("connection task must exist")?;
-        result?;
-        self.assert_registry_empty().await;
-        Ok(())
-    }
-
-    async fn server_error(&mut self) -> ControlResult<Box<dyn std::error::Error + Send + Sync>> {
-        let result = self
-            .connections
-            .join_next()
-            .await
-            .expect("connection task must exist")?;
-        let Err(error) = result else {
-            panic!("expected connection failure")
+#[tokio::test]
+async fn missing_result_times_out_without_retransmission() -> ControlResult<()> {
+    timeout(std::time::Duration::from_secs(10), async {
+        let (client, mut server) = socket_pair().await?;
+        let (mut write, mut read) = client.split();
+        let mut state = ClientState::default();
+        let (time, ticks) = tokio::sync::watch::channel(tokio::time::Instant::now());
+        let mut clock = Clock::Manual(ticks);
+        state
+            .join(&mut write, &registration("server", "channel", 7), &clock)
+            .await?;
+        let Some(message) = server.next().await else {
+            return Err("connection closed before registration request".into());
         };
-        self.assert_registry_empty().await;
-        Ok(error)
-    }
+        assert!(matches!(message?, Message::Text(_)));
+        time.send_replace(clock.now() + ACK_TIMEOUT);
+        let error = receive_event(
+            &mut write,
+            &mut read,
+            &mut state,
+            &mut clock,
+            &mut |_, _| Ok(()),
+        )
+        .await
+        .expect_err("missing result");
+        assert_eq!(
+            error.downcast_ref::<ReliabilityError>(),
+            Some(&ReliabilityError::Unconfirmed { message_id: 1 })
+        );
+        close_socket(&mut write, Some(&ReliabilityError::HandlerFailed)).await?;
+        // No retry frame precedes closure on the actual WebSocket.
+        let Some(message) = server.next().await else {
+            return Err("connection ended before close frame".into());
+        };
+        assert!(matches!(message?, Message::Close(_)));
+        Ok(())
+    })
+    .await?
 }
 
-// Every case owns bounded observations, sockets, and its connection task. Always
-// join cancellation after a failed assertion result or deadline. JoinSet also
-// aborts on drop during a panic. No application server process is launched.
-async fn run_case<A, F>(ack: A, case: F) -> ControlResult<()>
-where
-    A: FnMut(u64, usize) -> Option<u64> + Send + 'static,
-    F: for<'a> FnOnce(&'a mut ControlTestConnection) -> CaseFuture<'a>,
+#[tokio::test]
+async fn handler_failure_sends_no_ack_and_clears_client_state() -> ControlResult<()> {
+    timeout(std::time::Duration::from_secs(10), async {
+        let (client, mut server) = socket_pair().await?;
+        let (mut write, mut read) = client.split();
+        let mut state = ClientState::default();
+        let mut clock = Clock::default();
+        state
+            .join(&mut write, &registration("server", "channel", 7), &clock)
+            .await?;
+        let Some(message) = server.next().await else {
+            return Err("connection closed before registration request".into());
+        };
+        let _ = message?;
+        send_control_message(&mut server, &ControlMessage::JoinAccepted { request_id: 1 }).await?;
+        receive_event(
+            &mut write,
+            &mut read,
+            &mut state,
+            &mut clock,
+            &mut |_, _| Ok(()),
+        )
+        .await?;
+        send_control_message(
+            &mut server,
+            &ControlMessage::ControlMsg {
+                message_id: 1,
+                payload: PAYLOAD.into(),
+            },
+        )
+        .await?;
+        let error = receive_event(
+            &mut write,
+            &mut read,
+            &mut state,
+            &mut clock,
+            &mut |_, _| Err("local processing failed".into()),
+        )
+        .await
+        .expect_err("handler failure");
+        assert_eq!(
+            error.downcast_ref::<ReliabilityError>(),
+            Some(&ReliabilityError::HandlerFailed)
+        );
+        assert!(state.sender.ensure_open().is_err());
+        close_socket(&mut write, Some(&ReliabilityError::HandlerFailed)).await?;
+        let Some(message) = server.next().await else {
+            return Err("connection ended before close frame".into());
+        };
+        assert!(matches!(message?, Message::Close(_)));
+        Ok(())
+    })
+    .await?
+}
+
+#[tokio::test]
+async fn client_cli_registers_then_processes_and_acks_without_demo_broadcast() -> ControlResult<()>
 {
-    let mut fixture = ControlTestConnection::start(ack).await?;
-    let result = timeout(TEST_DEADLINE, case(&mut fixture)).await;
-    fixture.sender.close();
-    let _ = timeout(WRITE_TIMEOUT, fixture.write.close()).await;
-    fixture.connections.shutdown().await;
-    result??;
-    Ok(())
-}
-
-#[allow(clippy::disallowed_methods)] // tokio::test creates its runtime with expect.
-#[tokio::test]
-async fn reliable_send_receives_real_ack_and_clears_pending() -> ControlResult<()> {
-    run_case(
-        |id, _| Some(id),
-        |fixture| {
-            Box::pin(async move {
-                assert_eq!(fixture.send(PAYLOAD).await?, 1);
-                assert_eq!(fixture.sender.pending_len(), 1);
-                assert_eq!(
-                    fixture.event().await?,
-                    ClientEvent::Acknowledged {
-                        message_id: 1,
-                        cleared: true
-                    }
-                );
-                assert_eq!(fixture.sender.pending_len(), 0);
-                assert_eq!(fixture.sender.next_deadline(), None);
-                assert_eq!(fixture.wait_received(1).await?.applied, 1);
-                fixture.finish().await
-            })
-        },
-    )
-    .await
-}
-
-#[allow(clippy::disallowed_methods)]
-#[tokio::test]
-async fn real_unknown_duplicate_and_stale_acks_only_clear_the_matching_send() -> ControlResult<()> {
-    run_case(
-        |_, _| None,
-        |fixture| {
-            Box::pin(async move {
-                fixture.send("first").await?;
-                fixture.send("second").await?;
-                fixture.wait_received(2).await?;
-                for (id, cleared, remaining) in [
-                    (999, false, 2),
-                    (0, false, 2),
-                    (2, true, 1),
-                    (2, false, 1),
-                    (1, true, 0),
-                    (1, false, 0),
-                ] {
-                    fixture.inject_ack(id).await?;
-                    assert_eq!(
-                        fixture.event().await?,
-                        ClientEvent::Acknowledged {
-                            message_id: id,
-                            cleared
-                        }
-                    );
-                    assert_eq!(fixture.sender.pending_len(), remaining);
-                }
-                fixture.finish().await
-            })
-        },
-    )
-    .await
-}
-
-#[allow(clippy::disallowed_methods)]
-#[tokio::test]
-async fn missing_ack_retries_over_websocket_without_reapplying_and_is_reacked() -> ControlResult<()>
-{
-    run_case(
-        |id, receipt| if receipt == 1 { None } else { Some(id) },
-        |fixture| {
-            Box::pin(async move {
-                fixture.send(PAYLOAD).await?;
-                assert_eq!(fixture.wait_received(1).await?.applied, 1);
-                fixture.expire_ack_deadline();
-                assert_eq!(fixture.event().await?, ClientEvent::Retried { count: 1 });
-                assert_eq!(fixture.wait_received(2).await?.applied, 1);
-                assert_eq!(
-                    fixture.event().await?,
-                    ClientEvent::Acknowledged {
-                        message_id: 1,
-                        cleared: true
-                    }
-                );
-                assert_eq!(fixture.sender.pending_len(), 0);
-                fixture.finish().await
-            })
-        },
-    )
-    .await
-}
-
-#[allow(clippy::disallowed_methods)]
-#[tokio::test]
-async fn delayed_ack_before_deadline_does_not_trigger_a_retry() -> ControlResult<()> {
-    run_case(
-        |_, _| None,
-        |fixture| {
-            Box::pin(async move {
-                fixture.send(PAYLOAD).await?;
-                fixture.wait_received(1).await?;
-                fixture
-                    .time
-                    .send_replace(fixture.clock.now() + ACK_TIMEOUT - Duration::from_millis(1));
-                fixture.inject_ack(1).await?;
-                assert_eq!(
-                    fixture.event().await?,
-                    ClientEvent::Acknowledged {
-                        message_id: 1,
-                        cleared: true
-                    }
-                );
-                assert_eq!(fixture.observations.borrow().received, 1);
-                fixture.finish().await
-            })
-        },
-    )
-    .await
-}
-
-#[allow(clippy::disallowed_methods)]
-#[tokio::test]
-async fn retry_exhaustion_is_explicit_and_clears_connection_state() -> ControlResult<()> {
-    run_case(
-        |_, _| None,
-        |fixture| {
-            Box::pin(async move {
-                fixture.send(PAYLOAD).await?;
-                fixture.wait_received(1).await?;
-                for receipt in 2..=4 {
-                    fixture.expire_ack_deadline();
-                    assert_eq!(fixture.event().await?, ClientEvent::Retried { count: 1 });
-                    assert_eq!(fixture.wait_received(receipt).await?.applied, 1);
-                }
-                fixture.expire_ack_deadline();
-                let error = match fixture.event().await {
-                    Err(error) => error,
-                    Ok(event) => panic!("expected exhaustion, got {event:?}"),
-                };
-                assert_eq!(
-                    error.downcast_ref::<ReliabilityError>(),
-                    Some(&ReliabilityError::RetryExhausted {
-                        message_id: 1,
-                        attempts: 4
-                    })
-                );
-                assert_eq!(fixture.sender.pending_len(), 0);
-                assert_eq!(fixture.sender.next_deadline(), None);
-                let Err(error) = fixture.send("after failure").await else {
-                    panic!("closed sender accepted a message")
-                };
-                assert_eq!(
-                    error.downcast_ref::<ReliabilityError>(),
-                    Some(&ReliabilityError::Closed)
-                );
-                fixture.finish().await
-            })
-        },
-    )
-    .await
-}
-
-#[allow(clippy::disallowed_methods)]
-#[tokio::test]
-async fn conflicting_duplicate_is_rejected_before_a_second_application() -> ControlResult<()> {
-    run_case(
-        |id, _| Some(id),
-        |fixture| {
-            Box::pin(async move {
-                fixture.send(PAYLOAD).await?;
-                fixture.event().await?;
-                send_control_message(
-                    &mut fixture.write,
-                    &ControlMessage::ControlMsg {
-                        message_id: 1,
-                        payload: "changed".into(),
-                    },
-                )
+    timeout(std::time::Duration::from_secs(10), async {
+        let (client, mut server) = socket_pair().await?;
+        let client = run_control_session(client, registration("server", "channel", 7));
+        let server = async {
+            let Some(message) = server.next().await else {
+                return Err("connection closed before registration request".into());
+            };
+            let Message::Text(text) = message? else {
+                return Err("expected registration JSON text".into());
+            };
+            assert_eq!(
+                serde_json::from_str::<ControlMessage>(&text)?,
+                registration("server", "channel", 7)
+            );
+            server.send(Message::Ping(vec![1])).await?;
+            let Some(message) = server.next().await else {
+                return Err("connection closed before Pong".into());
+            };
+            assert_eq!(message?, Message::Pong(vec![1]));
+            send_control_message(&mut server, &ControlMessage::JoinAccepted { request_id: 1 })
                 .await?;
-                let error = fixture.server_error().await?;
-                assert_eq!(
-                    error.downcast_ref::<ReliabilityError>(),
-                    Some(&ReliabilityError::ConflictingDuplicate { message_id: 1 })
-                );
-                assert_eq!(fixture.observations.borrow().applied, 1);
-                Ok(())
-            })
-        },
-    )
-    .await
-}
-
-#[allow(clippy::disallowed_methods)]
-#[tokio::test]
-async fn sequence_gap_is_rejected_before_processing() -> ControlResult<()> {
-    run_case(
-        |id, _| Some(id),
-        |fixture| {
-            Box::pin(async move {
+            for message_id in 1..=2 {
                 send_control_message(
-                    &mut fixture.write,
+                    &mut server,
                     &ControlMessage::ControlMsg {
-                        message_id: 2,
+                        message_id,
                         payload: PAYLOAD.into(),
                     },
                 )
                 .await?;
-                let error = fixture.server_error().await?;
-                assert_eq!(
-                    error.downcast_ref::<ReliabilityError>(),
-                    Some(&ReliabilityError::InvalidSequence {
-                        message_id: 2,
-                        expected: Some(1)
-                    })
-                );
-                assert_eq!(fixture.observations.borrow().applied, 0);
-                Ok(())
-            })
-        },
-    )
-    .await
-}
-
-#[allow(clippy::disallowed_methods)]
-#[tokio::test]
-async fn connection_continues_after_window_rollover_and_rejects_retired_ids() -> ControlResult<()> {
-    run_case(
-        |id, _| Some(id),
-        |fixture| {
-            Box::pin(async move {
-                for id in 1..=WINDOW as u64 + 1 {
-                    assert_eq!(fixture.send(PAYLOAD).await?, id);
-                    assert_eq!(
-                        fixture.event().await?,
-                        ClientEvent::Acknowledged {
-                            message_id: id,
-                            cleared: true
-                        }
-                    );
-                }
-                assert_eq!(fixture.observations.borrow().applied, WINDOW + 1);
-                send_control_message(
-                    &mut fixture.write,
-                    &ControlMessage::ControlMsg {
-                        message_id: 1,
-                        payload: PAYLOAD.into(),
-                    },
-                )
-                .await?;
-                let error = fixture.server_error().await?;
-                assert_eq!(
-                    error.downcast_ref::<ReliabilityError>(),
-                    Some(&ReliabilityError::RetiredMessage { message_id: 1 })
-                );
-                assert_eq!(fixture.observations.borrow().applied, WINDOW + 1);
-                Ok(())
-            })
-        },
-    )
-    .await
-}
-
-#[allow(clippy::disallowed_methods)]
-#[tokio::test]
-async fn close_with_pending_messages_reports_unconfirmed_and_cleans_up() -> ControlResult<()> {
-    run_case(
-        |_, _| None,
-        |fixture| {
-            Box::pin(async move {
-                fixture.send(PAYLOAD).await?;
-                fixture.wait_received(1).await?;
-                fixture.write.close().await?;
-                let error = match fixture.event().await {
-                    Err(error) => error,
-                    Ok(event) => panic!("expected unconfirmed close, got {event:?}"),
+                let Some(message) = server.next().await else {
+                    return Err("connection closed before notification ACK".into());
+                };
+                let Message::Text(text) = message? else {
+                    return Err("expected notification ACK JSON text".into());
                 };
                 assert_eq!(
-                    error.downcast_ref::<ReliabilityError>(),
-                    Some(&ReliabilityError::ConnectionClosed { pending: 1 })
+                    serde_json::from_str::<ControlMessage>(&text)?,
+                    ControlMessage::ControlAck { message_id }
                 );
-                assert_eq!(fixture.sender.pending_len(), 0);
-                assert_eq!(fixture.sender.next_deadline(), None);
-                fixture
-                    .connections
-                    .join_next()
-                    .await
-                    .expect("connection task must exist")??;
-                fixture.assert_registry_empty().await;
-                Ok(())
-            })
-        },
-    )
-    .await
+            }
+            server.close(None).await?;
+            Ok::<_, Box<dyn std::error::Error + Send + Sync>>(())
+        };
+        tokio::try_join!(client, server)?;
+        Ok(())
+    })
+    .await?
 }
 
-#[allow(clippy::disallowed_methods)]
 #[tokio::test]
-async fn cancelled_receive_clears_pending_and_server_shutdown_releases_handler() -> ControlResult<()>
-{
-    run_case(
-        |_, _| None,
-        |fixture| {
-            Box::pin(async move {
-                fixture.send(PAYLOAD).await?;
-                fixture.wait_received(1).await?;
-                assert!(timeout(Duration::ZERO, fixture.event()).await.is_err());
-                assert_eq!(fixture.sender.pending_len(), 0);
-                assert_eq!(fixture.sender.next_deadline(), None);
-                fixture.connections.shutdown().await;
-                assert!(fixture.handler_lifetime.upgrade().is_none());
-                let registry = fixture.peers.lock().await;
-                // Cancellation drops reliability state and the queue receiver. Async
-                // registry pruning remains the existing handler's normal/error cleanup.
-                assert!(
-                    registry
-                        .values()
-                        .flatten()
-                        .all(tokio::sync::mpsc::UnboundedSender::is_closed)
-                );
-                Ok(())
-            })
-        },
-    )
-    .await
-}
-
-#[allow(clippy::disallowed_methods)]
-#[tokio::test]
-async fn oversized_network_message_is_rejected_before_processing() -> ControlResult<()> {
-    run_case(
-        |id, _| Some(id),
-        |fixture| {
-            Box::pin(async move {
-                let text = serde_json::to_string(&ControlMessage::ControlMsg {
+async fn client_rejects_invalid_input_and_reused_notifications_before_processing()
+-> ControlResult<()> {
+    run_case(|h| {
+        Box::pin(async move {
+            let frames = [
+                Message::Binary(vec![1]),
+                Message::Text("{".into()),
+                Message::Text(serde_json::to_string(&registration(
+                    "server", "channel", 7,
+                ))?),
+                Message::Text(serde_json::to_string(&ControlMessage::Broadcast {
+                    request_id: 1,
+                    payload: PAYLOAD.into(),
+                })?),
+                Message::Text(serde_json::to_string(&ControlMessage::ControlAck {
                     message_id: 1,
-                    payload: "A".repeat(MAX_MESSAGE_BYTES),
-                })?;
-                assert!(text.len() > MAX_MESSAGE_BYTES);
-                fixture.write.send(Message::Text(text)).await?;
-                let error = fixture.server_error().await?;
-                assert!(matches!(
-                    error.downcast_ref::<WsError>(),
-                    Some(WsError::Capacity(_))
-                ));
-                assert_eq!(fixture.observations.borrow().applied, 0);
-                Ok(())
-            })
-        },
-    )
+                })?),
+                Message::Text(serde_json::to_string(&ControlMessage::ControlMsg {
+                    message_id: 0,
+                    payload: PAYLOAD.into(),
+                })?),
+                Message::Text(serde_json::to_string(&ControlMessage::ControlMsg {
+                    message_id: 2,
+                    payload: PAYLOAD.into(),
+                })?),
+            ];
+            for frame in frames {
+                let mut peer = h.connect().await?;
+                peer.join("server", "channel").await?;
+                let handle = h.registry.lock().await[&channel_key("server", "channel")][0].clone();
+                handle.send(frame)?;
+                assert!(peer.event().await.is_err());
+                assert_eq!(peer.processed.len(), 0);
+                close_socket(&mut peer.write, Some(&ReliabilityError::Closed)).await?;
+                h.result(peer.index).await?;
+            }
+            let mut peer = h.connect().await?;
+            peer.join("server", "channel").await?;
+            let handle = h.registry.lock().await[&channel_key("server", "channel")][0].clone();
+            let message = Message::Text(serde_json::to_string(&ControlMessage::ControlMsg {
+                message_id: 1,
+                payload: PAYLOAD.into(),
+            })?);
+            handle.send(message.clone())?;
+            assert_eq!(peer.event().await?, ClientEvent::Received { message_id: 1 });
+            handle.send(message)?;
+            assert!(peer.event().await.is_err());
+            assert_eq!(peer.processed.len(), 1);
+            close_socket(&mut peer.write, Some(&ReliabilityError::Closed)).await?;
+            h.result(peer.index).await
+        })
+    })
     .await
 }
 
-#[allow(clippy::disallowed_methods)]
 #[tokio::test]
-async fn graceful_close_after_ack_ends_the_production_receive_loop() -> ControlResult<()> {
-    run_case(
-        |id, _| Some(id),
-        |fixture| {
-            Box::pin(async move {
-                fixture.send(PAYLOAD).await?;
-                fixture.event().await?;
-                fixture.write.close().await?;
-                assert_eq!(fixture.event().await?, ClientEvent::Closed);
-                let Err(error) = fixture.event().await else {
-                    panic!("closed connection must not be reused")
-                };
-                assert_eq!(
-                    error.downcast_ref::<ReliabilityError>(),
-                    Some(&ReliabilityError::Closed)
-                );
-                fixture
-                    .connections
-                    .join_next()
-                    .await
-                    .expect("connection task must exist")??;
-                fixture.assert_registry_empty().await;
-                Ok(())
-            })
-        },
-    )
+async fn ready_traffic_cannot_hide_an_expired_request_deadline() -> ControlResult<()> {
+    run_case(|h| {
+        Box::pin(async move {
+            let mut peer = h.connect().await?;
+            peer.join("server", "channel").await?;
+            peer.send(PAYLOAD).await?;
+            // Read an actual result from the socket, then leave it ready for the
+            // production transition while advancing the confirmation deadline.
+            let frame = peer.read.next().await.expect("broadcast result")?;
+            let mut ready = futures_util::stream::iter([Ok(frame)]).chain(&mut peer.read);
+            peer.time.send_replace(peer.clock.now() + ACK_TIMEOUT);
+            let error = receive_event(
+                &mut peer.write,
+                &mut ready,
+                &mut peer.state,
+                &mut peer.clock,
+                &mut |_, _| Ok(()),
+            )
+            .await
+            .expect_err("expired request takes priority");
+            assert_eq!(
+                error.downcast_ref::<ReliabilityError>(),
+                Some(&ReliabilityError::Unconfirmed { message_id: 2 })
+            );
+            close_socket(&mut peer.write, Some(&ReliabilityError::Closed)).await?;
+            h.result(peer.index).await
+        })
+    })
     .await
 }
 
-#[allow(clippy::disallowed_methods)]
 #[tokio::test]
-async fn malformed_ack_clears_pending_before_returning_the_parse_error() -> ControlResult<()> {
-    run_case(
-        |_, _| None,
-        |fixture| {
-            Box::pin(async move {
-                fixture.send(PAYLOAD).await?;
-                fixture.wait_received(1).await?;
-                {
-                    let registry = fixture.peers.lock().await;
-                    let senders = registry
-                        .get(&channel_key("reliable-server", "reliable-channel"))
-                        .expect("JoinControl must register this connection");
-                    senders[0].send(Message::Text("{".into()))?;
-                }
-                let Err(error) = fixture.event().await else {
-                    panic!("malformed ACK must fail")
-                };
-                assert!(error.downcast_ref::<serde_json::Error>().is_some());
-                assert_eq!(fixture.sender.pending_len(), 0);
-                assert_eq!(fixture.sender.next_deadline(), None);
-                fixture.finish().await
-            })
-        },
-    )
+async fn websocket_enforces_real_frame_and_message_limits() -> ControlResult<()> {
+    run_case(|h| {
+        Box::pin(async move {
+            let mut peer = h.connect().await?;
+            peer.join("server", "channel").await?;
+            peer.write
+                .send(Message::Text(
+                    "a".repeat(super::reliability::MAX_MESSAGE_BYTES + 1),
+                ))
+                .await?;
+            let error = h.result(peer.index).await.expect_err("oversized frame");
+            assert!(matches!(
+                error.downcast_ref::<tokio_tungstenite::tungstenite::Error>(),
+                Some(tokio_tungstenite::tungstenite::Error::Capacity(_))
+            ));
+            assert!(h.registry.lock().await.is_empty());
+            Ok(())
+        })
+    })
     .await
+}
+
+#[tokio::test]
+async fn cancelling_client_receive_closes_state_and_releases_pending() -> ControlResult<()> {
+    timeout(std::time::Duration::from_secs(10), async {
+        let (client, mut server) = socket_pair().await?;
+        let (mut write, mut read) = client.split();
+        let mut state = ClientState::default();
+        let mut clock = Clock::default();
+        state
+            .join(&mut write, &registration("server", "channel", 7), &clock)
+            .await?;
+        let _ = server.next().await.expect("registration request")?;
+        assert!(
+            timeout(
+                std::time::Duration::ZERO,
+                receive_event(
+                    &mut write,
+                    &mut read,
+                    &mut state,
+                    &mut clock,
+                    &mut |_, _| Ok(()),
+                )
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(state.sender.pending_len(), 0);
+        assert!(state.sender.ensure_open().is_err());
+        close_socket(&mut write, Some(&ReliabilityError::Closed)).await?;
+        assert!(matches!(
+            server.next().await.expect("close frame")?,
+            Message::Close(_)
+        ));
+        Ok(())
+    })
+    .await?
 }

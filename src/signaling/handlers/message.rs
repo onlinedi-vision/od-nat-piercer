@@ -61,7 +61,7 @@ pub async fn handle_message(
             }
 
             _ => {
-                println!("Unknown/Bad packet from {}: {}", src, msg.trim());
+                println!("Unknown/bad UDP packet from {src}: {} bytes", msg.len());
             }
         }
     }

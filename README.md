@@ -3,13 +3,19 @@
 A **UDP NAT traversal protocol** and Rust implementation being built for Online
 Division voice channels, with video and screen sharing as longer-term goals.
 
-It uses NAT probing and UDP hole punching to attempt direct connections between
-peers behind routers, with relay fallback when a direct path is unavailable.
+It uses NAT probing and UDP hole punching to attempt UDP connections between
+peers behind routers. Eligible participants can forward traffic for their
+channel; server relay provides fallback for paths that need it.
 
 ## The goal
 
 > Make voice channels fast, secure, and dependable across real networks, using
-> direct UDP connections when possible and deliberate relay fallback when needed.
+> direct UDP paths and participant relays where usable, with deliberate server
+> relay fallback when needed.
+
+Keep the implementation small and clear, with short functions and mechanisms
+justified by current requirements. Resource efficiency must preserve security,
+correctness, and predictable failures.
 
 The intended product is a reusable Rust transport and security runtime embedded
 in the Online Division client. It should establish connections, recover from
@@ -28,12 +34,13 @@ between those boundaries.
 | **Client / endpoint** | Runs on a participant's device, communicates with the signaling server, and sends and receives peer traffic over UDP. |
 | **Signaling server** | Groups participants into servers and channels, shares peer addresses, and coordinates relay selection. |
 | **UDP NAT traversal** | Uses NAT probes and UDP hole punching to attempt direct connections between peers behind routers. |
-| **Reliable CONTROL** | Carries client-to-server JSON control messages over WebSocket, with acknowledgments, bounded retries, and duplicate suppression per connection. |
-| **Relay fallback** | Forwards traffic through a participant or server when a direct connection is unavailable. |
+| **CONTROL** | Broadcasts JSON control payloads within a channel over WebSocket, with typed request results, recipient processing ACKs, and bounded failure without retransmission. |
+| **Participant relay** | An eligible channel participant forwards traffic to other participants. |
+| **Server relay fallback** | Forwards traffic for participants whose paths require the server, or when no participant is eligible to relay. |
 
 CONTROL supports coordination between endpoints and the server. The UDP path
-is the foundation for future media traffic. Today, the prototype exchanges
-demonstration CONTROL payloads and terminal text; audio integration and transport
+is the foundation for future media traffic. Today, the prototype supports
+confirmed CONTROL exchanges and terminal text; audio integration and transport
 security remain to be implemented.
 
 ## NAT detection and relay fallback
@@ -44,6 +51,12 @@ classifies the results as cone-like, symmetric-like, or unknown.
 
 When a client is classified as symmetric, the prototype skips UDP hole punching
 and relies on server relaying, so traffic can follow an indirect path instead.
+
+For a channel with an eligible participant, relay selection chooses the first
+eligible user in channel order and introduces the other direct peers to that
+participant. Server fallback can also be requested after direct connectivity
+fails. The current routing and relay handover still need lifecycle work before
+they can support dependable voice calls.
 
 These classifications are heuristic: they do not identify every NAT behavior or
 guarantee direct connectivity. A symmetric classification guides the current
@@ -61,15 +74,22 @@ Implemented so far:
 - UDP signaling, channel membership tracking, and peer discovery.
 - Heuristic NAT probing, UDP hole punching, and basic direct peer communication.
 - Prototype participant and server relay paths for terminal text traffic.
-- JSON CONTROL messages over WebSocket, with pending-message tracking, matching
-  acknowledgments, bounded retries, and duplicate suppression per connection.
+- JSON CONTROL messages over WebSocket, with explicit registration/broadcast
+  results, strict consecutive IDs, processing ACKs, and finite waits without retries.
+- Channel-scoped CONTROL broadcast, independent recipient limits, and partial
+  queue-admission reports when a recipient cannot keep up.
 - Unit tests and real localhost WebSocket integration coverage for CONTROL
   delivery, failure handling, message limits, and cleanup.
 
-The current client sends a demonstration CONTROL payload to the server. Its ACK
-confirms processing by that server on the current connection; it does not
-confirm delivery to other participants. CONTROL broadcast is still to be
-implemented.
+The client registers its CONTROL connection, then processes and acknowledges
+server messages. Explicitly submitted CONTROL messages are forwarded to the
+other registered connections in the same channel.
+The broadcast result reports how many copies were queued or could not be queued; it
+does not confirm that every recipient processed the payload. Each recipient
+confirms its own processing separately. A saturated recipient's CONTROL
+connection closes without disconnecting healthy senders or declaring an
+application departure. Automated tests exercise this broadcast path; actual
+voice control operations remain future work.
 
 Signaling currently uses plaintext UDP and `ws://` without participant
 authentication. Production signaling protection, peer verification, and media
@@ -77,8 +97,8 @@ encryption remain to be implemented.
 
 ## What remains to build
 
-- Complete CONTROL broadcast and consistent membership, routing, disconnect,
-  and shutdown behavior.
+- Establish consistent membership, routing, disconnect, and shutdown behavior,
+  including reconnect and control-state recovery.
 - Add binary media transport and expose a reusable session runtime for the
   client application.
 - Integrate audio from `od-client` for the first controlled development voice
@@ -87,7 +107,8 @@ encryption remain to be implemented.
   and route migration.
 - Secure production CONTROL/signaling and media, including identity binding,
   authorization, replay protection, and rejection of security downgrades.
-- Evaluate optional group key management and end-to-end media encryption.
+- Implement reviewed group security and end-to-end media encryption before
+  production release.
 - Validate security, latency, resource usage, recovery, and multi-user behavior
   before production readiness.
 
@@ -97,8 +118,7 @@ and screen sharing are future uses of the same transport foundation.
 
 ## Try the local prototype
 
-Use a controlled development environment. Building requires Rust/Cargo and the
-native build tools needed by the vendored OpenSSL dependency.
+Use a controlled development environment. Building requires Rust/Cargo and a native toolchain.
 
 From the repository root, build the server and client:
 
@@ -149,8 +169,8 @@ CONTROL prototype. Stop each process with `Ctrl+C` when finished.
   terminal messages, and current limitations.
 - [Signaling server guide](docs/doc_signaling_server.md): listeners, membership,
   relay selection, and UDP commands.
-- [Reliable CONTROL guide](docs/doc_control.md): JSON messages, ACKs, retries,
-  duplicate handling, and connection limits.
+- [CONTROL guide](docs/doc_control.md): JSON requests/results, processing ACKs,
+  strict IDs, finite failure, and connection limits.
 - [Local testing guide](docs/doc_test_od_nat_piercer.md): a two-client example,
   expected events, automated tests, and troubleshooting.
 
@@ -169,5 +189,5 @@ cargo test --lib control::
 ```
 
 The CONTROL integration tests use short-lived localhost connections and
-controlled retry deadlines. A localhost run does not establish behavior across
+controlled confirmation deadlines. A localhost run does not establish behavior across
 real NATs or measure voice quality or production capacity.

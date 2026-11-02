@@ -1,8 +1,8 @@
 use crate::{
-    client::structures::{NatKind, PeerInfo},
+    client::structures::PeerInfo,
     proto::control_text::{
-        MSG_DATA, MSG_DIRECT, MSG_HOLE_PUNCH, MSG_MODE, MSG_NAT_SEEN, MSG_PING, MSG_PONG,
-        MSG_RELAY, MSG_SERVER_RELAY, MSG_USER_LEFT, MSG_WELCOME,
+        MSG_DATA, MSG_DIRECT, MSG_HOLE_PUNCH, MSG_MODE, MSG_PING, MSG_PONG, MSG_RELAY,
+        MSG_SERVER_RELAY, MSG_USER_LEFT, MSG_WELCOME,
     },
 };
 use std::{
@@ -62,7 +62,6 @@ fn handle_mode_direct(
                 created_at: Instant::now(),
                 use_server_relay: false,
                 relay_requested: false,
-                nat_kind: NatKind::Unknown,
             });
             println!("Added peer {username} with addr {addr_str}");
         }
@@ -78,18 +77,6 @@ fn handle_user_left(parts: &[&str], peers: &Arc<Mutex<Vec<PeerInfo>>>) -> std::i
     guard.retain(|p| p.username != username);
     println!("[CLIENT:user] {username} left, removed from list");
     Ok(())
-}
-
-fn handle_unrecognized_command(line: &str) {
-    if line != MSG_PING && line != MSG_HOLE_PUNCH {
-        return;
-    }
-
-    if line.starts_with(&format!("{MSG_NAT_SEEN} ")) {
-        return;
-    }
-
-    println!("Unhandled control line: {line}");
 }
 
 /// Handles a mode-related control message.
@@ -150,10 +137,10 @@ pub fn handle_mode_line(
             }
 
             MSG_DIRECT if parts.len() >= 4 => handle_mode_direct(&parts, peers, me)?,
-            _ => handle_unrecognized_command(line),
+            _ => {}
         },
         MSG_USER_LEFT if parts.len() >= 2 => handle_user_left(&parts, peers)?,
-        _ => handle_unrecognized_command(line),
+        _ => {}
     }
     Ok(())
 }

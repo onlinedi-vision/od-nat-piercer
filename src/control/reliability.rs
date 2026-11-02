@@ -1,42 +1,31 @@
-//! Connection-scoped CONTROL reliability
+//! Send once, match a bounded confirmation, or fail explicitly.
 
-use std::{
-    collections::{BTreeMap, VecDeque},
-    error::Error,
-    fmt,
-    future::pending,
-    time::Duration,
-};
+use std::{collections::BTreeMap, error::Error, fmt, future::pending, time::Duration};
 
 use futures_util::{Sink, SinkExt};
-use openssl::sha::sha256;
 use tokio::time::{Instant, timeout};
 use tokio_tungstenite::tungstenite::{Error as WsError, Message, protocol::WebSocketConfig};
 
-use super::messages::ControlMessage;
+use super::{messages::ControlMessage, recipient::CapacityReservation};
 
 pub(super) type ControlResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
 
-// Initial policy, not measured capacity or latency guarantees. Both endpoints
-// must agree on the ID window; it is not negotiated by the current wire format.
+// Provisional development policy, not measured production capacity.
 pub(super) const WINDOW: usize = 32;
-pub(super) const MAX_PENDING_BYTES: usize = 4 * 1024 * 1024;
-pub(super) const MAX_MESSAGE_BYTES: usize = 1024 * 1024;
-pub(super) const ACK_TIMEOUT: Duration = Duration::from_secs(2);
+pub(super) const MAX_MESSAGE_BYTES: usize = 8 * 1024;
+pub(super) const ACK_TIMEOUT: Duration = Duration::from_secs(5);
+pub(super) const REGISTRATION_TIMEOUT: Duration = Duration::from_secs(5);
 pub(super) const WRITE_TIMEOUT: Duration = Duration::from_secs(2);
-const MAX_ATTEMPTS: u8 = 4;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum ReliabilityError {
     WindowFull,
-    PendingBytesFull,
     MessageTooLarge,
     IdExhausted,
     Closed,
     WriteTimedOut,
-    RetryExhausted {
+    Unconfirmed {
         message_id: u64,
-        attempts: u8,
     },
     ConnectionClosed {
         pending: usize,
@@ -45,43 +34,45 @@ pub(super) enum ReliabilityError {
         message_id: u64,
         expected: Option<u64>,
     },
-    ConflictingDuplicate {
-        message_id: u64,
-    },
-    RetiredMessage {
-        message_id: u64,
-    },
+    RegistrationTimedOut,
+    SlowConsumer,
+    Protocol(&'static str),
+    HandlerFailed,
 }
 
 impl fmt::Display for ReliabilityError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::WindowFull => f.write_str("CONTROL ID window is full; wait for acknowledgment"),
-            Self::PendingBytesFull => f.write_str("CONTROL pending serialized-data budget is full"),
-            Self::MessageTooLarge => f.write_str("serialized CONTROL message exceeds 1 MiB"),
-            Self::IdExhausted => f.write_str("CONTROL message IDs exhausted; IDs cannot wrap"),
-            Self::Closed => f.write_str("CONTROL reliability state is closed"),
-            Self::WriteTimedOut => f.write_str("CONTROL write timed out; delivery is unconfirmed"),
-            Self::RetryExhausted {
-                message_id,
-                attempts,
-            } => write!(
-                f,
-                "CONTROL {message_id} delivery unconfirmed after {attempts} attempts"
-            ),
-            Self::ConnectionClosed { pending } => write!(
-                f,
-                "CONTROL connection closed with {pending} unconfirmed messages"
-            ),
+            Self::WindowFull => f.write_str("CONTROL pending confirmation limit reached"),
+            Self::MessageTooLarge => f.write_str("serialized CONTROL message exceeds 8 KiB"),
+            Self::IdExhausted => f.write_str("CONTROL IDs exhausted; IDs cannot wrap"),
+            Self::Closed => f.write_str("CONTROL connection state is closed"),
+            Self::WriteTimedOut => f.write_str("CONTROL write timed out; delivery unconfirmed"),
+            Self::Unconfirmed { message_id } => {
+                write!(
+                    f,
+                    "CONTROL {message_id} delivery unconfirmed: confirmation timed out"
+                )
+            }
+            Self::ConnectionClosed { pending } => {
+                write!(
+                    f,
+                    "CONTROL connection closed; delivery unconfirmed for {pending} messages"
+                )
+            }
             Self::InvalidSequence {
                 message_id,
                 expected,
-            } => write!(f, "invalid CONTROL ID {message_id}; expected {expected:?}"),
-            Self::ConflictingDuplicate { message_id } => {
-                write!(f, "CONTROL ID {message_id} reused with different content")
+            } => {
+                write!(f, "invalid CONTROL ID {message_id}; expected {expected:?}")
             }
-            Self::RetiredMessage { message_id } => {
-                write!(f, "CONTROL ID {message_id} is outside retained history")
+            Self::RegistrationTimedOut => f.write_str("CONTROL registration timed out"),
+            Self::SlowConsumer => {
+                f.write_str("CONTROL recipient capacity exhausted; delivery unconfirmed")
+            }
+            Self::Protocol(reason) => write!(f, "CONTROL protocol error: {reason}"),
+            Self::HandlerFailed => {
+                f.write_str("CONTROL local handler failed; delivery unconfirmed")
             }
         }
     }
@@ -97,26 +88,102 @@ pub(super) fn websocket_config() -> WebSocketConfig {
     }
 }
 
-pub(super) fn encode(message: &ControlMessage) -> ControlResult<String> {
-    let text = serde_json::to_string(message)?;
-    if text.len() > MAX_MESSAGE_BYTES {
-        return Err(ReliabilityError::MessageTooLarge.into());
+pub(super) fn check_raw_size(bytes: usize) -> Result<(), ReliabilityError> {
+    if bytes > MAX_MESSAGE_BYTES {
+        Err(ReliabilityError::MessageTooLarge)
+    } else {
+        Ok(())
     }
+}
+
+pub(super) fn encode(message: &ControlMessage) -> ControlResult<String> {
+    match message {
+        ControlMessage::JoinControl {
+            server_id,
+            channel,
+            user,
+            ..
+        } => {
+            check_raw_size(
+                server_id
+                    .len()
+                    .saturating_add(channel.len())
+                    .saturating_add(user.len()),
+            )?;
+        }
+        ControlMessage::Broadcast { payload, .. } | ControlMessage::ControlMsg { payload, .. } => {
+            check_raw_size(payload.len())?;
+        }
+        _ => {}
+    }
+    let text = serde_json::to_string(message)?;
+    check_raw_size(text.len())?;
     Ok(text)
+}
+
+pub(super) async fn write_frame<S>(write: &mut S, frame: Message) -> ControlResult<()>
+where
+    S: Sink<Message, Error = WsError> + Unpin,
+{
+    timeout(WRITE_TIMEOUT, write.send(frame))
+        .await
+        .map_err(|_| ReliabilityError::WriteTimedOut)??;
+    Ok(())
 }
 
 pub(super) async fn write_text<S>(write: &mut S, text: String) -> ControlResult<()>
 where
     S: Sink<Message, Error = WsError> + Unpin,
 {
-    timeout(WRITE_TIMEOUT, write.send(Message::Text(text)))
+    write_frame(write, Message::Text(text)).await
+}
+
+// Tungstenite queues Pong when reading Ping; only its flush is our responsibility.
+pub(super) async fn flush_socket<S>(write: &mut S) -> ControlResult<()>
+where
+    S: Sink<Message, Error = WsError> + Unpin,
+{
+    timeout(WRITE_TIMEOUT, write.flush())
         .await
         .map_err(|_| ReliabilityError::WriteTimedOut)??;
     Ok(())
 }
 
-/// Tests can advance ACK deadlines explicitly, including over real `WebSockets`.
-/// Write timeout tests use Tokio's paused time separately.
+pub(super) async fn close_socket<S>(
+    write: &mut S,
+    failure: Option<&(dyn Error + Send + Sync + 'static)>,
+) -> ControlResult<()>
+where
+    S: Sink<Message, Error = WsError> + Unpin,
+{
+    use tokio_tungstenite::tungstenite::protocol::{CloseFrame, frame::coding::CloseCode};
+    let close = failure.map(|error| CloseFrame {
+        code: CloseCode::Policy,
+        reason: match error.downcast_ref::<ReliabilityError>() {
+            Some(ReliabilityError::HandlerFailed) => "CONTROL handler failed; delivery unconfirmed",
+            Some(ReliabilityError::SlowConsumer) => {
+                "CONTROL recipient capacity exhausted; delivery unconfirmed"
+            }
+            Some(ReliabilityError::RegistrationTimedOut) => "CONTROL registration timed out",
+            Some(ReliabilityError::Protocol(_) | ReliabilityError::InvalidSequence { .. }) => {
+                "CONTROL protocol error; delivery unconfirmed"
+            }
+            _ => "CONTROL connection failed; delivery unconfirmed",
+        }
+        .into(),
+    });
+    timeout(WRITE_TIMEOUT, async {
+        // Reading Close may already have queued tungstenite's reply. Even if
+        // another Close is rejected, flush that reply before dropping the sink.
+        let _ = write.send(Message::Close(close)).await;
+        write.close().await
+    })
+    .await
+    .map_err(|_| ReliabilityError::WriteTimedOut)??;
+    Ok(())
+}
+
+/// Tests advance deadlines explicitly, including over real `WebSockets`.
 #[derive(Default)]
 pub(super) enum Clock {
     #[default]
@@ -153,16 +220,45 @@ impl Clock {
     }
 }
 
+#[derive(Default)]
+pub(super) struct Sequence {
+    highest: u64,
+}
+
+impl Sequence {
+    pub(super) fn accept(&mut self, id: u64) -> Result<(), ReliabilityError> {
+        let expected = self.highest.checked_add(1);
+        if expected.is_none() {
+            return Err(ReliabilityError::IdExhausted);
+        }
+        if Some(id) != expected {
+            return Err(ReliabilityError::InvalidSequence {
+                message_id: id,
+                expected,
+            });
+        }
+        self.highest = id;
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Confirmation {
+    Join,
+    Broadcast,
+    Ack,
+    Rejection,
+}
+
 struct PendingMessage {
-    text: String,
-    attempts: u8,
-    deadline: Option<Instant>,
+    expected: Confirmation,
+    deadline: Instant,
+    _reservation: Option<CapacityReservation>,
 }
 
 pub(super) struct ReliableSender {
     next_id: Option<u64>,
     pending: BTreeMap<u64, PendingMessage>,
-    pending_bytes: usize,
     closed: bool,
 }
 
@@ -171,7 +267,6 @@ impl Default for ReliableSender {
         Self {
             next_id: Some(1),
             pending: BTreeMap::new(),
-            pending_bytes: 0,
             closed: false,
         }
     }
@@ -186,127 +281,66 @@ impl ReliableSender {
         }
     }
 
-    fn admit(&mut self, payload: &str) -> ControlResult<u64> {
-        self.ensure_open()?;
-        let id = self.next_id.ok_or(ReliabilityError::IdExhausted)?;
-        if self.pending.len() == WINDOW
-            || self
-                .pending
-                .first_key_value()
-                .is_some_and(|(&oldest, _)| id - oldest >= WINDOW as u64)
-        {
-            return Err(ReliabilityError::WindowFull.into());
-        }
-        // Avoid serializing arbitrarily large local input just to reject it.
-        if payload.len() > MAX_MESSAGE_BYTES {
-            return Err(ReliabilityError::MessageTooLarge.into());
-        }
-        let text = encode(&ControlMessage::ControlMsg {
-            message_id: id,
-            payload: payload.into(),
-        })?;
-        if text.len() > MAX_PENDING_BYTES - self.pending_bytes {
-            return Err(ReliabilityError::PendingBytesFull.into());
-        }
-        self.pending_bytes += text.len();
-        self.pending.insert(
-            id,
-            PendingMessage {
-                text,
-                attempts: 0,
-                deadline: None,
-            },
-        );
-        self.next_id = id.checked_add(1);
-        Ok(id)
-    }
-
-    pub(super) async fn send<S>(
+    pub(super) async fn send<S, F>(
         &mut self,
         write: &mut S,
-        payload: &str,
+        make_message: F,
+        expected: Confirmation,
+        reservation: Option<CapacityReservation>,
         clock: &Clock,
     ) -> ControlResult<u64>
     where
         S: Sink<Message, Error = WsError> + Unpin,
+        F: FnOnce(u64) -> ControlMessage,
     {
-        let id = self.admit(payload)?;
-        self.transmit(write, id, clock).await?;
+        self.check_deadlines(clock)?;
+        let id = self.next_id.ok_or(ReliabilityError::IdExhausted)?;
+        if self.pending.len() == WINDOW {
+            return Err(ReliabilityError::WindowFull.into());
+        }
+        // Local rejection happens before consuming an ID or closing the sender.
+        let text = encode(&make_message(id))?;
+        self.next_id = id.checked_add(1);
+        let mut guard = SenderGuard::new(self);
+        write_text(write, text).await?;
+        guard.sender.pending.insert(
+            id,
+            PendingMessage {
+                expected,
+                deadline: clock.now() + ACK_TIMEOUT,
+                _reservation: reservation,
+            },
+        );
+        guard.complete();
         Ok(id)
     }
 
-    async fn transmit<S>(&mut self, write: &mut S, id: u64, clock: &Clock) -> ControlResult<()>
-    where
-        S: Sink<Message, Error = WsError> + Unpin,
-    {
-        let mut guard = SenderGuard::new(self);
-        let message = guard
-            .sender
-            .pending
-            .get_mut(&id)
-            .ok_or(ReliabilityError::Closed)?;
-        write_text(write, message.text.clone()).await?;
-        message.attempts += 1;
-        // Start the ACK deadline after the write completes, not during a stall.
-        message.deadline = Some(clock.now() + ACK_TIMEOUT);
-        guard.complete();
+    pub(super) fn confirm(&mut self, id: u64, actual: Confirmation) -> ControlResult<bool> {
+        let Some(message) = self.pending.get(&id) else {
+            return Ok(false);
+        };
+        if actual != message.expected
+            && !(actual == Confirmation::Rejection && message.expected != Confirmation::Ack)
+        {
+            return Err(
+                ReliabilityError::Protocol("result type does not match pending request").into(),
+            );
+        }
+        self.pending.remove(&id);
+        Ok(true)
+    }
+
+    pub(super) fn check_deadlines(&mut self, clock: &Clock) -> ControlResult<()> {
+        self.ensure_open()?;
+        if let Some((&id, _)) = self.pending.iter().find(|(_, m)| m.deadline <= clock.now()) {
+            self.close();
+            return Err(ReliabilityError::Unconfirmed { message_id: id }.into());
+        }
         Ok(())
     }
 
-    pub(super) async fn retry_due<S>(
-        &mut self,
-        write: &mut S,
-        clock: &Clock,
-    ) -> ControlResult<usize>
-    where
-        S: Sink<Message, Error = WsError> + Unpin,
-    {
-        self.ensure_open()?;
-        let now = clock.now();
-        let due: Vec<u64> = self
-            .pending
-            .iter()
-            .filter_map(|(&id, message)| {
-                message
-                    .deadline
-                    .filter(|&deadline| deadline <= now)
-                    .map(|_| id)
-            })
-            .collect();
-        for &id in &due {
-            if self
-                .pending
-                .get(&id)
-                .is_some_and(|message| message.attempts == MAX_ATTEMPTS)
-            {
-                self.close();
-                return Err(ReliabilityError::RetryExhausted {
-                    message_id: id,
-                    attempts: MAX_ATTEMPTS,
-                }
-                .into());
-            }
-        }
-        for &id in &due {
-            self.transmit(write, id, clock).await?;
-        }
-        Ok(due.len())
-    }
-
-    pub(super) fn acknowledge(&mut self, id: u64) -> bool {
-        if let Some(message) = self.pending.remove(&id) {
-            self.pending_bytes -= message.text.len();
-            true
-        } else {
-            false
-        }
-    }
-
     pub(super) fn next_deadline(&self) -> Option<Instant> {
-        self.pending
-            .values()
-            .filter_map(|message| message.deadline)
-            .min()
+        self.pending.values().map(|message| message.deadline).min()
     }
 
     pub(super) fn pending_len(&self) -> usize {
@@ -315,13 +349,11 @@ impl ReliableSender {
 
     pub(super) fn close(&mut self) {
         self.pending.clear();
-        self.pending_bytes = 0;
         self.closed = true;
     }
 }
 
-/// Dropping an in-progress write/read operation terminates its reliability
-/// state: a cancelled write may have partially reached the WebSocket sink.
+/// A cancelled/failed socket transition cannot safely resume the same sender.
 pub(super) struct SenderGuard<'a> {
     pub(super) sender: &'a mut ReliableSender,
     completed: bool,
@@ -344,52 +376,6 @@ impl Drop for SenderGuard<'_> {
         if !self.completed {
             self.sender.close();
         }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum Receipt {
-    New,
-    Duplicate,
-}
-
-#[derive(Default)]
-pub(super) struct ReliableReceiver {
-    highest: u64,
-    recent: VecDeque<(u64, [u8; 32])>,
-}
-
-impl ReliableReceiver {
-    // Processing and committing a New receipt must be synchronous in the
-    // connection owner before awaiting an ACK write. This is not durable state.
-    pub(super) fn classify(&self, id: u64, payload: &str) -> Result<Receipt, ReliabilityError> {
-        let expected = self.highest.checked_add(1);
-        if Some(id) == expected {
-            return Ok(Receipt::New);
-        }
-        if id == 0 || id > self.highest {
-            return Err(ReliabilityError::InvalidSequence {
-                message_id: id,
-                expected,
-            });
-        }
-        let (_, fingerprint) = self
-            .recent
-            .iter()
-            .find(|(seen, _)| *seen == id)
-            .ok_or(ReliabilityError::RetiredMessage { message_id: id })?;
-        if *fingerprint != sha256(payload.as_bytes()) {
-            return Err(ReliabilityError::ConflictingDuplicate { message_id: id });
-        }
-        Ok(Receipt::Duplicate)
-    }
-
-    pub(super) fn commit(&mut self, id: u64, payload: &str) {
-        self.highest = id;
-        if self.recent.len() == WINDOW {
-            self.recent.pop_front();
-        }
-        self.recent.push_back((id, sha256(payload.as_bytes())));
     }
 }
 

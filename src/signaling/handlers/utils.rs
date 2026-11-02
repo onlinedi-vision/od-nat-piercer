@@ -5,18 +5,6 @@ use crate::{
 use std::{net::SocketAddr, sync::Arc, time::Instant};
 use tokio::{net::UdpSocket, sync::Mutex};
 
-pub async fn get_remaining_users(
-    state: &Arc<Mutex<ServerMap>>,
-    server_id: &str,
-    channel_name: &str,
-) -> Vec<User> {
-    let st = state.lock().await;
-    st.get(server_id)
-        .and_then(|channels| channels.get(channel_name))
-        .map(|channel| channel.users.clone())
-        .unwrap_or_default()
-}
-
 pub async fn update_existing_user(
     channel: &mut Channel,
     user_name: &str,

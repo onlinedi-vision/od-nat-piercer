@@ -61,28 +61,6 @@ pub async fn send_relay_mode_to_relay(socket: &Arc<UdpSocket>, relay_user: &User
     }
 }
 
-pub async fn notify_existing_users_about_new_user(
-    socket: &Arc<UdpSocket>,
-    users: &[User],
-    new_user_name: &str,
-    new_user_addr: SocketAddr,
-) {
-    for user in users {
-        if user.addr != new_user_addr {
-            let msg_to_existing =
-                format!("{MSG_MODE} {MSG_DIRECT} {new_user_name} {new_user_addr}\n");
-            if let Err(e) = socket.send_to(msg_to_existing.as_bytes(), user.addr).await {
-                eprintln!("Failed to notify {}: {}", user.name, e);
-            }
-
-            let msg_to_new = format!("{} {} {} {}\n", MSG_MODE, MSG_DIRECT, user.name, user.addr);
-            if let Err(e) = socket.send_to(msg_to_new.as_bytes(), new_user_addr).await {
-                eprintln!("Failed to notify new user: {e}");
-            }
-        }
-    }
-}
-
 pub async fn promote_new_relay(socket: &Arc<UdpSocket>, new_relay: &User) {
     if let Err(e) = socket
         .send_to(
@@ -161,17 +139,15 @@ pub async fn notify_all_about_departure(
 pub async fn handle_connect_notifications(
     server_id: &str,
     channel_name: &str,
-    user_name: &str,
-    src_addr: SocketAddr,
     users_to_notify: Channel,
     socket: Arc<UdpSocket>,
     state: Arc<Mutex<ServerMap>>,
 ) {
+    // A lone new member has no peers to notify. Its mode was already sent
+    // during insertion.
     if users_to_notify.users.len() > 1 {
         handle_multiple_users_scenario(server_id, channel_name, &users_to_notify, &socket, &state)
             .await;
-    } else {
-        handle_single_user_scenario(&socket, &users_to_notify, user_name, src_addr).await;
     }
 }
 
@@ -242,15 +218,6 @@ pub async fn handle_multiple_users_scenario(
             ch.relay = None;
         }
     }
-}
-
-pub async fn handle_single_user_scenario(
-    socket: &Arc<UdpSocket>,
-    users_to_notify: &Channel,
-    user_name: &str,
-    src_addr: SocketAddr,
-) {
-    notify_existing_users_about_new_user(socket, &users_to_notify.users, user_name, src_addr).await;
 }
 
 pub async fn handle_relay_transition(

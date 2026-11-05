@@ -98,16 +98,7 @@ pub async fn handle_connect_message(
         return;
     }
 
-    handle_connect_notifications(
-        &server_id,
-        &channel_name,
-        &user_name,
-        src_addr,
-        users_to_notify,
-        socket,
-        state,
-    )
-    .await;
+    handle_connect_notifications(&server_id, &channel_name, users_to_notify, socket, state).await;
 }
 
 #[test]
@@ -115,4 +106,59 @@ fn welcome_payload_uses_machine_readable_format() {
     let payload = welcome_payload(123456789, 42);
 
     assert_eq!(payload, "WELCOME 123456789 42\n");
+}
+
+#[allow(clippy::disallowed_methods)] // Test assertions and tokio::test use expect.
+#[tokio::test]
+async fn first_cone_member_receives_relay_mode_and_matching_welcome() -> std::io::Result<()> {
+    let exchange = async {
+        let server = Arc::new(UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, 0)).await?);
+        let client = UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, 0)).await?;
+        let state = Arc::new(Mutex::new(ServerMap::new()));
+        handle_connect_message(
+            &[
+                "CONNECT",
+                "test-server",
+                "test-channel",
+                "test-peer",
+                "CONE",
+            ],
+            client.local_addr()?,
+            Arc::clone(&server),
+            Arc::clone(&state),
+        )
+        .await;
+        let mut packets = Vec::new();
+        for _ in 0..2 {
+            let mut buffer = [0u8; 256];
+            let (len, source) = client.recv_from(&mut buffer).await?;
+            assert_eq!(source, server.local_addr()?);
+            packets.push(buffer[..len].to_vec());
+        }
+        assert!(packets.iter().any(|packet| packet == b"MODE RELAY\n"));
+        let (header, payload) = packets
+            .iter()
+            .find_map(|packet| packet::decode(packet))
+            .expect("join must emit framed WELCOME");
+        let registry = state.lock().await;
+        let channel = &registry["test-server"]["test-channel"];
+        assert_eq!(channel.users.len(), 1);
+        assert_eq!(channel.relay.as_deref(), Some("test-peer"));
+        assert_eq!(header.kind, packet::Kind::Control);
+        assert_eq!(header.channel_id, channel.channel_id);
+        assert_eq!(header.dst_peer_id, channel.users[0].peer_id);
+        assert_eq!(
+            std::str::from_utf8(payload).expect("WELCOME text"),
+            format!(
+                "WELCOME {} {}\n",
+                channel.channel_id, channel.users[0].peer_id
+            )
+        );
+        Ok(())
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(5), exchange)
+        .await
+        .map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::TimedOut, "local join did not finish")
+        })?
 }

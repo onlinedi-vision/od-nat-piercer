@@ -2,18 +2,17 @@ use std::thread;
 
 use futures_util::{Sink, Stream, StreamExt};
 use tokio_tungstenite::{
-    connect_async_with_config,
+    WebSocketStream, connect_async_with_config,
     tungstenite::{Error as WsError, Message},
 };
 
-use crate::control::messages::ControlMessage;
-
-use super::reliability::{
-    Clock, ControlResult, ReliabilityError, ReliableSender, SenderGuard, encode, websocket_config,
-    write_text,
+use super::{
+    messages::{BroadcastReport, ControlMessage, RequestRejection},
+    reliability::{
+        Clock, Confirmation, ControlResult, ReliabilityError, ReliableSender, SenderGuard,
+        Sequence, check_raw_size, close_socket, encode, flush_socket, websocket_config, write_text,
+    },
 };
-
-const TEST_PAYLOAD_LEN: usize = 100 * 1024;
 
 pub fn start_control_client(
     signaling_ip: String,
@@ -30,7 +29,6 @@ pub fn start_control_client(
                 return;
             }
         };
-
         rt.block_on(async move {
             if let Err(e) =
                 run_control_client(signaling_ip, server_id, channel, user, peer_id).await
@@ -49,47 +47,145 @@ async fn run_control_client(
     peer_id: u32,
 ) -> ControlResult<()> {
     let ws_url = format!("ws://{signaling_ip}:2133");
-
     let (ws_stream, _) =
         connect_async_with_config(&ws_url, Some(websocket_config()), false).await?;
     println!("Connected to control WebSocket server at {ws_url}");
+    run_control_session(
+        ws_stream,
+        ControlMessage::JoinControl {
+            request_id: 1,
+            server_id,
+            channel,
+            user,
+            peer_id,
+        },
+    )
+    .await
+}
 
-    let (mut write, mut read) = ws_stream.split();
-
-    let join = ControlMessage::JoinControl {
-        server_id,
-        channel,
-        user,
-        peer_id,
-    };
-
-    send_control_message(&mut write, &join).await?;
-    println!("Sent JoinControl on reliable control plane.");
-
-    let test_payload = "A".repeat(TEST_PAYLOAD_LEN);
-    let payload_len = test_payload.len();
-
-    let mut sender = ReliableSender::default();
-    let mut clock = Clock::default();
-    let message_id = sender.send(&mut write, &test_payload, &clock).await?;
-    println!("Sent ControlMsg message_id={message_id} payload_len={payload_len}");
-
-    loop {
-        match receive_or_retry(&mut write, &mut read, &mut sender, &mut clock).await? {
-            ClientEvent::Acknowledged {
-                message_id,
-                cleared: true,
-            } => {
-                println!("Received ControlAck for pending message_id={message_id}");
+// Shared by the CLI and localhost tests. No synthetic startup broadcast.
+pub(super) async fn run_control_session<S>(
+    mut socket: WebSocketStream<S>,
+    join: ControlMessage,
+) -> ControlResult<()>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let result = async {
+        let (mut write, mut read) = (&mut socket).split();
+        let mut state = ClientState::default();
+        let mut clock = Clock::default();
+        state.join(&mut write, &join, &clock).await?;
+        loop {
+            match receive_event(
+                &mut write,
+                &mut read,
+                &mut state,
+                &mut clock,
+                &mut |id, payload| {
+                    println!(
+                        "Processed server CONTROL message_id={id} payload_len={}",
+                        payload.len()
+                    );
+                    Ok(())
+                },
+            )
+            .await?
+            {
+                ClientEvent::Closed => return Ok(()),
+                ClientEvent::Rejected { reason, .. } => {
+                    return Err(format!("CONTROL request rejected: {reason:?}").into());
+                }
+                ClientEvent::Joined { .. } => println!("CONTROL registration accepted."),
+                _ => {}
             }
-            ClientEvent::Closed => break,
-            ClientEvent::Acknowledged { cleared: false, .. }
-            | ClientEvent::Retried { .. }
-            | ClientEvent::Other => {}
         }
     }
+    .await;
+    let _ = close_socket(&mut socket, result.as_ref().err().map(AsRef::as_ref)).await;
+    result
+}
 
-    Ok(())
+#[derive(Default)]
+pub(super) struct ClientState {
+    pub(super) sender: ReliableSender,
+    receiver: Sequence,
+    registered: bool,
+}
+
+impl ClientState {
+    pub(super) async fn join<S>(
+        &mut self,
+        write: &mut S,
+        join: &ControlMessage,
+        clock: &Clock,
+    ) -> ControlResult<u64>
+    where
+        S: Sink<Message, Error = WsError> + Unpin,
+    {
+        let ControlMessage::JoinControl {
+            server_id,
+            channel,
+            user,
+            ..
+        } = join
+        else {
+            return Err(ReliabilityError::Protocol("expected local registration").into());
+        };
+        check_raw_size(
+            server_id
+                .len()
+                .saturating_add(channel.len())
+                .saturating_add(user.len()),
+        )?;
+        self.sender
+            .send(
+                write,
+                |request_id| {
+                    let mut message = join.clone();
+                    if let ControlMessage::JoinControl { request_id: id, .. } = &mut message {
+                        *id = request_id;
+                    }
+                    message
+                },
+                Confirmation::Join,
+                None,
+                clock,
+            )
+            .await
+    }
+
+    // Used by real WebSocket tests; the CLI currently has no broadcast producer.
+    #[allow(dead_code)]
+    pub(super) async fn broadcast<S>(
+        &mut self,
+        write: &mut S,
+        payload: &str,
+        clock: &Clock,
+    ) -> ControlResult<u64>
+    where
+        S: Sink<Message, Error = WsError> + Unpin,
+    {
+        self.sender.check_deadlines(clock)?;
+        if !self.registered {
+            return Err(
+                ReliabilityError::Protocol("wait for JoinAccepted before broadcast").into(),
+            );
+        }
+        check_raw_size(payload.len())?;
+        self.sender
+            .send(
+                write,
+                |request_id| ControlMessage::Broadcast {
+                    request_id,
+                    payload: payload.into(),
+                },
+                Confirmation::Broadcast,
+                None,
+                clock,
+            )
+            .await
+    }
 }
 
 pub(super) async fn send_control_message<S>(
@@ -97,61 +193,132 @@ pub(super) async fn send_control_message<S>(
     message: &ControlMessage,
 ) -> ControlResult<()>
 where
-    S: Sink<Message, Error = tokio_tungstenite::tungstenite::Error> + Unpin,
+    S: Sink<Message, Error = WsError> + Unpin,
 {
     write_text(write, encode(message)?).await
 }
 
 #[derive(Debug, PartialEq, Eq)]
 pub(super) enum ClientEvent {
-    Acknowledged { message_id: u64, cleared: bool },
-    Retried { count: usize },
+    Joined {
+        request_id: u64,
+    },
+    Broadcast {
+        request_id: u64,
+        report: BroadcastReport,
+    },
+    Rejected {
+        request_id: u64,
+        reason: RequestRejection,
+    },
+    Received {
+        message_id: u64,
+    },
     Other,
     Closed,
 }
 
-/// One production receive/timer transition. The caller owns the socket and
-/// reliability state; cancellation of a transition clears and closes that state.
-pub(super) async fn receive_or_retry<S, R>(
+/// One socket-owner transition. Failure/cancellation clears pending state.
+pub(super) async fn receive_event<S, R, F>(
     write: &mut S,
     read: &mut R,
-    sender: &mut ReliableSender,
+    state: &mut ClientState,
     clock: &mut Clock,
+    process: &mut F,
 ) -> ControlResult<ClientEvent>
 where
     S: Sink<Message, Error = WsError> + Unpin,
     R: Stream<Item = Result<Message, WsError>> + Unpin,
+    F: FnMut(u64, &str) -> ControlResult<()>,
 {
-    sender.ensure_open()?;
-    let mut guard = SenderGuard::new(sender);
+    state.sender.check_deadlines(clock)?;
+    let mut guard = SenderGuard::new(&mut state.sender);
     let deadline = guard.sender.next_deadline();
-    let event = tokio::select! {
-        frame = read.next() => {
-            match frame.transpose()? {
-                None | Some(Message::Close(_)) => {
-                    let pending = guard.sender.pending_len();
-                    guard.sender.close();
-                    if pending != 0 {
-                        return Err(ReliabilityError::ConnectionClosed { pending }.into());
-                    }
-                    ClientEvent::Closed
-                }
-                Some(Message::Text(text)) => {
-                    match serde_json::from_str::<ControlMessage>(&text)? {
-                        ControlMessage::ControlAck { message_id } => ClientEvent::Acknowledged {
-                            message_id,
-                            cleared: guard.sender.acknowledge(message_id),
-                        },
-                        _ => ClientEvent::Other,
-                    }
-                }
-                Some(_) => ClientEvent::Other,
-            }
-        }
+    let frame = tokio::select! {
+        biased;
         () = clock.wait_until(deadline) => {
-            ClientEvent::Retried { count: guard.sender.retry_due(write, clock).await? }
+            guard.sender.check_deadlines(clock)?;
+            return Err(ReliabilityError::Protocol("confirmation timer woke early").into());
         }
+        frame = read.next() => frame.transpose()?,
+    };
+    let event = match frame {
+        None | Some(Message::Close(_)) => {
+            let pending = guard.sender.pending_len();
+            guard.sender.close();
+            if pending != 0 {
+                return Err(ReliabilityError::ConnectionClosed { pending }.into());
+            }
+            ClientEvent::Closed
+        }
+        Some(Message::Text(text)) => {
+            check_raw_size(text.len())?;
+            let message = serde_json::from_str(&text)?;
+            handle_message(
+                write,
+                guard.sender,
+                &mut state.receiver,
+                &mut state.registered,
+                message,
+                process,
+            )
+            .await?
+        }
+        Some(Message::Ping(_)) => {
+            flush_socket(write).await?;
+            ClientEvent::Other
+        }
+        Some(Message::Pong(_)) => ClientEvent::Other,
+        Some(_) => return Err(ReliabilityError::Protocol("expected JSON text").into()),
     };
     guard.complete();
     Ok(event)
+}
+
+async fn handle_message<S, F>(
+    write: &mut S,
+    sender: &mut ReliableSender,
+    receiver: &mut Sequence,
+    registered: &mut bool,
+    message: ControlMessage,
+    process: &mut F,
+) -> ControlResult<ClientEvent>
+where
+    S: Sink<Message, Error = WsError> + Unpin,
+    F: FnMut(u64, &str) -> ControlResult<()>,
+{
+    Ok(match message {
+        ControlMessage::JoinAccepted { request_id } => {
+            if !sender.confirm(request_id, Confirmation::Join)? {
+                return Ok(ClientEvent::Other);
+            }
+            *registered = true;
+            ClientEvent::Joined { request_id }
+        }
+        ControlMessage::BroadcastResult { request_id, report } => {
+            if !sender.confirm(request_id, Confirmation::Broadcast)? {
+                return Ok(ClientEvent::Other);
+            }
+            ClientEvent::Broadcast { request_id, report }
+        }
+        ControlMessage::RequestRejected { request_id, reason } => {
+            if !sender.confirm(request_id, Confirmation::Rejection)? {
+                return Ok(ClientEvent::Other);
+            }
+            ClientEvent::Rejected { request_id, reason }
+        }
+        ControlMessage::ControlMsg {
+            message_id,
+            payload,
+        } => {
+            if !*registered {
+                return Err(ReliabilityError::Protocol("notification before JoinAccepted").into());
+            }
+            receiver.accept(message_id)?;
+            process(message_id, &payload).map_err(|_| ReliabilityError::HandlerFailed)?;
+            send_control_message(write, &ControlMessage::ControlAck { message_id }).await?;
+            ClientEvent::Received { message_id }
+        }
+        _ => return Err(ReliabilityError::Protocol("message in wrong direction").into()),
+    })
 }

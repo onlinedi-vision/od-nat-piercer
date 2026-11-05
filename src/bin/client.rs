@@ -128,7 +128,6 @@ fn process_server_response(
     {
         return Ok(());
     }
-    println!("Server response:\n{response}");
     for line in response.lines() {
         let line = line.trim();
 
@@ -209,9 +208,8 @@ fn handle_recv_result(
                             payload.len()
                         );
 
-                        //temporarly: if payload is text, process as before
+                        // Current framed CONTROL uses the text command parser.
                         if let Ok(s) = std::str::from_utf8(payload) {
-                            println!("(setup) {MSG_CONTROL} payload: {}", s.trim());
                             try_handle_welcome(s, context.channel_id, context.my_peer_id);
                             if &src == context.server_socketaddr {
                                 if s.lines()
@@ -348,7 +346,6 @@ fn main_loop(
                         Kind::Control => {
                             println!("Got {MSG_CONTROL} {} bytes from {src}", payload.len());
                             if let Ok(s) = std::str::from_utf8(payload) {
-                                println!("{MSG_CONTROL} payload: {}", s.trim());
                                 try_handle_welcome(s, context.channel_id, context.my_peer_id);
 
                                 process_incoming_message(incoming, s, src)?;
@@ -448,7 +445,6 @@ fn main() -> std::io::Result<()> {
     let peers = Arc::new(Mutex::new(peers));
 
     let is_relay = Arc::new(Mutex::new(false));
-    let relay_started = Arc::new(Mutex::new(false));
 
     let send_via_server = Arc::new(AtomicBool::new(false)); //this client must send via server
     let channel_has_server_relays = Arc::new(AtomicBool::new(false)); //as relay, i should also mirror to serveri
@@ -507,7 +503,6 @@ fn main() -> std::io::Result<()> {
     start_relay_keepalive(
         socket.try_clone()?,
         Arc::clone(&peers),
-        Arc::clone(&relay_started),
         server_id.clone(),
         channel.clone(),
         signaling_addr.clone(),

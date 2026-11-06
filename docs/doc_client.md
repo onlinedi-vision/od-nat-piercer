@@ -89,7 +89,7 @@ prototype behavior; they are not production guarantees.
 
 ## Terminal messages and stopping
 
-Enter a short line in a client terminal to send legacy UDP text. The selected
+Enter a short line in a client terminal to send prototype UDP text. The selected
 route determines whether it goes to known peers or through the signaling server.
 This traffic is separate from reliable WebSocket CONTROL and has no application
 ACK/retry guarantee.

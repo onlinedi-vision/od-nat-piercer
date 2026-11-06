@@ -1,7 +1,8 @@
-The N.A.T. Piercer standard sets the following base rules for N.A.T. piercers:
+# Historical port proposal
 
-- N.A.T. Piercers SHOULD (or ARE EXPECTED to) run on port 1001
-  In this case we are expected to set the following environment variable for this program:
-```
-$ export NAT_PIERCER_PORT=1001
-```
+Port `1001` and the `NAT_PIERCER_PORT` environment variable belonged to an
+unimplemented proposal. They do not configure the current executables.
+
+The signaling server currently binds UDP ports `2131` and `2132` and WebSocket
+TCP port `2133`. The executables do not read `NAT_PIERCER_PORT`. See the
+[signaling server guide](docs/doc_signaling_server.md) for current usage.

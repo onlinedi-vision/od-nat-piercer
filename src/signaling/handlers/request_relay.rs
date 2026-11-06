@@ -7,11 +7,11 @@ use tokio::{net::UdpSocket, sync::Mutex};
 
 pub async fn handle_relay_request(
     parts: &[&str],
-    _src: SocketAddr,
+    src: SocketAddr,
     socket: Arc<UdpSocket>,
     state: Arc<Mutex<ServerMap>>,
 ) {
-    // Relay request <server_id> <channel> <username>
+    // Both path-failure reports and initial fallback requests use this policy.
     if parts.len() < 4 {
         return;
     }
@@ -19,18 +19,37 @@ pub async fn handle_relay_request(
     let channel_name = parts[2];
     let username = parts[3];
 
-    let mut st = state.lock().await;
-    if let Some(channels) = st.get_mut(server_id)
-        && let Some(channel) = channels.get_mut(channel_name)
-    {
-        // mark this user that he needs server relay
-        if let Some(user) = channel.users.iter_mut().find(|u| u.name == username) {
-            user.needs_server_relay = true;
+    let recipients: Vec<SocketAddr> = {
+        let mut st = state.lock().await;
+        let Some(channel) = st
+            .get_mut(server_id)
+            .and_then(|channels| channels.get_mut(channel_name))
+        else {
+            return;
+        };
+        let Some(relay_name) = channel.relay.as_deref() else {
+            return;
+        };
+        // Only the current registered relay can report another peer's path.
+        if relay_name == username
+            || !channel
+                .users
+                .iter()
+                .any(|user| user.name == relay_name && user.addr == src)
+        {
+            return;
         }
-        // notify all users that the server will forward for the user that needs a relay
-        let notify = format!("{MSG_MODE} {MSG_SERVER_RELAY} {username}\n");
-        for u in &channel.users {
-            let _ = socket.send_to(notify.as_bytes(), u.addr).await;
+        let Some(target) = channel.users.iter_mut().find(|user| user.name == username) else {
+            return;
+        };
+        target.needs_server_relay = true;
+        channel.users.iter().map(|user| user.addr).collect()
+    };
+
+    let notify = format!("{MSG_MODE} {MSG_SERVER_RELAY} {username}\n");
+    for recipient in recipients {
+        if let Err(error) = socket.send_to(notify.as_bytes(), recipient).await {
+            eprintln!("Failed to send server-relay notification to {recipient}: {error}");
         }
     }
 }

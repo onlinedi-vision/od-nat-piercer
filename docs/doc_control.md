@@ -106,8 +106,6 @@ more sends even if an older ID remains pending. There is no ID-distance rule.
 socket buffers, connection overhead and total process memory.
 
 These provisional limits are not measured capacity or latency guarantees.
-Client and server must update together; older builds and version negotiation
-are unsupported during this development stage.
 
 ## Slow recipients and cleanup
 

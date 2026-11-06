@@ -74,6 +74,8 @@ Implemented so far:
 - UDP signaling, channel membership tracking, and peer discovery.
 - Heuristic NAT probing, UDP hole punching, and basic direct peer communication.
 - Prototype participant and server relay paths for terminal text traffic.
+- Peer-path failure reports request server fallback while preserving participant
+  registrations; server departure notices follow actual registration removal.
 - JSON CONTROL messages over WebSocket, with explicit registration/broadcast
   results, strict consecutive IDs, processing ACKs, and finite waits without retries.
 - Channel-scoped CONTROL broadcast, independent recipient limits, and partial

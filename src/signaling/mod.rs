@@ -7,3 +7,6 @@ pub use handlers::handle_message;
 
 #[cfg(test)]
 mod ut;
+
+#[cfg(test)]
+mod membership_tests;

@@ -79,7 +79,7 @@ Recipients log `Processed server CONTROL` when a server message arrives.
 The automated CONTROL suite uses explicit test messages to exercise broadcast,
 queue-admission results, processing ACKs, and finite unconfirmed failure.
 
-Registration checks the WebSocket connection; typed terminal text uses legacy
+Registration checks the WebSocket connection; typed terminal text uses prototype
 UDP traffic. Neither demonstrates an audio call or authenticated communication.
 
 A third client can be started with:

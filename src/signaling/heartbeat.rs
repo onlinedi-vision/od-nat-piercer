@@ -215,7 +215,13 @@ async fn cleanup_empty_channels(state: Arc<Mutex<ServerMap>>, to_cleanup: Vec<(S
         let mut st = state.lock().await;
         for (sid, cname) in to_cleanup {
             if let Some(chans) = st.get_mut(&sid) {
-                chans.remove(&cname);
+                // A participant may have joined after the empty snapshot.
+                if chans
+                    .get(&cname)
+                    .is_some_and(|channel| channel.users.is_empty())
+                {
+                    chans.remove(&cname);
+                }
                 if chans.is_empty() {
                     st.remove(&sid);
                 }
@@ -240,6 +246,9 @@ pub fn start_heartbeat(socket: Arc<UdpSocket>, state: Arc<Mutex<ServerMap>>) {
         }
     });
 }
+
+#[cfg(test)]
+mod tests;
 
 #[test]
 fn relay_handover_sends_one_direct_notice_to_each_recipient() {

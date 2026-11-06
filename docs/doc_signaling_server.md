@@ -2,7 +2,7 @@
 
 The standalone signaling server tracks prototype participants, shares UDP
 addresses, coordinates relay choices, and hosts the WebSocket CONTROL endpoint.
-It also forwards legacy UDP text where server relaying is selected.
+It also forwards prototype UDP text where server relaying is selected.
 
 This executable is a development prototype. Usernames, channel names, and peer
 IDs are caller-supplied or server-assigned identifiers, not authenticated
@@ -99,14 +99,16 @@ correct recovery from every participant change.
 | `CONNECT <server_id> <channel> <user> <nat_type>` | Join or refresh a prototype participant. |
 | `HB <server_id> <channel> <user>` | Refresh liveness for a matching participant and source address. |
 | `PING` / `PONG` | Probe liveness and refresh matching users on PONG. |
-| `REQUEST_RELAY <server_id> <channel> <user>` | Request server relaying for a participant. |
-| `PEER_TIMEOUT <server_id> <channel> <user>` | Report an unreachable peer; currently also affects membership. |
+| `REQUEST_RELAY <server_id> <channel> <user>` | Current participant relay requests server forwarding for another registered participant. |
+| `PEER_TIMEOUT <server_id> <channel> <user>` | Current participant relay reports a failed peer path and requests fallback; membership is preserved. |
 | `DISCONNECT <server_id> <channel> <user>` | Handle an explicit departure; the normal client does not send it on termination. |
-| `DATA <user> <text>` | Forward legacy text according to current channel/relay state. |
+| `DATA <user> <text>` | Forward prototype text according to current channel/relay state. |
 
-These commands are not a production authorization boundary. In particular,
-peer failure reporting currently affects the membership list, although a failed
-network path should eventually be handled separately from application membership.
+These commands are not a production authorization boundary. Both fallback
+reports require the UDP source to match the currently selected registered relay
+and the target to be a different existing participant. Address matching is not
+cryptographic authentication. Valid reports change routing, not membership;
+unmatched or repeated DISCONNECT messages send no departure notification.
 
 The heartbeat worker scans every 20 seconds. Users whose recorded liveness is
 older than 40 seconds can be removed on a scan, with departure notifications and

@@ -474,6 +474,7 @@ fn main() -> std::io::Result<()> {
         is_relay: &is_relay,
         channel_has_server_relays: &channel_has_server_relays,
         signaling_addr: &signaling_addr,
+        server_addr: server_socketaddr,
     };
 
     let context = ClientReceiveContext {

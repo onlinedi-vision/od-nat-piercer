@@ -1,6 +1,6 @@
 use crate::proto::control_text::{
     MSG_CONNECT, MSG_DATA, MSG_DISCONNECT, MSG_HB, MSG_NAT_PROBE, MSG_NAT_SEEN, MSG_PEER_TIMEOUT,
-    MSG_PONG, MSG_REQUEST_RELAY,
+    MSG_PONG, MSG_RELAY_DATA, MSG_REQUEST_RELAY,
 };
 use crate::signaling::structures::ServerMap;
 use std::{net::SocketAddr, sync::Arc};
@@ -10,7 +10,7 @@ use super::{
     connect::handle_connect_message,
     disconnect::handle_disconnect_message,
     heartbeat::{handle_heartbeat, handle_pong},
-    request_relay::{handle_data_from_client, handle_relay_request},
+    request_relay::{handle_data_from_client, handle_relay_data, handle_relay_request},
 };
 
 pub async fn handle_message(
@@ -51,8 +51,12 @@ pub async fn handle_message(
                 handle_relay_request(&parts, src, socket, state).await;
             }
 
-            MSG_DATA if parts.len() >= 3 => {
+            MSG_DATA => {
                 handle_data_from_client(&msg, src, socket, state).await;
+            }
+
+            MSG_RELAY_DATA => {
+                handle_relay_data(&msg, src, socket, state).await;
             }
 
             _ => {

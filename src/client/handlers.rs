@@ -1,9 +1,11 @@
 use crate::{
+    client::routing::send_data,
     client::structures::PeerInfo,
     proto::control_text::{
         MSG_DATA, MSG_DIRECT, MSG_HOLE_PUNCH, MSG_MODE, MSG_PING, MSG_PONG, MSG_RELAY,
         MSG_SERVER_RELAY, MSG_USER_LEFT, MSG_WELCOME,
     },
+    proto::routed_data::Data,
 };
 use std::{
     net::{SocketAddr, UdpSocket},
@@ -125,7 +127,7 @@ pub fn handle_mode_line(
                     }
 
                     //mark that peer as server-relayed to stop punching it
-                    if let Some(peer) = guard.iter_mut().find(|p| p.username == username) {
+                    for peer in guard.iter_mut().filter(|p| p.username == username) {
                         peer.use_server_relay = true;
                         peer.connected = true; // stop punching
                         peer.relay_requested = true;
@@ -201,67 +203,44 @@ pub fn handle_hole_punch(
     Ok(())
 }
 
-fn handle_relay_message_to_peers(
-    socket: &UdpSocket,
-    peers: &Arc<Mutex<Vec<PeerInfo>>>,
-    sender: &str,
-    message: &str,
-) -> std::io::Result<()> {
-    let peers_guard = peers.lock().map_err(|_| {
-        std::io::Error::other("Cannot process message: peers mutex is poisoned")
-    })?;
-    for peer in peers_guard.iter() {
-        if peer.username != sender
-            && let Err(e) = socket.send_to(message.as_bytes(), peer.addr)
-        {
-            eprintln!("Failed to send data to {}: {}", peer.addr, e);
-        }
-    }
-    Ok(())
-}
-
 /// Handles a data message received from a peer or the signaling server.
 ///
 /// # Errors
 ///
 /// Returns an error if a required peer or relay-state mutex is poisoned.
 pub fn handle_data_message(
-    socket: &UdpSocket,
+    context: &IncomingMessageContext<'_>,
     line: &str,
-    peers: &Arc<Mutex<Vec<PeerInfo>>>,
-    is_relay: &Arc<Mutex<bool>>,
-    channel_has_server_relays: &Arc<AtomicBool>,
-    signaling_addr: &str,
+    src: SocketAddr,
 ) -> std::io::Result<()> {
-    if line.starts_with(&format!("{MSG_DATA} ")) {
-        let parts: Vec<&str> = line.splitn(3, ' ').collect();
-        if parts.len() >= 3 {
-            let sender = parts[1];
-            let text = parts[2];
-            println!("[{sender}]: {text}");
+    let Some(data) = Data::parse(line) else {
+        return Ok(());
+    };
+    println!("[{}]: {}", data.sender, data.payload);
+    mark_peer_connected_by_name(context.peers, data.sender)?;
 
-            let relay = *is_relay.lock().map_err(|_| {
-                std::io::Error::other("Cannot process message: relay state mutex is poisoned")
-            })?;
-
-            //NO MATTER THE SOURCE, we've observed sender activity
-            mark_peer_connected_by_name(peers, sender)?;
-
-            if relay {
-                // 1) transmit to peers
-                handle_relay_message_to_peers(socket, peers, sender, line)?;
-
-                // 2) mirror to server only if the channel has server-relayed users
-                if channel_has_server_relays.load(Ordering::Acquire) {
-                    let _ = socket.send_to(line.as_bytes(), signaling_addr);
-                }
-            } else {
-                // non-relay receiving data does not forward further
-                // if this non-relay is symmetric and has to send via server, that's handled in networking.rs
-            }
-        }
+    // The server already owns distribution of this packet. Its copy is final,
+    // even when this endpoint also has the participant-relay role.
+    if src == context.server_addr {
+        return Ok(());
     }
-    Ok(())
+    let relay = *context.is_relay.lock().map_err(|_| {
+        std::io::Error::other("Cannot process message: relay state mutex is poisoned")
+    })?;
+    if !relay {
+        return Ok(());
+    }
+    let mirror_to = context
+        .channel_has_server_relays
+        .load(Ordering::Acquire)
+        .then_some(context.signaling_addr);
+    match send_data(context.socket, context.peers, line, true, mirror_to) {
+        Err(error) if error.kind() == std::io::ErrorKind::InvalidInput => {
+            eprintln!("Cannot forward DATA: {error}");
+            Ok(())
+        }
+        result => result,
+    }
 }
 
 /// Marks a peer as connected after receiving a direct message.
@@ -300,6 +279,7 @@ pub struct IncomingMessageContext<'a> {
     pub is_relay: &'a Arc<Mutex<bool>>,
     pub channel_has_server_relays: &'a Arc<AtomicBool>,
     pub signaling_addr: &'a str,
+    pub server_addr: SocketAddr,
 }
 
 /// Processes incoming lines, stopping at the first handler error.
@@ -312,6 +292,11 @@ pub fn process_incoming_message(
     message: &str,
     src: SocketAddr,
 ) -> std::io::Result<()> {
+    // DATA occupies one complete datagram. Validate size/newlines before the
+    // multi-line MODE parser can trim a truncated carrier or interpret payload.
+    if message.starts_with(&format!("{MSG_DATA} ")) {
+        return handle_data_message(context, message, src);
+    }
     for line in message.lines() {
         let line = line.trim();
         if line.is_empty() {
@@ -322,25 +307,13 @@ pub fn process_incoming_message(
             MSG_PONG => handle_pong(context.peers, src)?,
             MSG_HOLE_PUNCH => handle_hole_punch(context.peers, src)?,
             _ => {
-                if line.starts_with(&format!("{MSG_DATA} ")) {
-                    handle_data_message(
-                        context.socket,
-                        line,
-                        context.peers,
-                        context.is_relay,
-                        context.channel_has_server_relays,
-                        context.signaling_addr,
-                    )?;
-                } else {
-                    //Handle control messages: MODE / USER_LEFT
-                    handle_mode_line(
-                        line,
-                        context.peers,
-                        context.user,
-                        context.is_relay,
-                        context.channel_has_server_relays,
-                    )?;
-                }
+                handle_mode_line(
+                    line,
+                    context.peers,
+                    context.user,
+                    context.is_relay,
+                    context.channel_has_server_relays,
+                )?;
             }
         }
     }

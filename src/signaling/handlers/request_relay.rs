@@ -1,5 +1,8 @@
 use crate::{
-    proto::control_text::{MSG_MODE, MSG_SERVER_RELAY},
+    proto::{
+        control_text::{MSG_DATA, MSG_MODE, MSG_SERVER_RELAY},
+        routed_data::{Data, RelayData},
+    },
     signaling::structures::ServerMap,
 };
 use std::{net::SocketAddr, sync::Arc};
@@ -60,71 +63,86 @@ pub async fn handle_data_from_client(
     socket: Arc<UdpSocket>,
     state: Arc<Mutex<ServerMap>>,
 ) {
-    // expect "DATA <sender> <payload>"
-    let parts: Vec<&str> = raw.splitn(3, ' ').collect();
-    if parts.len() < 3 {
+    let Some(data) = Data::parse(raw) else {
         return;
-    }
-    let sender_name = parts[1];
+    };
+    let recipients = {
+        let state = state.lock().await;
+        state
+            .values()
+            .flat_map(|channels| channels.values())
+            .find_map(|channel| {
+                channel
+                    .users
+                    .iter()
+                    .any(|user| user.addr == src && user.name == data.sender)
+                    .then(|| {
+                        channel
+                            .users
+                            .iter()
+                            .filter(|user| user.name != data.sender)
+                            .map(|user| user.addr)
+                            .collect::<Vec<_>>()
+                    })
+            })
+            .unwrap_or_default()
+    };
+    // Ordinary submissions give the server full distribution ownership,
+    // including a direct member or the relay choosing server-only submission.
+    send_data_to_recipients(raw, &recipients, &socket).await;
+}
 
-    let mut st = state.lock().await;
-
-    for channels in st.values_mut() {
-        for channel in channels.values_mut() {
-            // mirrored DATA from RELAY -> deliver to peers that need server relay
-            if let Some(relay_name) = &channel.relay
-                && let Some(relay_user) = channel.users.iter().find(|u| &u.name == relay_name)
-                && relay_user.addr == src
-            {
-                for peer in &channel.users {
-                    if peer.name != sender_name && peer.needs_server_relay {
-                        let _ = socket.send_to(raw.as_bytes(), peer.addr).await;
-                    }
-                }
-                return;
-            }
-
-            //find the sender in this channel by (addr, name)
-            if let Some(sender_index) = channel
-                .users
-                .iter()
-                .position(|u| u.addr == src && u.name == sender_name)
-            {
-                //who is relay
-                let sender_is_relay = channel.relay.as_deref().is_some_and(|r| r == sender_name);
-
-                let sender_needs_server_relay = channel.users[sender_index].needs_server_relay;
-
-                //if sender is relay -> deliver only to need_server_relay users
-                if sender_is_relay {
-                    for peer in &channel.users {
-                        if peer.name != sender_name && peer.needs_server_relay {
-                            let _ = socket.send_to(raw.as_bytes(), peer.addr).await;
-                        }
-                    }
-                    return;
-                }
-
-                // If sender is symmetric (needs server relay) -> deliver to everyone else
-                if sender_needs_server_relay {
-                    for peer in &channel.users {
-                        if peer.addr != src {
-                            let _ = socket.send_to(raw.as_bytes(), peer.addr).await;
-                        }
-                    }
-                    return;
-                }
-
-                //otherwise (unexpected normal client sent to server?)
-                // forward to the relay only
-                if let Some(relay_name) = &channel.relay
-                    && let Some(relay_user) = channel.users.iter().find(|u| &u.name == relay_name)
-                    && relay_user.addr != src
+pub async fn handle_relay_data(
+    raw: &str,
+    src: SocketAddr,
+    socket: Arc<UdpSocket>,
+    state: Arc<Mutex<ServerMap>>,
+) {
+    let Some(mirror) = RelayData::parse(raw) else {
+        return;
+    };
+    let recipients = {
+        let state = state.lock().await;
+        state
+            .values()
+            .flat_map(|channels| channels.values())
+            .find_map(|channel| {
+                let relay_name = channel.relay.as_deref()?;
+                if !channel
+                    .users
+                    .iter()
+                    .any(|user| user.name == relay_name && user.addr == src)
+                    || !channel
+                        .users
+                        .iter()
+                        .any(|user| user.name == mirror.data.sender)
                 {
-                    let _ = socket.send_to(raw.as_bytes(), relay_user.addr).await;
+                    return None;
                 }
-                return;
-            }
+                Some(
+                    channel
+                        .users
+                        .iter()
+                        .filter(|user| {
+                            user.needs_server_relay
+                                && user.name != mirror.data.sender
+                                && user.addr != src
+                                && !mirror.direct.contains(&user.name.as_str())
+                        })
+                        .map(|user| user.addr)
+                        .collect::<Vec<_>>(),
+                )
+            })
+            .unwrap_or_default()
+    };
+    let delivery = format!("{MSG_DATA} {} {}", mirror.data.sender, mirror.data.payload);
+    send_data_to_recipients(&delivery, &recipients, &socket).await;
+}
+
+async fn send_data_to_recipients(raw: &str, recipients: &[SocketAddr], socket: &UdpSocket) {
+    for recipient in recipients {
+        if let Err(error) = socket.send_to(raw.as_bytes(), recipient).await {
+            eprintln!("Failed to forward DATA to {recipient}: {error}");
         }
     }
 }

@@ -9,6 +9,7 @@ pub const MSG_NAT_SEEN: &str = "NAT_SEEN";
 pub const MSG_PEER_TIMEOUT: &str = "PEER_TIMEOUT";
 pub const MSG_REQUEST_RELAY: &str = "REQUEST_RELAY";
 pub const MSG_DATA: &str = "DATA";
+pub const MSG_RELAY_DATA: &str = "RELAY_DATA";
 
 pub const NAT_TYPE_SYMMETRIC: &str = "SYMMETRIC";
 pub const NAT_TYPE_CONE: &str = "CONE";

@@ -5,6 +5,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use crate::client::routing::send_data;
 use crate::client::structures::{NatKind, PeerInfo, PunchSync, RelaySync};
 use crate::proto::control_text::{
     MSG_DATA, MSG_HB, MSG_HOLE_PUNCH, MSG_NAT_PROBE, MSG_NAT_SEEN, MSG_PEER_TIMEOUT, MSG_PING,
@@ -341,35 +342,37 @@ struct UserMessageContext {
 fn handle_user_message(context: &UserMessageContext, message: &str) -> std::io::Result<()> {
     let payload = format!("{MSG_DATA} {} {message}\n", context.username);
 
-    // if i am simmetric, send via server
+    // The server is the sole distribution owner for this submission.
     if context.send_via_server.load(Ordering::Acquire) {
-        println!("Sending {MSG_DATA} via server relay: {message}");
-        let _ = context
+        if crate::proto::routed_data::Data::parse(&payload).is_none() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "Invalid routed DATA",
+            ));
+        }
+        if let Err(error) = context
             .socket
-            .send_to(payload.as_bytes(), &context.signaling_addr);
+            .send_to(payload.as_bytes(), &context.signaling_addr)
+        {
+            eprintln!("Failed DATA submission to server: {error}");
+        }
         return Ok(());
     }
 
-    let is_relay = *context.is_relay.lock().map_err(|_| {
-        std::io::Error::other("Cannot send message: relay state mutex is poisoned")
-    })?;
+    let is_relay = *context
+        .is_relay
+        .lock()
+        .map_err(|_| std::io::Error::other("Cannot send message: relay state mutex is poisoned"))?;
 
-    // we on DIRECT, send directly only to peers that are not server relayed
-    let peers_guard = context.peers.lock().map_err(|_| {
-        std::io::Error::other("Cannot send message: peers mutex is poisoned")
-    })?;
-    for peer in peers_guard.iter().filter(|p| !p.use_server_relay) {
-        let _ = context.socket.send_to(payload.as_bytes(), peer.addr);
-    }
-
-    // if i am relay and channel has server relayed peers, mirror to server
-    // otherwise symmetric users can not receive my message
-    if is_relay && context.channel_has_server_relays.load(Ordering::Acquire) {
-        let _ = context
-            .socket
-            .send_to(payload.as_bytes(), &context.signaling_addr);
-    }
-    Ok(())
+    let mirror_to = (is_relay && context.channel_has_server_relays.load(Ordering::Acquire))
+        .then_some(context.signaling_addr.as_str());
+    send_data(
+        &context.socket,
+        &context.peers,
+        &payload,
+        is_relay,
+        mirror_to,
+    )
 }
 
 fn user_input_loop(context: &UserMessageContext) {
@@ -381,6 +384,10 @@ fn user_input_loop(context: &UserMessageContext) {
             continue;
         }
         if let Err(e) = handle_user_message(context, msg) {
+            if e.kind() == std::io::ErrorKind::InvalidInput {
+                eprintln!("Cannot send input: {e}");
+                continue;
+            }
             eprintln!("User input stopped: {e}");
             break;
         }
@@ -408,3 +415,6 @@ pub fn start_user_input(
 
     thread::spawn(move || user_input_loop(&context));
 }
+
+#[cfg(test)]
+mod routing_tests;

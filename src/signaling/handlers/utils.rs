@@ -33,7 +33,7 @@ pub fn remove_old_user_sessions(channel: &mut Channel, user_name: &str, src_addr
 pub async fn handle_lone_user_scenario(channel: &mut Channel, socket: &Arc<UdpSocket>) {
     if channel.relay.is_none() && channel.users.len() == 1 {
         let u = &channel.users[0];
-        if u.nat_kind == NatKind::Symmetric {
+        if pick_eligible_relay(channel).is_none() {
             let reply = format!(
                 "{} {} {}\n",
                 MSG_MODE, MSG_SERVER_RELAY, channel.users[0].name
@@ -100,23 +100,16 @@ pub fn find_and_remove_user(
 }
 
 pub fn update_relay_after_departure(channel: &mut Channel, was_relay: bool) -> Option<SocketAddr> {
-    let mut lone_user_addr = None;
-
-    if was_relay {
-        if channel.users.is_empty() {
-            channel.relay = None;
-        } else {
-            let new_relay = channel.users[0].name.clone();
-            channel.relay = Some(new_relay);
-        }
-
-        if channel.users.len() == 1 {
-            channel.relay = Some(channel.users[0].name.clone());
-            lone_user_addr = Some(channel.users[0].addr);
-        }
+    if !was_relay {
+        return None;
     }
-
-    lone_user_addr
+    let replacement = pick_eligible_relay(channel);
+    channel.relay = replacement.as_ref().map(|user| user.name.clone());
+    if channel.users.len() == 1 {
+        replacement.map(|user| user.addr)
+    } else {
+        None
+    }
 }
 
 pub async fn handle_user_removal(

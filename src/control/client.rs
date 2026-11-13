@@ -14,44 +14,32 @@ use super::{
     },
 };
 
-pub fn start_control_client(
-    signaling_ip: String,
-    server_id: String,
-    channel: String,
-    user: String,
-    peer_id: u32,
-) {
-    thread::spawn(move || {
-        let rt = match tokio::runtime::Runtime::new() {
-            Ok(rt) => rt,
-            Err(e) => {
-                eprintln!("Failed to create control client runtime: {e}");
-                return;
-            }
-        };
-        rt.block_on(async move {
-            if let Err(e) =
-                run_control_client(signaling_ip, server_id, channel, user, peer_id).await
-            {
-                eprintln!("Control client error: {e}");
-            }
-        });
-    });
+#[must_use]
+pub struct ControlWorker {
+    stopping: tokio::sync::watch::Sender<bool>,
+    thread: Option<thread::JoinHandle<()>>,
 }
 
-async fn run_control_client(
-    signaling_ip: String,
+impl Drop for ControlWorker {
+    fn drop(&mut self) {
+        self.stopping.send_replace(true);
+        if let Some(thread) = self.thread.take()
+            && thread.join().is_err()
+        {
+            eprintln!("CONTROL worker panicked during shutdown");
+        }
+    }
+}
+
+pub fn start_control_client(
+    signaling_ip: &str,
     server_id: String,
     channel: String,
     user: String,
     peer_id: u32,
-) -> ControlResult<()> {
-    let ws_url = format!("ws://{signaling_ip}:2133");
-    let (ws_stream, _) =
-        connect_async_with_config(&ws_url, Some(websocket_config()), false).await?;
-    println!("Connected to control WebSocket server at {ws_url}");
-    run_control_session(
-        ws_stream,
+) -> ControlWorker {
+    control_worker(
+        format!("ws://{signaling_ip}:2133"),
         ControlMessage::JoinControl {
             request_id: 1,
             server_id,
@@ -60,7 +48,40 @@ async fn run_control_client(
             peer_id,
         },
     )
-    .await
+}
+
+pub(super) fn control_worker(url: String, join: ControlMessage) -> ControlWorker {
+    let (stopping, mut stopped) = tokio::sync::watch::channel(false);
+    let thread = thread::spawn(move || {
+        let rt = match tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        {
+            Ok(rt) => rt,
+            Err(e) => {
+                eprintln!("Failed to create control client runtime: {e}");
+                return;
+            }
+        };
+        rt.block_on(async move {
+            tokio::select! {
+                biased;
+                _ = stopped.wait_for(|stopped| *stopped) => {},
+                result = run_control_client(url, join) => {
+                    if let Err(error) = result { eprintln!("Control client error: {error}"); }
+                }
+            }
+        });
+    });
+    ControlWorker {
+        stopping,
+        thread: Some(thread),
+    }
+}
+
+async fn run_control_client(url: String, join: ControlMessage) -> ControlResult<()> {
+    let (socket, _) = connect_async_with_config(&url, Some(websocket_config()), false).await?;
+    run_control_session(socket, join).await
 }
 
 // Shared by the CLI and localhost tests. No synthetic startup broadcast.

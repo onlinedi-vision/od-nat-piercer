@@ -2,7 +2,7 @@ use crate::{
     proto::control_text::{MSG_DIRECT, MSG_MODE, MSG_RELAY, MSG_SERVER_RELAY, MSG_USER_LEFT},
     signaling::{
         handlers::utils::pick_eligible_relay,
-        structures::{Channel, ServerMap, User},
+        structures::{Channel, NatKind, ServerMap, User},
     },
 };
 use std::{net::SocketAddr, sync::Arc};
@@ -25,6 +25,44 @@ pub async fn mark_relay_in_channel(
         return true;
     }
     false
+}
+
+pub(crate) fn relay_handover(channel: &mut Channel) -> Vec<(Vec<SocketAddr>, Vec<u8>)> {
+    let selected = pick_eligible_relay(channel);
+    channel.relay = selected.as_ref().map(|user| user.name.clone());
+    let everyone: Vec<_> = channel.users.iter().map(|user| user.addr).collect();
+    let mut notices = Vec::new();
+    if let Some(relay) = selected {
+        notices.push((
+            vec![relay.addr],
+            format!("{MSG_MODE} {MSG_RELAY}\n").into_bytes(),
+        ));
+        for peer in channel.users.iter().filter(|peer| peer.name != relay.name) {
+            if peer.needs_server_relay || peer.nat_kind == NatKind::Symmetric {
+                notices.push((
+                    everyone.clone(),
+                    format!("{MSG_MODE} {MSG_SERVER_RELAY} {}\n", peer.name).into_bytes(),
+                ));
+            } else {
+                notices.push((
+                    vec![peer.addr],
+                    format!("{MSG_MODE} {MSG_DIRECT} {} {}\n", relay.name, relay.addr).into_bytes(),
+                ));
+                notices.push((
+                    vec![relay.addr],
+                    format!("{MSG_MODE} {MSG_DIRECT} {} {}\n", peer.name, peer.addr).into_bytes(),
+                ));
+            }
+        }
+    } else {
+        for peer in &channel.users {
+            notices.push((
+                everyone.clone(),
+                format!("{MSG_MODE} {MSG_SERVER_RELAY} {}\n", peer.name).into_bytes(),
+            ));
+        }
+    }
+    notices
 }
 
 pub async fn notify_relay_about_peers(socket: &Arc<UdpSocket>, relay_user: &User, peers: &[User]) {
@@ -230,50 +268,19 @@ pub async fn handle_relay_transition(
     if !was_relay {
         return;
     }
-
-    //luam canalul curent ca sa vedem users + need_server_relay
-    let channel_opt = {
-        let st = state.lock().await;
-        st.get(server_id)
-            .and_then(|chans| chans.get(channel_name))
-            .cloned()
+    let notices = {
+        let mut state = state.lock().await;
+        state
+            .get_mut(server_id)
+            .and_then(|channels| channels.get_mut(channel_name))
+            .map(relay_handover)
+            .unwrap_or_default()
     };
-
-    if let Some(channel) = channel_opt {
-        //alegem un nou relay eligibil
-        if let Some(new_relay) = pick_eligible_relay(&channel) {
-            let peers: Vec<User> = channel
-                .users
-                .iter()
-                .filter(|&u| u.name != new_relay.name)
-                .cloned()
-                .collect();
-
-            promote_new_relay(socket, &new_relay).await;
-            notify_peers_about_new_relay(socket, &new_relay, &peers).await;
-            notify_new_relay_about_peers(socket, &new_relay, &peers).await;
-
-            //actualizam relay in state
-            let mut st = state.lock().await;
-            if let Some(chans) = st.get_mut(server_id)
-                && let Some(ch) = chans.get_mut(channel_name)
-            {
-                ch.relay = Some(new_relay.name.clone());
-            }
-        } else {
-            //no eligible user -> server remains relay, announce SERVER_RELAY for all peers
-            for u in &channel.users {
-                let notify = format!("{} {} {}\n", MSG_MODE, MSG_SERVER_RELAY, u.name);
-                for usr in &channel.users {
-                    let _ = socket.send_to(notify.as_bytes(), usr.addr).await;
-                }
-            }
-
-            let mut st = state.lock().await;
-            if let Some(chans) = st.get_mut(server_id)
-                && let Some(ch) = chans.get_mut(channel_name)
-            {
-                ch.relay = None;
+    // Selection and its recipient snapshot are atomic; no stale post-send write.
+    for (recipients, message) in notices {
+        for recipient in recipients {
+            if let Err(error) = socket.send_to(&message, recipient).await {
+                eprintln!("Failed relay handover notification to {recipient}: {error}");
             }
         }
     }

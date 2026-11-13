@@ -12,19 +12,17 @@ use std::{
 use od_nat_piercer::{
     client::{
         control_plane::start_control_client_after_welcome,
-        handlers::{
-            IncomingMessageContext, handle_peer_message, process_incoming_message,
-            try_handle_welcome,
-        },
+        handlers::{IncomingMessageContext, process_incoming_message, try_handle_welcome},
         networking::{
-            detect_nat_kind, start_heartbeat, start_hole_punching, start_relay_keepalive,
-            start_user_input,
+            UserMessageContext, detect_nat_kind, start_heartbeat, start_hole_punching,
+            start_user_input, stop_workers, workers_stopping,
         },
-        structures::{NatKind, PeerInfo, PunchState, PunchSync, RelayState, RelaySync},
+        path_health::{PathContext, PathMonitor},
+        structures::{NatKind, PeerInfo, PunchState, PunchSync},
     },
     proto::{
         control_text::{
-            MSG_CONNECT, MSG_CONTROL, MSG_MODE, MSG_RELAY, MSG_SERVER_RELAY, NAT_TYPE_CONE,
+            MSG_CONNECT, MSG_DATA, MSG_MODE, MSG_RELAY, MSG_SERVER_RELAY, NAT_TYPE_CONE,
             NAT_TYPE_PUBLIC, NAT_TYPE_SYMMETRIC, NAT_TYPE_UNKNOWN,
         },
         packet::Kind,
@@ -40,7 +38,6 @@ struct ClientReceiveContext<'a> {
     send_via_server: &'a Arc<AtomicBool>,
     server_socketaddr: &'a std::net::SocketAddr,
     punch_sync: &'a PunchSync,
-    relay_sync: &'a RelaySync,
     channel_id: &'a Arc<AtomicU64>,
     my_peer_id: &'a Arc<AtomicU32>,
 }
@@ -94,26 +91,6 @@ fn send_connect_message(
     Ok(())
 }
 
-fn update_relay_is_active(
-    is_relay: &Arc<Mutex<bool>>,
-    channel_has_server_relays: &Arc<AtomicBool>,
-    relay_sync: &RelaySync,
-) -> std::io::Result<()> {
-    let relay = *is_relay.lock().map_err(|_| {
-        std::io::Error::other("Cannot update relay activity: relay role mutex is poisoned")
-    })?;
-    let active = relay || channel_has_server_relays.load(Ordering::Acquire);
-    let (lock, cvar) = &**relay_sync;
-    let mut st = lock.lock().map_err(|_| {
-        std::io::Error::other("Cannot update relay activity: relay state mutex is poisoned")
-    })?;
-    if st.is_active != active {
-        st.is_active = active;
-        cvar.notify_all(); //starts/stops relay loop instantly
-    }
-    Ok(())
-}
-
 fn process_server_response(
     response: &str,
     user: &str,
@@ -134,7 +111,9 @@ fn process_server_response(
         if line == format!("{MSG_MODE} {MSG_RELAY}") {
             let (lock, cvar) = &**punch_sync;
             let mut st = lock.lock().map_err(|_| {
-                std::io::Error::other("Cannot process server response: punch state mutex is poisoned")
+                std::io::Error::other(
+                    "Cannot process server response: punch state mutex is poisoned",
+                )
             })?;
             if send_via_server.load(Ordering::Acquire) {
                 send_via_server.store(false, Ordering::Release);
@@ -155,6 +134,10 @@ fn process_server_response(
                 let who = parts[2];
 
                 if who == user {
+                    *is_relay.lock().map_err(|_| {
+                        std::io::Error::other("Cannot clear relay role: mutex poisoned")
+                    })? = false;
+                    channel_has_server_relays.store(false, Ordering::Release);
                     let (lock, cvar) = &**punch_sync;
                     let mut st = lock.lock().map_err(|_| {
                         std::io::Error::other(
@@ -190,126 +173,53 @@ fn process_server_response(
     Ok(())
 }
 
-fn handle_recv_result(
+fn handle_datagram(
     context: &ClientReceiveContext<'_>,
-    result: std::io::Result<(usize, std::net::SocketAddr)>,
-    buf: &[u8],
-    saw_mode: &mut bool,
+    bytes: &[u8],
+    src: std::net::SocketAddr,
 ) -> std::io::Result<bool> {
+    let payload = if let Some((header, payload)) = od_nat_piercer::proto::packet::decode(bytes) {
+        if header.kind != Kind::Control {
+            return Ok(false);
+        }
+        payload
+    } else {
+        bytes
+    };
+    let Ok(message) = std::str::from_utf8(payload) else {
+        return Ok(false);
+    };
     let incoming = &context.incoming;
-
-    match result {
-        Ok((len, src)) => {
-            if let Some((hdr, payload)) = od_nat_piercer::proto::packet::decode(&buf[..len]) {
-                match hdr.kind {
-                    Kind::Control => {
-                        println!(
-                            "(setup) Got {MSG_CONTROL} {} bytes from {src}",
-                            payload.len()
-                        );
-
-                        // Current framed CONTROL uses the text command parser.
-                        if let Ok(s) = std::str::from_utf8(payload) {
-                            try_handle_welcome(s, context.channel_id, context.my_peer_id);
-                            if &src == context.server_socketaddr {
-                                if s.lines()
-                                    .any(|l| l.trim_start().starts_with(&format!("{MSG_MODE} ")))
-                                {
-                                    *saw_mode = true;
-                                }
-
-                                // 1) Normal processing: MODE / DATA / USER_LEFT, etc
-                                process_incoming_message(incoming, s, src)?;
-
-                                // 2) Local mode + send_via_server / punching behaviors
-                                process_server_response(
-                                    s,
-                                    incoming.user,
-                                    incoming.is_relay,
-                                    incoming.channel_has_server_relays,
-                                    context.send_via_server,
-                                    context.punch_sync,
-                                )?;
-
-                                update_relay_is_active(
-                                    incoming.is_relay,
-                                    incoming.channel_has_server_relays,
-                                    context.relay_sync,
-                                )?;
-                            } else {
-                                // peer traffic (arrived during setup)
-                                handle_peer_message(incoming.peers, src)?;
-
-                                process_incoming_message(incoming, s, src)?;
-                            }
-                        }
-                    }
-                    Kind::Dtls => {
-                        println!("(setup) Got DTLS {} bytes from {}", payload.len(), src);
-                    }
-                    Kind::Srtp => {
-                        println!("(setup) Got SRTP {} bytes from {}", payload.len(), src);
-                    }
-                }
-                return Ok(true);
-            }
-            let resp = String::from_utf8_lossy(&buf[..len]).to_string();
-            if &src == context.server_socketaddr {
-                if resp
-                    .lines()
-                    .any(|l| l.trim_start().starts_with(&format!("{MSG_MODE} ")))
-                {
-                    *saw_mode = true;
-                }
-
-                // 1) Normal processing: MODE / DATA / USER_LEFT, etc
-                process_incoming_message(incoming, &resp, src)?;
-
-                // 2) Local mode + send_via_server / punching behaviors
-                process_server_response(
-                    &resp,
-                    incoming.user,
-                    incoming.is_relay,
-                    incoming.channel_has_server_relays,
-                    context.send_via_server,
-                    context.punch_sync,
-                )?;
-
-                update_relay_is_active(
-                    incoming.is_relay,
-                    incoming.channel_has_server_relays,
-                    context.relay_sync,
-                )?;
-            } else {
-                // peer traffic (arrived during setup)
-                handle_peer_message(incoming.peers, src)?;
-
-                process_incoming_message(incoming, &resp, src)?;
-            }
-            Ok(true)
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-            thread::sleep(Duration::from_millis(SETUP_POLL_SLEEP_MS));
-            Ok(true)
-        }
-        Err(e) => {
-            eprintln!("recv error during setup: {e}");
-            Ok(false)
-        }
+    process_incoming_message(incoming, message, src)?;
+    if src != *context.server_socketaddr || message.split_whitespace().next() == Some(MSG_DATA) {
+        return Ok(false);
     }
+    try_handle_welcome(message, context.channel_id, context.my_peer_id);
+    process_server_response(
+        message,
+        incoming.user,
+        incoming.is_relay,
+        incoming.channel_has_server_relays,
+        context.send_via_server,
+        context.punch_sync,
+    )?;
+    Ok(message.lines().any(|line| line.starts_with("MODE ")))
 }
 
-fn server_responses_during_setup(
-    context: &ClientReceiveContext<'_>,
-) -> std::io::Result<()> {
-    let mut buf = [0u8; 2048];
-    let setup_deadline = Instant::now() + Duration::from_millis(SETUP_DEADLINE_MS);
-    let mut saw_mode = false;
-
-    while Instant::now() < setup_deadline && !saw_mode {
-        let res = context.incoming.socket.recv_from(&mut buf);
-        if !handle_recv_result(context, res, &buf, &mut saw_mode)? {
-            break;
+fn server_responses_during_setup(context: &ClientReceiveContext<'_>) -> std::io::Result<()> {
+    let mut buffer = [0; 2048];
+    let deadline = Instant::now() + Duration::from_millis(SETUP_DEADLINE_MS);
+    while Instant::now() < deadline {
+        match context.incoming.socket.recv_from(&mut buffer) {
+            Ok((len, src)) => {
+                if handle_datagram(context, &buffer[..len], src)? {
+                    break;
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                thread::sleep(Duration::from_millis(SETUP_POLL_SLEEP_MS));
+            }
+            Err(error) => return Err(error),
         }
     }
     Ok(())
@@ -321,88 +231,90 @@ fn main_loop(
     server_id: &str,
     channel: &str,
 ) -> std::io::Result<()> {
-    let mut buf = [0u8; 2048];
-    let mut control_client_started = false;
+    let mut buffer = [0; 2048];
+    let mut monitor = PathMonitor::new(Instant::now());
     let incoming = &context.incoming;
-
-    println!("Starting main message loop...");
-
-    let pid = context.my_peer_id.load(Ordering::Acquire);
-
-    start_control_client_after_welcome(
-        &mut control_client_started,
-        signaling_ip,
-        server_id,
-        channel,
-        incoming.user,
-        pid,
-    );
-
-    loop {
-        match incoming.socket.recv_from(&mut buf) {
+    let mut control_worker = None;
+    while !workers_stopping(context.punch_sync) {
+        let mut control_started = control_worker.is_some();
+        if let Some(worker) = start_control_client_after_welcome(
+            &mut control_started,
+            signaling_ip,
+            server_id,
+            channel,
+            incoming.user,
+            context.my_peer_id.load(Ordering::Acquire),
+        ) {
+            control_worker = Some(worker);
+        }
+        let idle = match incoming.socket.recv_from(&mut buffer) {
             Ok((len, src)) => {
-                if let Some((hdr, payload)) = od_nat_piercer::proto::packet::decode(&buf[..len]) {
-                    match hdr.kind {
-                        Kind::Control => {
-                            println!("Got {MSG_CONTROL} {} bytes from {src}", payload.len());
-                            if let Ok(s) = std::str::from_utf8(payload) {
-                                try_handle_welcome(s, context.channel_id, context.my_peer_id);
-
-                                process_incoming_message(incoming, s, src)?;
-                            }
-                        }
-                        Kind::Dtls => println!("Got DTLS {} bytes from {}", payload.len(), src),
-                        Kind::Srtp => println!("Got SRTP {} bytes from {}", payload.len(), src),
-                    }
-                    let pid = context.my_peer_id.load(Ordering::Acquire);
-
-                    start_control_client_after_welcome(
-                        &mut control_client_started,
-                        signaling_ip,
-                        server_id,
-                        channel,
-                        incoming.user,
-                        pid,
-                    );
-
-                    continue;
-                }
-
-                let message = String::from_utf8_lossy(&buf[..len]).to_string();
-
-                if &src == context.server_socketaddr {
-                    // 1) Process MODE / DATA / USER_LEFT etc.
-                    process_incoming_message(incoming, &message, src)?;
-
-                    // 2) Update send_via_server + punching according to MODE lines
-                    process_server_response(
-                        &message,
-                        incoming.user,
-                        incoming.is_relay,
-                        incoming.channel_has_server_relays,
-                        context.send_via_server,
-                        context.punch_sync,
-                    )?;
-                } else {
-                    // Peer traffic
-                    handle_peer_message(incoming.peers, src)?;
-
-                    process_incoming_message(incoming, &message, src)?;
-                }
-
-                update_relay_is_active(
-                    incoming.is_relay,
-                    incoming.channel_has_server_relays,
-                    context.relay_sync,
-                )?;
+                handle_datagram(context, &buffer[..len], src)?;
+                false
             }
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                thread::sleep(Duration::from_millis(MAIN_POLL_SLEEP_MS));
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => true,
+            Err(error) => return Err(error),
+        };
+        let relay = *incoming
+            .is_relay
+            .lock()
+            .map_err(|_| std::io::Error::other("Cannot check paths: relay mutex is poisoned"))?;
+        monitor.tick(
+            &PathContext {
+                socket: incoming.socket,
+                peers: incoming.peers,
+                server_id,
+                channel,
+                user: incoming.user,
+                signaling_addr: incoming.signaling_addr,
+                is_relay: relay,
+                send_via_server: context.send_via_server.load(Ordering::Acquire),
+            },
+            Instant::now(),
+        )?;
+        if idle {
+            thread::sleep(
+                Duration::from_millis(MAIN_POLL_SLEEP_MS)
+                    .min(monitor.time_until_check(Instant::now())),
+            );
+        }
+    }
+    Ok(())
+}
+
+struct Workers {
+    sync: PunchSync,
+    heartbeat: Option<thread::JoinHandle<()>>,
+    punching: Option<thread::JoinHandle<()>>,
+}
+
+impl Drop for Workers {
+    fn drop(&mut self) {
+        stop_workers(&self.sync);
+        for worker in [self.heartbeat.take(), self.punching.take()]
+            .into_iter()
+            .flatten()
+        {
+            if worker.join().is_err() {
+                eprintln!("Network worker panicked during shutdown");
             }
-            Err(e) => {
-                eprintln!("Error receiving: {e}");
-                return Err(e);
-            }
+        }
+    }
+}
+
+struct Departure<'a> {
+    socket: &'a UdpSocket,
+    address: &'a str,
+    server: &'a str,
+    channel: &'a str,
+    user: &'a str,
+}
+
+impl Drop for Departure<'_> {
+    fn drop(&mut self) {
+        let message = format!("DISCONNECT {} {} {}", self.server, self.channel, self.user);
+        if let Err(error) = self.socket.send_to(message.as_bytes(), self.address) {
+            eprintln!("Failed explicit departure: {error}");
         }
     }
 }
@@ -422,16 +334,16 @@ fn main() -> std::io::Result<()> {
 
     //Address for the signalization server (UDP on port 2131)
     let signaling_addr = format!("{signaling_ip}:2131");
-    let server_socketaddr: std::net::SocketAddr = signaling_addr
-        .to_socket_addrs()?
-        .next()
-        .ok_or_else(|| {
+    let server_socketaddr: std::net::SocketAddr =
+        signaling_addr.to_socket_addrs()?.next().ok_or_else(|| {
             std::io::Error::new(
                 std::io::ErrorKind::AddrNotAvailable,
                 "No address found for signaling server",
             )
         })?;
 
+    // Workers reuse the resolved numeric address; shutdown never waits on DNS.
+    let signaling_addr = server_socketaddr.to_string();
     send_connect_message(
         &socket,
         &signaling_addr,
@@ -441,6 +353,13 @@ fn main() -> std::io::Result<()> {
         my_nat,
     )?;
 
+    let _departure = Departure {
+        socket: &socket,
+        address: &signaling_addr,
+        server: &server_id,
+        channel: &channel,
+        user: &user,
+    };
     let peers: Vec<PeerInfo> = Vec::new();
     let peers = Arc::new(Mutex::new(peers));
 
@@ -450,22 +369,26 @@ fn main() -> std::io::Result<()> {
     let channel_has_server_relays = Arc::new(AtomicBool::new(false)); //as relay, i should also mirror to serveri
 
     let punch_sync: PunchSync = Arc::new((
-        Mutex::new(PunchState { paused: false }),
+        Mutex::new(PunchState {
+            paused: false,
+            stopping: false,
+        }),
         std::sync::Condvar::new(),
     ));
 
-    let relay_sync: RelaySync = Arc::new((
-        Mutex::new(RelayState { is_active: false }),
-        std::sync::Condvar::new(),
-    ));
-
-    start_heartbeat(
+    let mut workers = Workers {
+        sync: Arc::clone(&punch_sync),
+        heartbeat: None,
+        punching: None,
+    };
+    workers.heartbeat = Some(start_heartbeat(
         socket.try_clone()?,
         server_id.clone(),
         channel.clone(),
         user.clone(),
         signaling_addr.clone(),
-    );
+        Arc::clone(&punch_sync),
+    ));
 
     let incoming = IncomingMessageContext {
         socket: &socket,
@@ -482,7 +405,6 @@ fn main() -> std::io::Result<()> {
         send_via_server: &send_via_server,
         server_socketaddr: &server_socketaddr,
         punch_sync: &punch_sync,
-        relay_sync: &relay_sync,
         channel_id: &channel_id,
         my_peer_id: &my_peer_id,
     };
@@ -493,33 +415,33 @@ fn main() -> std::io::Result<()> {
     if my_nat == NatKind::Symmetric {
         println!("Symmetric NAT detected - skipping hole punching, relying on server relay.");
     } else {
-        start_hole_punching(
+        workers.punching = Some(start_hole_punching(
             socket.try_clone()?,
             Arc::clone(&peers),
             Arc::clone(&punch_sync),
-        );
+        ));
     }
 
-    //Relay keepalive thread starter
-    start_relay_keepalive(
-        socket.try_clone()?,
-        Arc::clone(&peers),
-        server_id.clone(),
-        channel.clone(),
-        signaling_addr.clone(),
-        Arc::clone(&relay_sync),
-    );
-
     //Thread for sending messages
-    start_user_input(
-        socket.try_clone()?,
-        Arc::clone(&peers),
-        user.clone(),
-        Arc::clone(&send_via_server),
-        signaling_addr.clone(),
-        Arc::clone(&is_relay),
-        Arc::clone(&channel_has_server_relays),
-    );
+    start_user_input(UserMessageContext {
+        socket: socket.try_clone()?,
+        peers: Arc::clone(&peers),
+        username: user.clone(),
+        send_via_server: Arc::clone(&send_via_server),
+        signaling_addr: signaling_addr.clone(),
+        is_relay: Arc::clone(&is_relay),
+        channel_has_server_relays: Arc::clone(&channel_has_server_relays),
+        sync: Arc::clone(&punch_sync),
+    });
 
-    main_loop(&context, &signaling_ip, &server_id, &channel)
+    main_loop(
+        &context,
+        &server_socketaddr.ip().to_string(),
+        &server_id,
+        &channel,
+    )
 }
+
+#[cfg(test)]
+#[path = "client/tests.rs"]
+mod tests;

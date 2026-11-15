@@ -1,6 +1,4 @@
-#![allow(clippy::disallowed_methods)] // Explicit assertions and controlled timestamps.
-
-use std::{collections::HashMap, net::Ipv4Addr, time::Instant};
+use std::{collections::HashMap, io, net::Ipv4Addr, time::Instant};
 
 use super::*;
 use crate::signaling::structures::{Channel, NatKind, User};
@@ -20,20 +18,26 @@ fn state(users: Vec<User>, relay: Option<&str>) -> Arc<Mutex<ServerMap>> {
     )])))
 }
 
-fn user(name: &str, id: u32) -> User {
-    let port = 30000 + u16::try_from(id).expect("fixture peer ID");
-    User::new(name, (Ipv4Addr::LOCALHOST, port).into(), NatKind::Cone, id)
+fn user(name: &str, id: u32) -> io::Result<User> {
+    let port = 30000 + u16::try_from(id).map_err(io::Error::other)?;
+    Ok(User::new(
+        name,
+        (Ipv4Addr::LOCALHOST, port).into(),
+        NatKind::Cone,
+        id,
+    ))
 }
 
 #[tokio::test]
-async fn expired_relay_does_not_remove_healthy_neighbours() {
-    let mut relay = user("relay", 1);
+#[allow(clippy::disallowed_methods)] // tokio::test generates expect when creating its runtime.
+async fn expired_relay_does_not_remove_healthy_neighbours() -> io::Result<()> {
+    let mut relay = user("relay", 1)?;
     let relay_addr = relay.addr;
     // 41s without a PONG exceeds the server's 40s heartbeat timeout.
     relay.last_pong = Instant::now()
         .checked_sub(Duration::from_secs(41))
-        .expect("fixture timestamp");
-    let peer = user("peer", 2);
+        .ok_or_else(|| io::Error::other("fixture timestamp underflow"))?;
+    let peer = user("peer", 2)?;
     let state = state(vec![relay, peer.clone()], Some("relay"));
     let (_, cleanup, notices) = collect_heartbeat_data(Arc::clone(&state)).await;
     let registry = state.lock().await;
@@ -53,17 +57,19 @@ async fn expired_relay_does_not_remove_healthy_neighbours() {
         departures[0].1,
         format!("USER_LEFT relay {relay_addr}\n").as_bytes()
     );
+    Ok(())
 }
 
 #[tokio::test]
-async fn server_relay_peer_is_removed_after_heartbeat_timeout() {
-    let mut peer = user("peer", 2);
+#[allow(clippy::disallowed_methods)] // tokio::test generates expect when creating its runtime.
+async fn server_relay_peer_is_removed_after_heartbeat_timeout() -> io::Result<()> {
+    let mut peer = user("peer", 2)?;
     peer.needs_server_relay = true;
     // 41s without a PONG exceeds the server's 40s heartbeat timeout.
     peer.last_pong = Instant::now()
         .checked_sub(Duration::from_secs(41))
-        .expect("fixture timestamp");
-    let state = state(vec![user("relay", 1), peer], Some("relay"));
+        .ok_or_else(|| io::Error::other("fixture timestamp underflow"))?;
+    let state = state(vec![user("relay", 1)?, peer], Some("relay"));
     let (_, _, notices) = collect_heartbeat_data(Arc::clone(&state)).await;
     let registry = state.lock().await;
     assert_eq!(registry["s"]["c"].users.len(), 1);
@@ -73,10 +79,12 @@ async fn server_relay_peer_is_removed_after_heartbeat_timeout() {
             .iter()
             .any(|(_, bytes)| bytes.starts_with(b"USER_LEFT peer "))
     );
+    Ok(())
 }
 
 #[tokio::test]
-async fn cleanup_preserves_a_channel_populated_after_the_empty_snapshot() {
+#[allow(clippy::disallowed_methods)] // tokio::test generates expect when creating its runtime.
+async fn cleanup_preserves_a_channel_populated_after_the_empty_snapshot() -> io::Result<()> {
     let state = state(Vec::new(), None);
     let (_, cleanup, _) = collect_heartbeat_data(Arc::clone(&state)).await;
     assert_eq!(cleanup, [("s".into(), "c".into())]);
@@ -84,19 +92,20 @@ async fn cleanup_preserves_a_channel_populated_after_the_empty_snapshot() {
         let mut registry = state.lock().await;
         let channel = registry
             .get_mut("s")
-            .expect("server")
-            .get_mut("c")
-            .expect("channel");
-        channel.users.push(user("new-peer", 2));
+            .and_then(|channels| channels.get_mut("c"))
+            .ok_or_else(|| io::Error::other("missing fixture channel"))?;
+        channel.users.push(user("new-peer", 2)?);
         channel.relay = Some("new-peer".into());
     }
     cleanup_empty_channels(Arc::clone(&state), cleanup).await;
     let registry = state.lock().await;
     assert_eq!(registry["s"]["c"].channel_id, 7);
     assert_eq!(registry["s"]["c"].users[0].name, "new-peer");
+    Ok(())
 }
 
 #[tokio::test]
+#[allow(clippy::disallowed_methods)] // tokio::test generates expect when creating its runtime.
 async fn cleanup_still_removes_a_channel_that_remains_empty() {
     let state = state(Vec::new(), None);
     let (_, cleanup, _) = collect_heartbeat_data(Arc::clone(&state)).await;
@@ -105,14 +114,15 @@ async fn cleanup_still_removes_a_channel_that_remains_empty() {
 }
 
 #[tokio::test]
-async fn expiry_never_promotes_an_ineligible_or_already_expired_participant() {
+#[allow(clippy::disallowed_methods)] // tokio::test generates expect when creating its runtime.
+async fn expiry_never_promotes_an_ineligible_or_already_expired_participant() -> io::Result<()> {
     let now = Instant::now();
-    let mut expired = user("expired", 1);
+    let mut expired = user("expired", 1)?;
     expired.last_pong = now
         .checked_sub(Duration::from_secs(41))
-        .expect("fixture timestamp");
+        .ok_or_else(|| io::Error::other("fixture timestamp underflow"))?;
     for nat_kind in [NatKind::Cone, NatKind::Symmetric] {
-        let mut remaining = user("remaining", 2);
+        let mut remaining = user("remaining", 2)?;
         remaining.nat_kind = nat_kind;
         remaining.needs_server_relay = true;
         remaining.last_pong = now;
@@ -126,7 +136,7 @@ async fn expiry_never_promotes_an_ineligible_or_already_expired_participant() {
                 .any(|(_, bytes)| bytes.starts_with(b"MODE SERVER_RELAY remaining"))
         );
     }
-    let mut another = user("another", 2);
+    let mut another = user("another", 2)?;
     another.last_pong = expired.last_pong;
     let state = state(vec![expired, another], Some("expired"));
     let (_, cleanup, notices) = collect_heartbeat_data_at(Arc::clone(&state), now).await;
@@ -134,12 +144,14 @@ async fn expiry_never_promotes_an_ineligible_or_already_expired_participant() {
     assert_eq!(state.lock().await["s"]["c"].relay, None);
     assert_eq!(cleanup, [("s".into(), "c".into())]);
     assert_eq!(notices.len(), 0);
+    Ok(())
 }
 
 #[tokio::test]
-async fn registration_expiry_keeps_its_own_threshold_and_scan_cadence() {
+#[allow(clippy::disallowed_methods)] // tokio::test generates expect when creating its runtime.
+async fn registration_expiry_keeps_its_own_threshold_and_scan_cadence() -> io::Result<()> {
     let start = Instant::now();
-    let mut member = user("member", 1);
+    let mut member = user("member", 1)?;
     member.last_pong = start;
     let state = state(vec![member], Some("member"));
     for scan in [
@@ -157,4 +169,5 @@ async fn registration_expiry_keeps_its_own_threshold_and_scan_cadence() {
     .await;
     assert!(state.lock().await["s"]["c"].users.is_empty());
     assert_eq!(cleanup, [("s".into(), "c".into())]);
+    Ok(())
 }

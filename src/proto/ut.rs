@@ -5,7 +5,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn encode_decode_roundtrip() {
+    fn encode_decode_roundtrip() -> Result<(), &'static str> {
         let payload = b"hello";
         let h = Header {
             kind: Kind::Control,
@@ -18,7 +18,7 @@ mod tests {
         };
 
         let buf = encode(h, payload);
-        let (h2, p2) = decode(&buf).expect("decode failed");
+        let (h2, p2) = decode(&buf).ok_or("decode failed")?;
         assert_eq!(h2.kind as u8, h.kind as u8);
         assert_eq!(h2.flags, h.flags);
         assert_eq!(h2.channel_id, h.channel_id);
@@ -26,6 +26,7 @@ mod tests {
         assert_eq!(h2.dst_peer_id, h.dst_peer_id);
         assert_eq!(h2.stream_id, h.stream_id);
         assert_eq!(p2, payload);
+        Ok(())
     }
 
     #[test]

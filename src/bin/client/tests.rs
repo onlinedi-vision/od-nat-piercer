@@ -1,5 +1,3 @@
-#![deny(clippy::disallowed_methods)]
-
 use super::*;
 use od_nat_piercer::proto::packet::{Header, encode};
 use std::{io, net::Ipv4Addr, sync::MutexGuard};

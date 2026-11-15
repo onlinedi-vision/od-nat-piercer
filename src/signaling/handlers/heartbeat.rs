@@ -3,13 +3,21 @@ use std::{net::SocketAddr, sync::Arc, time::Instant};
 use tokio::sync::Mutex;
 
 pub async fn handle_pong(src: SocketAddr, state: Arc<Mutex<ServerMap>>) {
-    let mut st = state.lock().await;
-    for channels in st.values_mut() {
-        for channel in channels.values_mut() {
-            if let Some(user) = channel.users.iter_mut().find(|u| u.addr == src) {
-                user.last_pong = Instant::now();
+    let registered = {
+        let mut st = state.lock().await;
+        let mut registered = false;
+        for channels in st.values_mut() {
+            for channel in channels.values_mut() {
+                if let Some(user) = channel.users.iter_mut().find(|u| u.addr == src) {
+                    user.last_pong = Instant::now();
+                    registered = true;
+                }
             }
         }
+        registered
+    };
+    if registered {
+        println!("Received PONG from registered client {src}");
     }
 }
 
@@ -20,11 +28,11 @@ pub async fn handle_heartbeat(parts: &[&str], src: SocketAddr, state: Arc<Mutex<
     let mut st = state.lock().await;
     if let Some(channels) = st.get_mut(server_id)
         && let Some(channel) = channels.get_mut(channel_name)
-            && let Some(u) = channel
-                .users
-                .iter_mut()
-                .find(|u| u.name == user_name && u.addr == src)
-            {
-                u.last_pong = Instant::now();
-            }
+        && let Some(u) = channel
+            .users
+            .iter_mut()
+            .find(|u| u.name == user_name && u.addr == src)
+    {
+        u.last_pong = Instant::now();
+    }
 }

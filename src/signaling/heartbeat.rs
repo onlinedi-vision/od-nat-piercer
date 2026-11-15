@@ -128,8 +128,9 @@ async fn collect_heartbeat_data_at(
 
 async fn send_pings(socket: Arc<UdpSocket>, to_ping: Vec<SocketAddr>) {
     for addr in to_ping {
-        if let Err(e) = socket.send_to(MSG_PING.as_bytes(), addr).await {
-            eprintln!("Failed to send {MSG_PING}: {e}");
+        match socket.send_to(MSG_PING.as_bytes(), addr).await {
+            Ok(_) => println!("Sent {MSG_PING} to registered client {addr}"),
+            Err(e) => eprintln!("Failed to send {MSG_PING}: {e}"),
         }
     }
 }

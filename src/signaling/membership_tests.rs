@@ -1,5 +1,3 @@
-#![allow(clippy::disallowed_methods)] // Explicit assertions in bounded localhost tests.
-
 use std::{collections::HashMap, io, net::Ipv4Addr, sync::Arc, time::Duration};
 
 use tokio::{net::UdpSocket, sync::Mutex, time::timeout};
@@ -25,7 +23,7 @@ impl Fixture {
         let other = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await?;
         let mut users = Vec::new();
         for (name, source) in [("relay", &relay), ("peer", &peer), ("other", &other)] {
-            let peer_id = u32::try_from(users.len() + 1).expect("three fixture users");
+            let peer_id = u32::try_from(users.len() + 1).map_err(io::Error::other)?;
             users.push(User::new(
                 name,
                 source.local_addr()?,
@@ -112,6 +110,7 @@ fn same_membership(before: &Channel, after: &Channel) {
 }
 
 #[tokio::test]
+#[allow(clippy::disallowed_methods)] // tokio::test generates expect when creating its runtime.
 async fn path_reports_preserve_healthy_membership_and_request_fallback() -> io::Result<()> {
     let fixture = Fixture::new().await?;
     fixture.command(&fixture.peer, "HB s c peer").await?;
@@ -139,6 +138,7 @@ async fn path_reports_preserve_healthy_membership_and_request_fallback() -> io::
 }
 
 #[tokio::test]
+#[allow(clippy::disallowed_methods)] // tokio::test generates expect when creating its runtime.
 async fn invalid_path_reports_have_no_membership_route_or_notification_effects() -> io::Result<()> {
     let fixture = Fixture::new().await?;
     let outsider = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await?;
@@ -169,6 +169,7 @@ async fn invalid_path_reports_have_no_membership_route_or_notification_effects()
 }
 
 #[tokio::test]
+#[allow(clippy::disallowed_methods)] // tokio::test generates expect when creating its runtime.
 async fn former_relay_cannot_request_fallback_for_another_participant() -> io::Result<()> {
     let fixture = Fixture::new().await?;
     fixture
@@ -176,9 +177,8 @@ async fn former_relay_cannot_request_fallback_for_another_participant() -> io::R
         .lock()
         .await
         .get_mut("s")
-        .expect("server")
-        .get_mut("c")
-        .expect("channel")
+        .and_then(|channels| channels.get_mut("c"))
+        .ok_or_else(|| io::Error::other("missing fixture channel"))?
         .relay = Some("other".into());
     let before = fixture.channel().await;
     for command in ["PEER_TIMEOUT", "REQUEST_RELAY"] {
@@ -198,6 +198,7 @@ async fn former_relay_cannot_request_fallback_for_another_participant() -> io::R
 }
 
 #[tokio::test]
+#[allow(clippy::disallowed_methods)] // tokio::test generates expect when creating its runtime.
 async fn missing_or_unregistered_selected_relay_cannot_authorize_reports() -> io::Result<()> {
     let fixture = Fixture::new().await?;
     for relay in [None, Some("removed-relay".into())] {
@@ -206,9 +207,8 @@ async fn missing_or_unregistered_selected_relay_cannot_authorize_reports() -> io
             .lock()
             .await
             .get_mut("s")
-            .expect("server")
-            .get_mut("c")
-            .expect("channel")
+            .and_then(|channels| channels.get_mut("c"))
+            .ok_or_else(|| io::Error::other("missing fixture channel"))?
             .relay = relay;
         let before = fixture.channel().await;
         for command in ["PEER_TIMEOUT", "REQUEST_RELAY"] {
@@ -229,6 +229,7 @@ async fn missing_or_unregistered_selected_relay_cannot_authorize_reports() -> io
 }
 
 #[tokio::test]
+#[allow(clippy::disallowed_methods)] // tokio::test generates expect when creating its runtime.
 async fn unmatched_disconnect_has_no_departure_or_route_effects() -> io::Result<()> {
     let fixture = Fixture::new().await?;
     let before = fixture.channel().await;
@@ -250,6 +251,7 @@ async fn unmatched_disconnect_has_no_departure_or_route_effects() -> io::Result<
 }
 
 #[tokio::test]
+#[allow(clippy::disallowed_methods)] // tokio::test generates expect when creating its runtime.
 async fn matched_disconnect_removes_once_and_late_reports_cannot_restore_it() -> io::Result<()> {
     let fixture = Fixture::new().await?;
     fixture
@@ -301,6 +303,7 @@ fn relay_departure_selects_only_eligible_candidates_before_notifications() {
 }
 
 #[tokio::test]
+#[allow(clippy::disallowed_methods)] // tokio::test generates expect when creating its runtime.
 async fn relay_disconnect_respects_lone_peer_eligibility() -> io::Result<()> {
     for (nat_kind, needs_server_relay, expected_mode) in [
         (NatKind::Symmetric, true, "MODE SERVER_RELAY peer\n"),
@@ -315,9 +318,8 @@ async fn relay_disconnect_respects_lone_peer_eligibility() -> io::Result<()> {
             let mut state = fixture.state.lock().await;
             let channel = state
                 .get_mut("s")
-                .expect("server")
-                .get_mut("c")
-                .expect("channel");
+                .and_then(|channels| channels.get_mut("c"))
+                .ok_or_else(|| io::Error::other("missing fixture channel"))?;
             channel.users.retain(|user| user.name != "other");
             channel.users[1].nat_kind = nat_kind;
             channel.users[1].needs_server_relay = needs_server_relay;
@@ -352,6 +354,7 @@ async fn relay_disconnect_respects_lone_peer_eligibility() -> io::Result<()> {
 }
 
 #[tokio::test]
+#[allow(clippy::disallowed_methods)] // tokio::test generates expect when creating its runtime.
 async fn registered_nonrelay_can_request_only_its_own_fallback() -> io::Result<()> {
     let fixture = Fixture::new().await?;
     let outsider = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await?;
@@ -406,15 +409,15 @@ async fn registered_nonrelay_can_request_only_its_own_fallback() -> io::Result<(
 }
 
 #[tokio::test]
+#[allow(clippy::disallowed_methods)] // tokio::test generates expect when creating its runtime.
 async fn relay_handover_keeps_server_only_members_on_server_routes() -> io::Result<()> {
     let fixture = Fixture::new().await?;
     {
         let mut state = fixture.state.lock().await;
         let channel = state
             .get_mut("s")
-            .expect("server")
-            .get_mut("c")
-            .expect("channel");
+            .and_then(|channels| channels.get_mut("c"))
+            .ok_or_else(|| io::Error::other("missing fixture channel"))?;
         channel.users[1].nat_kind = NatKind::Symmetric;
         channel.users[1].needs_server_relay = true;
     }

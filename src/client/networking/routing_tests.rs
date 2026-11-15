@@ -1,9 +1,8 @@
-#![allow(clippy::disallowed_methods)] // Explicit assertions in bounded localhost tests.
-
 use std::{
     collections::HashMap,
     io,
     net::{Ipv4Addr, SocketAddr},
+    sync::MutexGuard,
 };
 
 use tokio::{net::UdpSocket as AsyncUdpSocket, sync::Mutex as AsyncMutex, time::timeout};
@@ -37,6 +36,12 @@ fn socket() -> io::Result<UdpSocket> {
     let socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))?;
     socket.set_nonblocking(true)?;
     Ok(socket)
+}
+
+fn lock_state<T>(state: &Mutex<T>) -> io::Result<MutexGuard<'_, T>> {
+    state
+        .lock()
+        .map_err(|_| io::Error::other("test state mutex is poisoned"))
 }
 
 fn drain(socket: &UdpSocket) -> io::Result<Vec<(SocketAddr, String)>> {
@@ -77,7 +82,7 @@ impl Fixture {
             ("server-peer", &server_peer, ServerNatKind::Symmetric),
             ("server-other", &server_other, ServerNatKind::Symmetric),
         ] {
-            let id = u32::try_from(users.len() + 1).expect("four fixture users");
+            let id = u32::try_from(users.len() + 1).map_err(io::Error::other)?;
             users.push(User::new(name, endpoint.local_addr()?, nat, id));
         }
         let peers = Arc::new(Mutex::new(vec![PeerInfo {
@@ -238,6 +243,7 @@ fn assert_channel_unchanged(before: &Channel, after: &Channel) {
 }
 
 #[tokio::test]
+#[allow(clippy::disallowed_methods)] // tokio::test generates expect when creating its runtime.
 async fn server_fanout_is_not_forwarded_again_by_participant_relay() -> io::Result<()> {
     let fixture = Fixture::new()?;
     // DATA is only a carrier for this opaque deterministic payload.
@@ -264,6 +270,7 @@ async fn server_fanout_is_not_forwarded_again_by_participant_relay() -> io::Resu
 }
 
 #[tokio::test]
+#[allow(clippy::disallowed_methods)] // tokio::test generates expect when creating its runtime.
 async fn fallback_with_delayed_relay_notice_does_not_duplicate_a_payload() -> io::Result<()> {
     let fixture = Fixture::new()?;
     fixture
@@ -297,10 +304,11 @@ async fn fallback_with_delayed_relay_notice_does_not_duplicate_a_payload() -> io
 }
 
 #[tokio::test]
+#[allow(clippy::disallowed_methods)] // tokio::test generates expect when creating its runtime.
 async fn relay_originated_and_forwarded_payloads_use_the_same_partition() -> io::Result<()> {
     for forwarded in [false, true] {
         let fixture = Fixture::new()?;
-        fixture.peers.lock().expect("peers").push(peer(
+        lock_state(&fixture.peers)?.push(peer(
             "server-peer",
             fixture.server_peer.local_addr()?,
             true,
@@ -328,6 +336,7 @@ async fn relay_originated_and_forwarded_payloads_use_the_same_partition() -> io:
 }
 
 #[tokio::test]
+#[allow(clippy::disallowed_methods)] // tokio::test generates expect when creating its runtime.
 async fn in_flight_mirror_survives_fallback_and_repeated_notices() -> io::Result<()> {
     for forwarded in [false, true] {
         let fixture = Fixture::new()?;
@@ -347,7 +356,7 @@ async fn in_flight_mirror_survives_fallback_and_repeated_notices() -> io::Result
             .users
             .iter_mut()
             .find(|user| user.name == "direct")
-            .expect("target")
+            .ok_or_else(|| io::Error::other("missing fixture target"))?
             .needs_server_relay = true;
         fixture.request_fallback().await?;
         fixture.apply_fallback()?;
@@ -387,6 +396,7 @@ async fn in_flight_mirror_survives_fallback_and_repeated_notices() -> io::Result
 }
 
 #[tokio::test]
+#[allow(clippy::disallowed_methods)] // tokio::test generates expect when creating its runtime.
 async fn forwarded_payload_with_delayed_notice_keeps_direct_delivery_once() -> io::Result<()> {
     let fixture = Fixture::new()?;
     fixture.request_fallback().await?;
@@ -407,6 +417,7 @@ async fn forwarded_payload_with_delayed_notice_keeps_direct_delivery_once() -> i
 }
 
 #[tokio::test]
+#[allow(clippy::disallowed_methods)] // tokio::test generates expect when creating its runtime.
 async fn server_only_submissions_work_for_every_registered_role() -> io::Result<()> {
     for sender in ["relay", "direct", "server-peer"] {
         let fixture = Fixture::new()?;
@@ -419,7 +430,7 @@ async fn server_only_submissions_work_for_every_registered_role() -> io::Result<
         let endpoint = endpoints
             .iter()
             .find(|(name, _)| *name == sender)
-            .expect("sender")
+            .ok_or_else(|| io::Error::other("missing fixture sender"))?
             .1;
         handle_user_message(&fixture.outgoing(endpoint, sender, true)?, "00d1")?;
         fixture.dispatch_server_queue().await?;
@@ -446,6 +457,7 @@ async fn server_only_submissions_work_for_every_registered_role() -> io::Result<
 }
 
 #[tokio::test]
+#[allow(clippy::disallowed_methods)] // tokio::test generates expect when creating its runtime.
 async fn no_participant_relay_still_allows_server_distribution() -> io::Result<()> {
     let fixture = Fixture::new()?;
     fixture
@@ -453,11 +465,10 @@ async fn no_participant_relay_still_allows_server_distribution() -> io::Result<(
         .lock()
         .await
         .get_mut("s")
-        .expect("server")
-        .get_mut("c")
-        .expect("channel")
+        .and_then(|channels| channels.get_mut("c"))
+        .ok_or_else(|| io::Error::other("missing fixture channel"))?
         .relay = None;
-    *fixture.is_relay.lock().expect("role") = false;
+    *lock_state(&fixture.is_relay)? = false;
     fixture
         .send_to_server(&fixture.server_peer, "DATA server-peer 00e1")
         .await?;
@@ -478,6 +489,7 @@ async fn no_participant_relay_still_allows_server_distribution() -> io::Result<(
 }
 
 #[tokio::test]
+#[allow(clippy::disallowed_methods)] // tokio::test generates expect when creating its runtime.
 async fn direct_only_delivery_needs_no_server_mirror() -> io::Result<()> {
     let fixture = Fixture::new()?;
     fixture.has_server_peers.store(false, Ordering::Release);
@@ -496,6 +508,7 @@ async fn direct_only_delivery_needs_no_server_mirror() -> io::Result<()> {
 }
 
 #[tokio::test]
+#[allow(clippy::disallowed_methods)] // tokio::test generates expect when creating its runtime.
 async fn ordinary_sender_uses_one_upstream_and_never_forwards_received_data() -> io::Result<()> {
     let fixture = Fixture::new()?;
     let mut outgoing = fixture.outgoing(&fixture.direct, "direct", false)?;
@@ -519,7 +532,7 @@ async fn ordinary_sender_uses_one_upstream_and_never_forwards_received_data() ->
     )?;
     expect_empty(&fixture.direct)?;
 
-    *fixture.is_relay.lock().expect("role") = false;
+    *lock_state(&fixture.is_relay)? = false;
     fixture.receive_at_relay("DATA server-peer 0102", fixture.server_peer.local_addr()?)?;
     expect_empty(&fixture.direct)?;
     expect_empty(&fixture.server)?;
@@ -527,13 +540,17 @@ async fn ordinary_sender_uses_one_upstream_and_never_forwards_received_data() ->
 }
 
 #[tokio::test]
+#[allow(clippy::disallowed_methods)] // tokio::test generates expect when creating its runtime.
 async fn duplicate_peer_entries_select_one_destination_and_one_exclusion() -> io::Result<()> {
     let fixture = Fixture::new()?;
     let old_endpoint = socket()?;
     {
-        let mut peers = fixture.peers.lock().expect("peers");
+        let mut peers = lock_state(&fixture.peers)?;
         peers.insert(0, peer("direct", old_endpoint.local_addr()?, false));
-        let duplicate = peers.last().expect("direct peer").clone();
+        let duplicate = peers
+            .last()
+            .ok_or_else(|| io::Error::other("missing fixture direct peer"))?
+            .clone();
         peers.push(duplicate);
     }
     fixture.request_fallback().await?; // Deliberately do not apply the notice.
@@ -547,10 +564,7 @@ async fn duplicate_peer_entries_select_one_destination_and_one_exclusion() -> io
     expect_empty(&old_endpoint)?;
     fixture.apply_fallback()?;
     assert!(
-        fixture
-            .peers
-            .lock()
-            .expect("peers")
+        lock_state(&fixture.peers)?
             .iter()
             .all(|peer| peer.use_server_relay)
     );
@@ -558,6 +572,7 @@ async fn duplicate_peer_entries_select_one_destination_and_one_exclusion() -> io
 }
 
 #[tokio::test]
+#[allow(clippy::disallowed_methods)] // tokio::test generates expect when creating its runtime.
 async fn invalid_or_wrong_role_mirrors_have_no_forwarding_or_state_effect() -> io::Result<()> {
     let fixture = Fixture::new()?;
     let outsider = socket()?;
@@ -598,9 +613,8 @@ async fn invalid_or_wrong_role_mirrors_have_no_forwarding_or_state_effect() -> i
         .lock()
         .await
         .get_mut("s")
-        .expect("server")
-        .get_mut("c")
-        .expect("channel")
+        .and_then(|channels| channels.get_mut("c"))
+        .ok_or_else(|| io::Error::other("missing fixture channel"))?
         .relay = Some("direct".into());
     fixture
         .send_to_server(&fixture.relay, "RELAY_DATA relay 0 0122")
@@ -611,6 +625,7 @@ async fn invalid_or_wrong_role_mirrors_have_no_forwarding_or_state_effect() -> i
 }
 
 #[tokio::test]
+#[allow(clippy::disallowed_methods)] // tokio::test generates expect when creating its runtime.
 async fn server_mirror_is_channel_scoped_and_ignores_retired_exclusions() -> io::Result<()> {
     let fixture = Fixture::new()?;
     let foreign = socket()?;
@@ -652,15 +667,17 @@ async fn server_mirror_is_channel_scoped_and_ignores_retired_exclusions() -> io:
 }
 
 #[tokio::test]
+#[allow(clippy::disallowed_methods)] // tokio::test generates expect when creating its runtime.
 async fn oversize_or_multiline_carriers_never_partially_forward() -> io::Result<()> {
     use crate::proto::routed_data::MAX_ROUTED_DATA_BYTES;
 
     let fixture = Fixture::new()?;
     // Plain DATA fits exactly; adding routing metadata would exceed the bound.
     let payload = "a".repeat(MAX_ROUTED_DATA_BYTES - "DATA relay ".len() - 1);
-    let error = handle_user_message(&fixture.outgoing(&fixture.relay, "relay", false)?, &payload)
-        .expect_err("oversized mirror");
-    assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+    assert!(matches!(
+        handle_user_message(&fixture.outgoing(&fixture.relay, "relay", false)?, &payload),
+        Err(error) if error.kind() == io::ErrorKind::InvalidInput
+    ));
 
     let oversized_data = format!("DATA direct {}", "a".repeat(MAX_ROUTED_DATA_BYTES));
     fixture.receive_at_relay(&oversized_data, fixture.direct.local_addr()?)?;
@@ -678,7 +695,7 @@ async fn oversize_or_multiline_carriers_never_partially_forward() -> io::Result<
         "DATA direct 0141\nMODE SERVER_RELAY direct",
         fixture.direct.local_addr()?,
     )?;
-    assert!(!fixture.peers.lock().expect("peers")[0].use_server_relay);
+    assert!(!lock_state(&fixture.peers)?[0].use_server_relay);
     for raw in [
         oversized_data,
         format!("RELAY_DATA relay 0 {}", "a".repeat(MAX_ROUTED_DATA_BYTES)),
@@ -701,13 +718,14 @@ async fn oversize_or_multiline_carriers_never_partially_forward() -> io::Result<
 }
 
 #[tokio::test]
+#[allow(clippy::disallowed_methods)] // tokio::test generates expect when creating its runtime.
 async fn failed_direct_attempt_is_not_retried_through_the_server() -> io::Result<()> {
     for forwarded in [false, true] {
         let fixture = Fixture::new()?;
         fixture.request_fallback().await?;
         // An IPv4-only socket cannot send to this IPv6 destination. Failure is
         // logged, but must neither abort processing nor remove the exclusion.
-        fixture.peers.lock().expect("peers")[0].addr = SocketAddr::new(
+        lock_state(&fixture.peers)?[0].addr = SocketAddr::new(
             std::net::Ipv6Addr::LOCALHOST.into(),
             fixture.direct.local_addr()?.port(),
         );
@@ -747,6 +765,7 @@ async fn failed_direct_attempt_is_not_retried_through_the_server() -> io::Result
 }
 
 #[tokio::test]
+#[allow(clippy::disallowed_methods)] // tokio::test generates expect when creating its runtime.
 async fn input_eof_requests_shutdown_without_a_route_or_membership_change() -> io::Result<()> {
     let socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))?;
     let sync = Arc::new((
@@ -766,6 +785,6 @@ async fn input_eof_requests_shutdown_without_a_route_or_membership_change() -> i
     user_input_loop(&context, std::io::Cursor::new(Vec::<u8>::new()));
     assert!(workers_stopping(&sync));
     assert!(!context.send_via_server.load(Ordering::Acquire));
-    assert_eq!(context.peers.lock().unwrap().len(), 0);
+    assert!(lock_state(&context.peers)?.is_empty());
     Ok(())
 }

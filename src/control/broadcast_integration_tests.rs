@@ -1,5 +1,3 @@
-#![allow(clippy::disallowed_methods)] // Socket barriers and assertions in tests.
-
 use std::sync::Arc;
 
 use futures_util::StreamExt;
@@ -32,6 +30,7 @@ async fn report(
 }
 
 #[tokio::test]
+#[allow(clippy::disallowed_methods)] // tokio::test generates expect when creating its runtime.
 async fn broadcast_is_scoped_to_exact_pair_and_excludes_source_and_unregistered()
 -> ControlResult<()> {
     run_case(|h| {
@@ -92,6 +91,7 @@ async fn broadcast_is_scoped_to_exact_pair_and_excludes_source_and_unregistered(
 }
 
 #[tokio::test]
+#[allow(clippy::disallowed_methods)] // tokio::test generates expect when creating its runtime.
 async fn duplicate_unknown_results_and_acks_release_only_matching_pending_work() -> ControlResult<()>
 {
     run_case(|h| {
@@ -162,6 +162,7 @@ async fn duplicate_unknown_results_and_acks_release_only_matching_pending_work()
 }
 
 #[tokio::test]
+#[allow(clippy::disallowed_methods)] // tokio::test generates expect when creating its runtime.
 async fn missing_recipient_ack_closes_without_retransmission() -> ControlResult<()> {
     run_case(|h| {
         Box::pin(async move {
@@ -184,7 +185,11 @@ async fn missing_recipient_ack_closes_without_retransmission() -> ControlResult<
                 Some(&ReliabilityError::Unconfirmed { message_id: 1 })
             );
             assert!(matches!(
-                recipient.read.next().await.unwrap()?,
+                recipient
+                    .read
+                    .next()
+                    .await
+                    .ok_or("missing recipient close frame")??,
                 Message::Close(_)
             ));
             source.send(PAYLOAD).await?;
@@ -197,6 +202,7 @@ async fn missing_recipient_ack_closes_without_retransmission() -> ControlResult<
 }
 
 #[tokio::test]
+#[allow(clippy::disallowed_methods)] // tokio::test generates expect when creating its runtime.
 async fn saturated_recipient_is_isolated_and_source_gets_partial_report() -> ControlResult<()> {
     run_case(|h| Box::pin(async move {
         let mut source = h.connect().await?;
@@ -217,7 +223,10 @@ async fn saturated_recipient_is_isolated_and_source_gets_partial_report() -> Con
         healthy.barrier().await?;
         let error = h.result(slow.index).await.expect_err("saturated recipient");
         assert_eq!(error.downcast_ref::<ReliabilityError>(), Some(&ReliabilityError::SlowConsumer));
-        assert!(matches!(slow.read.next().await.unwrap()?, Message::Close(_)));
+        assert!(matches!(
+            slow.read.next().await.ok_or("missing slow recipient close frame")??,
+            Message::Close(_)
+        ));
         let id = source.send(PAYLOAD).await?;
         report(&mut source, id, 1, 0).await?;
         assert_eq!(healthy.event().await?, ClientEvent::Received { message_id: 34 });
@@ -230,6 +239,7 @@ async fn saturated_recipient_is_isolated_and_source_gets_partial_report() -> Con
 }
 
 #[tokio::test]
+#[allow(clippy::disallowed_methods)] // tokio::test generates expect when creating its runtime.
 async fn acked_slots_allow_progress_with_an_old_notification_pending() -> ControlResult<()> {
     run_case(|h| Box::pin(async move {
         let mut source = h.connect().await?;
@@ -255,6 +265,7 @@ async fn acked_slots_allow_progress_with_an_old_notification_pending() -> Contro
 }
 
 #[tokio::test]
+#[allow(clippy::disallowed_methods)] // tokio::test generates expect when creating its runtime.
 async fn exact_escaped_notification_limit_is_validated_before_fanout() -> ControlResult<()> {
     run_case(|h| {
         Box::pin(async move {
@@ -298,6 +309,7 @@ async fn exact_escaped_notification_limit_is_validated_before_fanout() -> Contro
 }
 
 #[tokio::test]
+#[allow(clippy::disallowed_methods)] // tokio::test generates expect when creating its runtime.
 async fn cancellation_releases_work_and_closed_registry_handles_are_pruned() -> ControlResult<()> {
     run_case(|h| {
         Box::pin(async move {
@@ -334,6 +346,7 @@ async fn cancellation_releases_work_and_closed_registry_handles_are_pruned() -> 
 }
 
 #[tokio::test]
+#[allow(clippy::disallowed_methods)] // tokio::test generates expect when creating its runtime.
 async fn recipient_close_with_pending_delivery_reports_unconfirmed() -> ControlResult<()> {
     run_case(|h| {
         Box::pin(async move {

@@ -160,15 +160,24 @@ fn record_direct_activity(
     src: SocketAddr,
     now: Instant,
 ) -> std::io::Result<()> {
-    let mut guard = peers
-        .lock()
-        .map_err(|_| std::io::Error::other("Cannot process message: peers mutex is poisoned"))?;
-    if let Some(peer) = guard.iter_mut().find(|peer| peer.addr == src)
-        && !peer.use_server_relay
-        && !peer.relay_requested
-    {
-        peer.last_direct_activity = Some(now);
-        peer.connected = true;
+    let first_observation = {
+        let mut guard = peers.lock().map_err(|_| {
+            std::io::Error::other("Cannot process message: peers mutex is poisoned")
+        })?;
+        if let Some(peer) = guard.iter_mut().find(|peer| peer.addr == src)
+            && !peer.use_server_relay
+            && !peer.relay_requested
+        {
+            let first = peer.last_direct_activity.is_none();
+            peer.last_direct_activity = Some(now);
+            peer.connected = true;
+            first.then(|| peer.username.clone())
+        } else {
+            None
+        }
+    };
+    if let Some(name) = first_observation {
+        println!("Direct path observed from {name} at {src}; stopped hole punching");
     }
     Ok(())
 }
@@ -258,7 +267,12 @@ pub(crate) fn process_incoming_message_at(
             record_direct_activity(context.peers, src, now)?;
         }
         match line {
-            MSG_PING => handle_ping(context.socket, src),
+            MSG_PING => {
+                if src == context.server_addr {
+                    println!("Received PING from signaling server {src}; replying with PONG");
+                }
+                handle_ping(context.socket, src);
+            }
             MSG_PONG | MSG_HOLE_PUNCH => {}
             _ if src == context.server_addr => {
                 handle_mode_line(

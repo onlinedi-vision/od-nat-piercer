@@ -1,17 +1,20 @@
-#![allow(clippy::disallowed_methods)] // Parser boundary assertions, no networking.
-
 use super::*;
 
 #[test]
-fn counted_fields_leave_the_remaining_payload_opaque() {
+fn counted_fields_leave_the_remaining_payload_opaque() -> Result<(), &'static str> {
     let raw = "RELAY_DATA origin 2 first second 00ff  7  DATA direct\t00\n";
-    let mirror = RelayData::parse(raw).expect("valid mirror");
+    let mirror = RelayData::parse(raw).ok_or("valid mirror rejected")?;
     assert_eq!(mirror.data.sender, "origin");
     assert_eq!(mirror.direct, ["first", "second"]);
     assert_eq!(mirror.data.payload, "00ff  7  DATA direct\t00");
-    assert_eq!(mirror.encode().expect("encode"), raw.trim_end_matches('\n'));
-    let empty_set = RelayData::parse("RELAY_DATA origin 0 00ff").expect("zero exclusions");
+    assert_eq!(
+        mirror.encode().ok_or("encode failed")?,
+        raw.trim_end_matches('\n')
+    );
+    let empty_set =
+        RelayData::parse("RELAY_DATA origin 0 00ff").ok_or("zero exclusions rejected")?;
     assert_eq!(empty_set.direct, Vec::<&str>::new());
+    Ok(())
 }
 
 #[test]
@@ -45,12 +48,12 @@ fn invalid_counts_and_truncated_fields_are_rejected() {
 }
 
 #[test]
-fn exact_size_boundary_is_accepted_without_truncation() {
+fn exact_size_boundary_is_accepted_without_truncation() -> Result<(), &'static str> {
     let prefix = "RELAY_DATA origin 1 direct ";
     let payload = "a".repeat(MAX_ROUTED_DATA_BYTES - prefix.len());
     let raw = format!("{prefix}{payload}");
-    let mirror = RelayData::parse(&raw).expect("exact boundary");
-    assert_eq!(mirror.encode().expect("exact encode"), raw);
+    let mirror = RelayData::parse(&raw).ok_or("exact boundary rejected")?;
+    assert_eq!(mirror.encode().ok_or("exact encode failed")?, raw);
     assert_eq!(mirror.data.payload.len(), payload.len());
     assert!(RelayData::parse(&format!("{raw}a")).is_none());
     let oversized = format!("{payload}a");
@@ -73,4 +76,5 @@ fn exact_size_boundary_is_accepted_without_truncation() {
     assert!(Data::parse(&raw).is_some());
     // A trailing LF counts towards the datagram size; do not trim before checking.
     assert!(Data::parse(&format!("{raw}\n")).is_none());
+    Ok(())
 }

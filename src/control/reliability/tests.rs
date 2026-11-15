@@ -1,5 +1,3 @@
-#![allow(clippy::disallowed_methods)] // Tokio test runtime and explicit test assertions.
-
 use std::{
     pin::Pin,
     task::{Context, Poll},
@@ -73,6 +71,7 @@ fn assert_error<T>(result: ControlResult<T>, expected: ReliabilityError) {
 }
 
 #[tokio::test]
+#[allow(clippy::disallowed_methods)] // tokio::test generates expect when creating its runtime.
 async fn pending_count_allows_progress_while_oldest_stays_pending() -> ControlResult<()> {
     let mut sender = ReliableSender::default();
     let mut sink = TestSink::default();
@@ -101,6 +100,7 @@ async fn pending_count_allows_progress_while_oldest_stays_pending() -> ControlRe
 }
 
 #[tokio::test]
+#[allow(clippy::disallowed_methods)] // tokio::test generates expect when creating its runtime.
 async fn deadline_fails_without_retransmission() -> ControlResult<()> {
     let (time, ticks) = tokio::sync::watch::channel(Instant::now());
     let clock = Clock::Manual(ticks);
@@ -122,6 +122,7 @@ async fn deadline_fails_without_retransmission() -> ControlResult<()> {
 }
 
 #[tokio::test]
+#[allow(clippy::disallowed_methods)] // tokio::test generates expect when creating its runtime.
 async fn exact_serialized_limits_and_local_errors_preserve_next_id() -> ControlResult<()> {
     let mut sender = ReliableSender::default();
     let mut sink = TestSink::default();
@@ -166,6 +167,7 @@ fn sequence_rejects_zero_gaps_reuse_and_exhaustion() {
 }
 
 #[tokio::test]
+#[allow(clippy::disallowed_methods)] // tokio::test generates expect when creating its runtime.
 async fn sender_never_wraps_or_reuses_exhausted_counter() -> ControlResult<()> {
     let mut sender = ReliableSender {
         next_id: Some(u64::MAX),
@@ -186,6 +188,7 @@ async fn sender_never_wraps_or_reuses_exhausted_counter() -> ControlResult<()> {
 }
 
 #[tokio::test]
+#[allow(clippy::disallowed_methods)] // tokio::test generates expect when creating its runtime.
 async fn failed_cancelled_and_closed_writes_release_reservations() -> ControlResult<()> {
     for fail in [true, false] {
         let (peer, mut queue, _) = super::super::recipient::ControlPeer::new();
@@ -224,6 +227,7 @@ async fn failed_cancelled_and_closed_writes_release_reservations() -> ControlRes
 }
 
 #[tokio::test(start_paused = true)]
+#[allow(clippy::disallowed_methods)] // tokio::test generates expect when creating its runtime.
 async fn failed_or_stalled_ping_flush_closes_client_pending_requests() -> ControlResult<()> {
     use super::super::{
         client::{ClientState, receive_event},
@@ -266,6 +270,7 @@ async fn failed_or_stalled_ping_flush_closes_client_pending_requests() -> Contro
 }
 
 #[tokio::test(start_paused = true)]
+#[allow(clippy::disallowed_methods)] // tokio::test generates expect when creating its runtime.
 async fn stalled_write_and_close_are_bounded() {
     let mut sender = ReliableSender::default();
     let mut sink = TestSink {
@@ -285,6 +290,7 @@ async fn stalled_write_and_close_are_bounded() {
 }
 
 #[tokio::test]
+#[allow(clippy::disallowed_methods)] // tokio::test generates expect when creating its runtime.
 async fn confirmation_deadline_starts_after_completed_write() -> ControlResult<()> {
     struct Delayed {
         time: tokio::sync::watch::Sender<Instant>,
@@ -326,6 +332,7 @@ async fn confirmation_deadline_starts_after_completed_write() -> ControlResult<(
 }
 
 #[tokio::test]
+#[allow(clippy::disallowed_methods)] // tokio::test generates expect when creating its runtime.
 async fn queue_and_pending_share_capacity_and_release_on_ack_or_termination() -> ControlResult<()> {
     use super::super::recipient::{ControlPeer, Outbound};
     let (peer, mut queue, _) = ControlPeer::new();

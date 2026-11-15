@@ -30,16 +30,21 @@ pub async fn handle_relay_request(
         else {
             return;
         };
-        let Some(relay_name) = channel.relay.as_deref() else {
-            return;
-        };
-        // Only the current registered relay can report another peer's path.
-        if relay_name == username
-            || !channel
+        let relay_name = channel.relay.as_deref();
+        let relay_report = relay_name.is_some_and(|relay| {
+            relay != username
+                && channel
+                    .users
+                    .iter()
+                    .any(|user| user.name == relay && user.addr == src)
+        });
+        let self_request = parts[0] == crate::proto::control_text::MSG_REQUEST_RELAY
+            && relay_name != Some(username)
+            && channel
                 .users
                 .iter()
-                .any(|user| user.name == relay_name && user.addr == src)
-        {
+                .any(|user| user.name == username && user.addr == src);
+        if !relay_report && !self_request {
             return;
         }
         let Some(target) = channel.users.iter_mut().find(|user| user.name == username) else {

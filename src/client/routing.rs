@@ -22,6 +22,12 @@ fn direct_targets(
         {
             continue;
         }
+        if peer.relay_requested {
+            if !relay {
+                break; // Do not revive an older upstream after this one failed.
+            }
+            continue;
+        }
         targets.push((peer.username.clone(), peer.addr));
         if !relay {
             break; // An ordinary sender submits to one distribution owner.

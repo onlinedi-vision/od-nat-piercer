@@ -5,7 +5,7 @@ use std::{collections::HashMap, io, net::Ipv4Addr, sync::Arc, time::Duration};
 use tokio::{net::UdpSocket, sync::Mutex, time::timeout};
 
 use super::{
-    handlers::handle_message,
+    handlers::{handle_message, utils::update_relay_after_departure},
     structures::{Channel, NatKind, ServerMap, User},
 };
 
@@ -274,6 +274,173 @@ async fn matched_disconnect_removes_once_and_late_reports_cannot_restore_it() ->
                 .assert_next_message_is_probe_response(recipient)
                 .await?;
         }
+    }
+    Ok(())
+}
+
+#[test]
+fn relay_departure_selects_only_eligible_candidates_before_notifications() {
+    let address = (Ipv4Addr::LOCALHOST, 30001).into();
+    let mut blocked = User::new("blocked", address, NatKind::Cone, 1);
+    blocked.needs_server_relay = true;
+    let symmetric = User::new("symmetric", address, NatKind::Symmetric, 2);
+    let eligible = User::new("eligible", address, NatKind::Public, 3);
+    for (users, expected) in [
+        (vec![blocked.clone(), eligible], Some("eligible")),
+        (vec![blocked, symmetric], None),
+        (Vec::new(), None),
+    ] {
+        let mut channel = Channel {
+            users,
+            relay: Some("departed".into()),
+            ..Channel::default()
+        };
+        assert_eq!(update_relay_after_departure(&mut channel, true), None);
+        assert_eq!(channel.relay.as_deref(), expected);
+    }
+}
+
+#[tokio::test]
+async fn relay_disconnect_respects_lone_peer_eligibility() -> io::Result<()> {
+    for (nat_kind, needs_server_relay, expected_mode) in [
+        (NatKind::Symmetric, true, "MODE SERVER_RELAY peer\n"),
+        (NatKind::Symmetric, false, "MODE SERVER_RELAY peer\n"),
+        (NatKind::Cone, true, "MODE SERVER_RELAY peer\n"),
+        (NatKind::Cone, false, "MODE RELAY\n"),
+        (NatKind::Public, false, "MODE RELAY\n"),
+        (NatKind::Unknown, false, "MODE RELAY\n"),
+    ] {
+        let fixture = Fixture::new().await?;
+        {
+            let mut state = fixture.state.lock().await;
+            let channel = state
+                .get_mut("s")
+                .expect("server")
+                .get_mut("c")
+                .expect("channel");
+            channel.users.retain(|user| user.name != "other");
+            channel.users[1].nat_kind = nat_kind;
+            channel.users[1].needs_server_relay = needs_server_relay;
+        }
+        let before = fixture.channel().await;
+        fixture
+            .command(&fixture.relay, "DISCONNECT s c relay")
+            .await?;
+        assert_eq!(fixture.receive(&fixture.peer).await?, expected_mode);
+        assert_eq!(
+            fixture.receive(&fixture.peer).await?,
+            format!("USER_LEFT relay {}\n", fixture.relay.local_addr()?)
+        );
+        let after = fixture.channel().await;
+        assert_eq!(after.users.len(), 1);
+        let mut expected = before;
+        expected.users.remove(0);
+        expected.relay = (expected_mode == "MODE RELAY\n").then(|| "peer".into());
+        same_membership(&expected, &after);
+        assert_eq!(after.users[0].needs_server_relay, needs_server_relay);
+        fixture
+            .command(&fixture.relay, "DISCONNECT s c relay")
+            .await?;
+        same_membership(&after, &fixture.channel().await);
+        for recipient in [&fixture.relay, &fixture.peer, &fixture.other] {
+            fixture
+                .assert_next_message_is_probe_response(recipient)
+                .await?;
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn registered_nonrelay_can_request_only_its_own_fallback() -> io::Result<()> {
+    let fixture = Fixture::new().await?;
+    let outsider = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+    let before = fixture.channel().await;
+    for (source, command) in [
+        (&outsider, "REQUEST_RELAY s c peer"),
+        (&fixture.other, "REQUEST_RELAY s c peer"),
+        (&fixture.peer, "REQUEST_RELAY s c other"),
+        (&fixture.peer, "REQUEST_RELAY wrong c peer"),
+        (&fixture.peer, "PEER_TIMEOUT s c peer"),
+        (&fixture.relay, "REQUEST_RELAY s c relay"),
+    ] {
+        fixture.command(source, command).await?;
+        same_membership(&before, &fixture.channel().await);
+        assert!(!fixture.channel().await.users[1].needs_server_relay);
+    }
+    for _ in 0..2 {
+        fixture
+            .command(&fixture.peer, "REQUEST_RELAY s c peer")
+            .await?;
+        let after = fixture.channel().await;
+        same_membership(&before, &after);
+        assert!(after.users[1].needs_server_relay);
+        for recipient in [&fixture.relay, &fixture.peer, &fixture.other] {
+            assert_eq!(
+                fixture.receive(recipient).await?,
+                "MODE SERVER_RELAY peer\n"
+            );
+            fixture
+                .assert_next_message_is_probe_response(recipient)
+                .await?;
+        }
+    }
+    fixture
+        .command(&fixture.peer, "DISCONNECT s c peer")
+        .await?;
+    for recipient in [&fixture.relay, &fixture.other] {
+        assert_eq!(
+            fixture.receive(recipient).await?,
+            format!("USER_LEFT peer {}\n", fixture.peer.local_addr()?)
+        );
+    }
+    fixture
+        .command(&fixture.peer, "REQUEST_RELAY s c peer")
+        .await?;
+    for recipient in [&fixture.relay, &fixture.peer, &fixture.other] {
+        fixture
+            .assert_next_message_is_probe_response(recipient)
+            .await?;
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn relay_handover_keeps_server_only_members_on_server_routes() -> io::Result<()> {
+    let fixture = Fixture::new().await?;
+    {
+        let mut state = fixture.state.lock().await;
+        let channel = state
+            .get_mut("s")
+            .expect("server")
+            .get_mut("c")
+            .expect("channel");
+        channel.users[1].nat_kind = NatKind::Symmetric;
+        channel.users[1].needs_server_relay = true;
+    }
+    fixture
+        .command(&fixture.relay, "DISCONNECT s c relay")
+        .await?;
+    let channel = fixture.channel().await;
+    assert_eq!(channel.relay.as_deref(), Some("other"));
+    assert_eq!(channel.users.len(), 2);
+    assert_eq!(
+        fixture.receive(&fixture.peer).await?,
+        "MODE SERVER_RELAY peer\n"
+    );
+    assert_eq!(fixture.receive(&fixture.other).await?, "MODE RELAY\n");
+    assert_eq!(
+        fixture.receive(&fixture.other).await?,
+        "MODE SERVER_RELAY peer\n"
+    );
+    for recipient in [&fixture.peer, &fixture.other] {
+        assert_eq!(
+            fixture.receive(recipient).await?,
+            format!("USER_LEFT relay {}\n", fixture.relay.local_addr()?)
+        );
+        fixture
+            .assert_next_message_is_probe_response(recipient)
+            .await?;
     }
     Ok(())
 }

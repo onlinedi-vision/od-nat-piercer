@@ -55,8 +55,8 @@ and relies on server relaying, so traffic can follow an indirect path instead.
 For a channel with an eligible participant, relay selection chooses the first
 eligible user in channel order and introduces the other direct peers to that
 participant. Server fallback can also be requested after direct connectivity
-fails. The current routing and relay handover still need lifecycle work before
-they can support dependable voice calls.
+fails. Path monitoring detects direct/participant-relay inactivity independently of
+server registration expiry. Delivery and voice recovery still require validation.
 
 These classifications are heuristic: they do not identify every NAT behavior or
 guarantee direct connectivity. A symmetric classification guides the current
@@ -74,8 +74,12 @@ Implemented so far:
 - UDP signaling, channel membership tracking, and peer discovery.
 - Heuristic NAT probing, UDP hole punching, and basic direct peer communication.
 - Prototype participant and server relay paths for terminal text traffic.
-- Peer-path failure reports request server fallback while preserving participant
-  registrations; server departure notices follow actual registration removal.
+- Path checks every 250 ms, relay probes at 1 s, and established-path inactivity
+  at 5 s; initial connection setup has a separate 12 s grace.
+- Relay reports and registered participants' self-requests select server fallback
+  without removing registrations. Relay handover selects eligible participants.
+- CLI EOF stops network workers and attempts DISCONNECT; forced termination still
+  relies on server registration expiry.
 - JSON CONTROL messages over WebSocket, with explicit registration/broadcast
   results, strict consecutive IDs, processing ACKs, and finite waits without retries.
 - Channel-scoped CONTROL broadcast, independent recipient limits, and partial
@@ -99,8 +103,8 @@ encryption remain to be implemented.
 
 ## What remains to build
 
-- Establish consistent membership, routing, disconnect, and shutdown behavior,
-  including reconnect and control-state recovery.
+- Add application session generations, reconnect and route/control-state recovery
+  through the reusable runtime boundary.
 - Add binary media transport and expose a reusable session runtime for the
   client application.
 - Integrate audio from `od-client` for the first controlled development voice
@@ -164,6 +168,10 @@ Use the same server and channel values, with distinct users and local ports.
 The clients receive peer IDs, open CONTROL connections, and exchange UDP
 connectivity messages. This example exercises the current connectivity and
 CONTROL prototype. Stop each process with `Ctrl+C` when finished.
+
+For a controlled client leave, close stdin (EOF). The CLI stops its network
+workers and attempts DISCONNECT. Forced process termination or a lost departure
+packet still relies on server registration expiry.
 
 ## Documentation
 

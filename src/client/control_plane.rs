@@ -1,4 +1,4 @@
-use crate::control::client::start_control_client;
+use crate::control::client::{ControlWorker, start_control_client};
 
 pub(crate) fn should_start_control_client(control_client_started: bool, peer_id: u32) -> bool {
     !control_client_started && peer_id != 0
@@ -11,13 +11,13 @@ pub fn start_control_client_after_welcome(
     channel: &str,
     user: &str,
     peer_id: u32,
-) {
+) -> Option<ControlWorker> {
     if !should_start_control_client(*control_client_started, peer_id) {
-        return;
+        return None;
     }
 
-    start_control_client(
-        signaling_ip.to_string(),
+    let worker = start_control_client(
+        signaling_ip,
         server_id.to_string(),
         channel.to_string(),
         user.to_string(),
@@ -27,4 +27,5 @@ pub fn start_control_client_after_welcome(
     *control_client_started = true;
 
     println!("Started control WebSocket client with peer_id={peer_id}");
+    Some(worker)
 }

@@ -99,16 +99,21 @@ correct recovery from every participant change.
 | `CONNECT <server_id> <channel> <user> <nat_type>` | Join or refresh a prototype participant. |
 | `HB <server_id> <channel> <user>` | Refresh liveness for a matching participant and source address. |
 | `PING` / `PONG` | Probe liveness and refresh matching users on PONG. |
-| `REQUEST_RELAY <server_id> <channel> <user>` | Current participant relay requests server forwarding for another registered participant. |
+| `REQUEST_RELAY <server_id> <channel> <user>` | Selected relay reports another registered member, or a registered non-relay requests its own fallback. |
 | `PEER_TIMEOUT <server_id> <channel> <user>` | Current participant relay reports a failed peer path and requests fallback; membership is preserved. |
-| `DISCONNECT <server_id> <channel> <user>` | Handle an explicit departure; the normal client does not send it on termination. |
+| `DISCONNECT <server_id> <channel> <user>` | Handle explicit departure; the CLI attempts it on controlled normal/error exit. |
 | `DATA <user> <text>` | Forward prototype text according to current channel/relay state. |
 
-These commands are not a production authorization boundary. Both fallback
-reports require the UDP source to match the currently selected registered relay
-and the target to be a different existing participant. Address matching is not
+These commands are not a production authorization boundary. PEER_TIMEOUT requires the selected registered relay reporting another existing
+member. REQUEST_RELAY also accepts a registered non-relay requesting its own
+fallback, with matching source address and username. Address matching is not
 cryptographic authentication. Valid reports change routing, not membership;
 unmatched or repeated DISCONNECT messages send no departure notification.
+
+Clients check paths every 250 ms. Relay PING/PONG probing is about one pair per
+second per active direct link. Established inactivity uses 5 s; initial connection
+setup has a separate 12 s grace. Nominal request bounds are 5–5.25 s / 12–12.25 s,
+plus scheduling delay; UDP requests/notices do not guarantee completed fallback.
 
 The heartbeat worker scans every 20 seconds. Users whose recorded liveness is
 older than 40 seconds can be removed on a scan, with departure notifications and

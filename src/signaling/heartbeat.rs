@@ -1,108 +1,24 @@
 use crate::{
-    proto::control_text::{
-        MSG_DIRECT, MSG_MODE, MSG_PING, MSG_RELAY, MSG_SERVER_RELAY, MSG_USER_LEFT,
-    },
+    proto::control_text::{MSG_MODE, MSG_PING, MSG_SERVER_RELAY, MSG_USER_LEFT},
     signaling::{handlers::utils::pick_eligible_relay, structures::ServerMap},
 };
-use std::{net::SocketAddr, sync::Arc, time::Duration};
+use std::{
+    net::SocketAddr,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 use tokio::{net::UdpSocket, sync::Mutex};
+
+const SERVER_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(20);
+const REGISTRATION_EXPIRY: Duration = Duration::from_secs(40);
 
 fn handle_relay_timeout(
     channel: &mut crate::signaling::structures::Channel,
     notifications: &mut Vec<(Vec<SocketAddr>, Vec<u8>)>,
 ) {
-    if let Some(new_relay_user) = pick_eligible_relay(channel) {
-        //setting the new relay in channel
-        channel.relay = Some(new_relay_user.name.clone());
-
-        //1) Send MODE RELAY just to the new relay
-        notifications.push((
-            vec![new_relay_user.addr],
-            format!("{MSG_MODE} {MSG_RELAY}\n").as_bytes().to_vec(),
-        ));
-
-        //2) Send to every peer: "MODE DIRECT <relay_name> <relay_addr>"
-        let peers_addrs: Vec<SocketAddr> = channel
-            .users
-            .iter()
-            .filter(|u| u.name != new_relay_user.name)
-            .map(|u| u.addr)
-            .collect();
-        if !peers_addrs.is_empty() {
-            let notice = format!(
-                "{} {} {} {}\n",
-                MSG_MODE, MSG_DIRECT, new_relay_user.name, new_relay_user.addr
-            );
-            notifications.push((peers_addrs, notice.into_bytes()));
-        }
-
-        // 3) Send new relay info about all other peers: "MODE DIRECT <peer> <addr>"
-        let mut peers_to_new_msg = Vec::new();
-        for peer in channel
-            .users
-            .iter()
-            .filter(|u| u.name != new_relay_user.name)
-        {
-            let m = format!("{} {} {} {}\n", MSG_MODE, MSG_DIRECT, peer.name, peer.addr);
-            peers_to_new_msg.extend_from_slice(m.as_bytes());
-        }
-        if !peers_to_new_msg.is_empty() {
-            notifications.push((vec![new_relay_user.addr], peers_to_new_msg));
-        }
-    } else {
-        //No eligible user -> no RELAY
-        // we just keep the server as relay (send MODE SERVER_RELAY <user> to all users)
-        channel.relay = None;
-        if !channel.users.is_empty() {
-            let mut payload = Vec::new();
-            for u in &channel.users {
-                let m = format!("{} {} {}\n", MSG_MODE, MSG_SERVER_RELAY, u.name);
-                payload.extend_from_slice(m.as_bytes());
-            }
-
-            //send to all users from channel
-            let all_addrs: Vec<SocketAddr> = channel.users.iter().map(|u| u.addr).collect();
-            notifications.push((all_addrs, payload));
-        }
-    }
-}
-
-fn handle_timed_out_user(
-    server_id: &str,
-    channel_name: &str,
-    channel: &mut crate::signaling::structures::Channel,
-    user_index: usize,
-    user_name: &str,
-    user_addr: SocketAddr,
-    notifications: &mut Vec<(Vec<SocketAddr>, Vec<u8>)>,
-) {
-    println!("User {user_name} timed out from {server_id}-{channel_name}");
-
-    let msg = format!("{MSG_USER_LEFT} {user_name} {user_addr}\n");
-    let peers_to_notify: Vec<SocketAddr> = channel
-        .users
-        .iter()
-        .filter(|u| u.addr != user_addr)
-        .map(|u| u.addr)
-        .collect();
-
-    if !peers_to_notify.is_empty() {
-        notifications.push((peers_to_notify, msg.as_bytes().to_vec()));
-    }
-
-    let was_relay = channel.relay.as_ref().is_some_and(|r| r == user_name);
-
-    channel.users.remove(user_index);
-
-    if was_relay {
-        handle_relay_timeout(channel, notifications);
-    } else if channel.users.len() == 1 {
-        channel.relay = Some(channel.users[0].name.clone());
-        notifications.push((
-            vec![channel.users[0].addr],
-            format!("{MSG_MODE} {MSG_RELAY}\n").as_bytes().to_vec(),
-        ));
-    }
+    notifications.extend(crate::signaling::handlers::notifications::relay_handover(
+        channel,
+    ));
 }
 
 fn process_channel_heartbeat(
@@ -112,54 +28,72 @@ fn process_channel_heartbeat(
     pings: &mut Vec<SocketAddr>,
     cleanup: &mut Vec<(String, String)>,
     notifications: &mut Vec<(Vec<SocketAddr>, Vec<u8>)>,
+    now: Instant,
 ) {
-    //Process timeout users
-    let mut i = 0;
-    while i < channel.users.len() {
-        let user_clone = &channel.users[i].clone();
-
-        if user_clone.last_pong.elapsed() > Duration::from_secs(40) {
-            handle_timed_out_user(
-                server_id,
-                channel_name,
-                channel,
-                i,
-                &user_clone.name,
-                user_clone.addr,
-                notifications,
-            );
+    let mut expired = Vec::new();
+    channel.users.retain(|user| {
+        if now.saturating_duration_since(user.last_pong) > REGISTRATION_EXPIRY {
+            expired.push(user.clone());
+            false
         } else {
-            i += 1;
+            true
         }
-    }
-
-    if channel.users.len() == 1 {
-        //one lone user, if he's eligible, we keep him as relay, otherwise the server remains relay
-        let solo = channel.users[0].clone();
-        let is_eligible = !solo.needs_server_relay;
-
-        if is_eligible {
-            pings.push(solo.addr);
-            channel.relay = Some(solo.name.clone());
-        } else {
-            //not eligible, don't promote him as relay, keep server as relay
-            channel.relay = None;
-
-            //announce it
+    });
+    let relay_expired = expired
+        .iter()
+        .any(|user| channel.relay.as_deref() == Some(&user.name));
+    for user in &expired {
+        println!(
+            "User {} timed out from {server_id}-{channel_name}",
+            user.name
+        );
+        let recipients = channel
+            .users
+            .iter()
+            .map(|peer| peer.addr)
+            .collect::<Vec<_>>();
+        if !recipients.is_empty() {
             notifications.push((
-                vec![solo.addr],
-                format!("{} {} {}\n", MSG_MODE, MSG_SERVER_RELAY, solo.name).into_bytes(),
+                recipients,
+                format!("{MSG_USER_LEFT} {} {}\n", user.name, user.addr).into_bytes(),
             ));
         }
     }
-
+    // Remove the whole expired batch before selecting anyone as a relay.
+    if !expired.is_empty() && (relay_expired || channel.users.len() == 1) {
+        handle_relay_timeout(channel, notifications);
+    }
+    if channel.users.len() == 1 {
+        if let Some(solo) = pick_eligible_relay(channel) {
+            pings.push(solo.addr);
+            channel.relay = Some(solo.name);
+        } else {
+            channel.relay = None;
+            let solo = &channel.users[0];
+            notifications.push((
+                vec![solo.addr],
+                format!("{MSG_MODE} {MSG_SERVER_RELAY} {}", solo.name).into_bytes(),
+            ));
+        }
+    }
     if channel.users.is_empty() {
-        cleanup.push((server_id.to_string(), channel_name.to_string()));
+        cleanup.push((server_id.to_owned(), channel_name.to_owned()));
     }
 }
 
 async fn collect_heartbeat_data(
     state: Arc<Mutex<ServerMap>>,
+) -> (
+    Vec<SocketAddr>,
+    Vec<(String, String)>,
+    Vec<(Vec<SocketAddr>, Vec<u8>)>,
+) {
+    collect_heartbeat_data_at(state, Instant::now()).await
+}
+
+async fn collect_heartbeat_data_at(
+    state: Arc<Mutex<ServerMap>>,
+    now: Instant,
 ) -> (
     Vec<SocketAddr>,
     Vec<(String, String)>,
@@ -183,6 +117,7 @@ async fn collect_heartbeat_data(
                         &mut pings,
                         &mut cleanup,
                         &mut notifications,
+                        now,
                     );
                 }
             }
@@ -232,7 +167,7 @@ async fn cleanup_empty_channels(state: Arc<Mutex<ServerMap>>, to_cleanup: Vec<(S
 
 pub fn start_heartbeat(socket: Arc<UdpSocket>, state: Arc<Mutex<ServerMap>>) {
     tokio::spawn(async move {
-        let mut interval = tokio::time::interval(Duration::from_secs(20));
+        let mut interval = tokio::time::interval(SERVER_HEARTBEAT_INTERVAL);
         loop {
             interval.tick().await;
 

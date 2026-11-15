@@ -600,3 +600,30 @@ async fn cancelling_client_receive_closes_state_and_releases_pending() -> Contro
     })
     .await?
 }
+
+#[tokio::test]
+async fn dropping_control_worker_cancels_a_pending_registration_and_closes_socket()
+-> ControlResult<()> {
+    timeout(std::time::Duration::from_secs(2), async {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let worker = super::client::control_worker(
+            format!("ws://{}", listener.local_addr()?),
+            ControlMessage::JoinControl {
+                request_id: 1,
+                server_id: "s".into(),
+                channel: "c".into(),
+                user: "me".into(),
+                peer_id: 1,
+            },
+        );
+        let (stream, _) = listener.accept().await?;
+        let mut server = tokio_tungstenite::accept_async(stream).await?;
+        let registration = server.next().await.ok_or("missing join")??;
+        assert!(matches!(registration, Message::Text(_)));
+        // Cancellation must not wait for the five-second registration result.
+        drop(worker);
+        assert!(matches!(server.next().await, None | Some(Err(_))));
+        Ok(())
+    })
+    .await?
+}

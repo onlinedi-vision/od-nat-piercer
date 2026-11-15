@@ -6,18 +6,15 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::client::routing::send_data;
-use crate::client::structures::{NatKind, PeerInfo, PunchSync, RelaySync};
+use crate::client::structures::{NatKind, PeerInfo, PunchSync};
 use crate::proto::control_text::{
-    MSG_DATA, MSG_HB, MSG_HOLE_PUNCH, MSG_NAT_PROBE, MSG_NAT_SEEN, MSG_PEER_TIMEOUT, MSG_PING,
-    MSG_REQUEST_RELAY, NAT_TYPE_CONE, NAT_TYPE_SYMMETRIC,
+    MSG_DATA, MSG_HB, MSG_HOLE_PUNCH, MSG_NAT_PROBE, MSG_NAT_SEEN, NAT_TYPE_CONE,
+    NAT_TYPE_SYMMETRIC,
 };
 
 const PUNCH_INITIAL_SLEEP_MS: u64 = 150; //initial sleep between punches
 const PUNCH_MAX_SLEEP_MS: u64 = 1500; // max sleep value between punches
 const HEARTBEAT_SLEEP_SEC: u64 = 20; // sleep between heartbeats
-const RELAY_TICK_SEC: u64 = 15; // how often the relay does keepalive work
-const PEER_TIMEOUT_SEC: u64 = 60; //peer timeout if no PONG message in this time
-const CONNECT_GRACE_SEC: u64 = 12; // wait for connection for this time, after this, ask server for relay
 const NAT_DETECT_TOTAL_TIMEOUT_MS: u64 = 600; // maximum waiting time for server to respond to both probes
 const NAT_DETECT_POLL_SLEEP_MS: u64 = 20; // sleep between polls when socket is WouldBlock
 
@@ -73,18 +70,30 @@ pub fn detect_nat_kind(socket: &UdpSocket, signaling_ip: &str) -> NatKind {
     }
 }
 
-fn heartbeat_loop(
-    socket: &UdpSocket,
-    server_id: &str,
-    channel: &str,
-    user: &str,
-    signaling_addr: &str,
-) {
-    loop {
-        let hb = format!("{MSG_HB} {server_id} {channel} {user}");
-        let _ = socket.send_to(hb.as_bytes(), signaling_addr);
-        thread::sleep(Duration::from_secs(HEARTBEAT_SLEEP_SEC));
-    }
+/// Requests local worker shutdown and wakes paused/sleeping workers.
+pub fn stop_workers(sync: &PunchSync) {
+    let (lock, wake) = &**sync;
+    let mut state = lock
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    state.stopping = true;
+    wake.notify_all();
+}
+
+#[must_use]
+pub fn workers_stopping(sync: &PunchSync) -> bool {
+    sync.0.lock().map_or(true, |state| state.stopping)
+}
+
+fn wait_for_worker_tick(sync: &PunchSync, duration: Duration) -> bool {
+    let (lock, wake) = &**sync;
+    let Ok(state) = lock.lock() else {
+        return false;
+    };
+    let Ok((state, _)) = wake.wait_timeout_while(state, duration, |state| !state.stopping) else {
+        return false;
+    };
+    !state.stopping
 }
 
 pub fn start_heartbeat(
@@ -93,10 +102,19 @@ pub fn start_heartbeat(
     channel: String,
     user: String,
     signaling_addr: String,
-) {
+    sync: PunchSync,
+) -> thread::JoinHandle<()> {
     thread::spawn(move || {
-        heartbeat_loop(&socket, &server_id, &channel, &user, &signaling_addr);
-    });
+        let hb = format!("{MSG_HB} {server_id} {channel} {user}");
+        while !workers_stopping(&sync) {
+            if let Err(error) = socket.send_to(hb.as_bytes(), &signaling_addr) {
+                eprintln!("Failed registration heartbeat: {error}");
+            }
+            if !wait_for_worker_tick(&sync, Duration::from_secs(HEARTBEAT_SLEEP_SEC)) {
+                break;
+            }
+        }
+    })
 }
 
 fn hole_punching_loop(socket: &UdpSocket, peers: &Arc<Mutex<Vec<PeerInfo>>>, sync: &PunchSync) {
@@ -111,7 +129,7 @@ fn hole_punching_loop(socket: &UdpSocket, peers: &Arc<Mutex<Vec<PeerInfo>>>, syn
                 return;
             };
 
-            while state.paused {
+            while state.paused && !state.stopping {
                 //here the thread doesn't consume CPU
                 let Ok(next_state) = cvar.wait(state) else {
                     eprintln!("Hole punching stopped: punch state mutex is poisoned");
@@ -120,7 +138,9 @@ fn hole_punching_loop(socket: &UdpSocket, peers: &Arc<Mutex<Vec<PeerInfo>>>, syn
                 state = next_state;
             }
 
-            //here state.paused == false, we can punch
+            if state.stopping {
+                return;
+            }
         }
 
         {
@@ -128,8 +148,16 @@ fn hole_punching_loop(socket: &UdpSocket, peers: &Arc<Mutex<Vec<PeerInfo>>>, syn
                 eprintln!("Hole punching stopped: peers mutex is poisoned");
                 return;
             };
+            backoff.retain(|name, _| {
+                guard.iter().any(|peer| {
+                    &peer.username == name
+                        && !peer.connected
+                        && !peer.use_server_relay
+                        && !peer.relay_requested
+                })
+            });
             for p in guard.iter() {
-                if p.connected || p.use_server_relay {
+                if p.connected || p.use_server_relay || p.relay_requested {
                     continue; //don't punch server-relayed peers
                 }
 
@@ -151,7 +179,9 @@ fn hole_punching_loop(socket: &UdpSocket, peers: &Arc<Mutex<Vec<PeerInfo>>>, syn
             .min()
             .copied()
             .unwrap_or(PUNCH_INITIAL_SLEEP_MS);
-        thread::sleep(Duration::from_millis(sleep_ms));
+        if !wait_for_worker_tick(sync, Duration::from_millis(sleep_ms)) {
+            return;
+        }
     }
 }
 
@@ -159,187 +189,27 @@ pub fn start_hole_punching(
     socket: UdpSocket,
     peers: Arc<Mutex<Vec<PeerInfo>>>,
     punch_sync: PunchSync,
-) {
+) -> thread::JoinHandle<()> {
     thread::spawn(move || {
         hole_punching_loop(&socket, &peers, &punch_sync);
-    });
+    })
 }
 
-fn handle_peer_timeout(
-    socket: &UdpSocket,
-    server_id: &str,
-    channel: &str,
-    peer: &PeerInfo,
-    signaling_addr: &str,
-) {
-    println!("Peer {} timeout - reporting to server", peer.username);
-    let _ = socket.send_to(
-        format!(
-            "{MSG_PEER_TIMEOUT} {} {} {}",
-            server_id, channel, peer.username
-        )
-        .as_bytes(),
-        signaling_addr,
-    );
-}
-
-fn relay_main_loop(
-    socket: &UdpSocket,
-    peers: &Arc<Mutex<Vec<PeerInfo>>>,
-    server_id: &str,
-    channel: &str,
-    signaling_addr: &str,
-    relay_sync: &RelaySync,
-) -> std::io::Result<()> {
-    loop {
-        // stop immediatly if deactivated
-        {
-            let (lock, _) = &**relay_sync;
-            let st = lock.lock().map_err(|_| {
-                std::io::Error::other("Relay failed: relay state mutex is poisoned")
-            })?;
-            if !st.is_active {
-                return Ok(());
-            }
-        }
-
-        let mut to_remove = Vec::new();
-        {
-            let mut guard = peers.lock().map_err(|_| {
-                std::io::Error::other("Relay failed: peers mutex is poisoned")
-            })?;
-            for (i, peer) in guard.iter_mut().enumerate() {
-                if peer.use_server_relay {
-                    continue;
-                }
-
-                if peer.last_pong.elapsed() > Duration::from_secs(PEER_TIMEOUT_SEC) {
-                    handle_peer_timeout(socket, server_id, channel, peer, signaling_addr);
-                    to_remove.push(i);
-                } else {
-                    if let Err(e) = socket.send_to(MSG_PING.as_bytes(), peer.addr) {
-                        eprintln!("Failed to send PING to {}: {}", peer.addr, e);
-                    }
-
-                    if !peer.connected
-                        && peer.created_at.elapsed() > Duration::from_secs(CONNECT_GRACE_SEC)
-                        && !peer.relay_requested
-                    {
-                        println!(
-                            "Peer {} not connected after {}s - requesting server relay",
-                            peer.username, CONNECT_GRACE_SEC,
-                        );
-                        peer.relay_requested = true;
-                        let _ = socket.send_to(
-                            format!(
-                                "{MSG_REQUEST_RELAY} {} {} {}\n",
-                                server_id, channel, peer.username
-                            )
-                            .as_bytes(),
-                            signaling_addr,
-                        );
-                    }
-                }
-            }
-
-            for &idx in to_remove.iter().rev() {
-                guard.remove(idx);
-            }
-        }
-        // sleep up to 15s, but wake instantly if is_active flips
-        let (lock, cvar) = &**relay_sync;
-        let st = lock.lock().map_err(|_| {
-            std::io::Error::other("Relay failed: relay state mutex is poisoned")
-        })?;
-        let _ = cvar
-            .wait_timeout(st, Duration::from_secs(RELAY_TICK_SEC))
-            .map_err(|_| {
-                std::io::Error::other("Relay failed: relay state mutex is poisoned")
-            })?;
-    }
-}
-
-fn relay_keepalive_loop(
-    socket: &UdpSocket,
-    peers: &Arc<Mutex<Vec<PeerInfo>>>,
-    server_id: &str,
-    channel: &str,
-    signaling_addr: &str,
-    relay_sync: &RelaySync,
-) {
-    loop {
-        // wait until active
-        {
-            let (lock, cvar) = &**relay_sync;
-            let Ok(mut st) = lock.lock() else {
-                eprintln!("Relay keepalive stopped: relay state mutex is poisoned");
-                return;
-            };
-            while !st.is_active {
-                let Ok(next_state) = cvar.wait(st) else {
-                    eprintln!("Relay keepalive stopped: relay state mutex is poisoned");
-                    return;
-                };
-                st = next_state;
-            }
-        }
-
-        println!("Starting relay keepalive thread.");
-        // run main loop until deactivated
-        let relay_result = relay_main_loop(
-            socket,
-            peers,
-            server_id,
-            channel,
-            signaling_addr,
-            relay_sync,
-        );
-
-        if let Err(e) = &relay_result {
-            eprintln!("Relay keepalive stopped: {e}");
-        }
-
-        println!("Relay loop stopped.");
-
-        if relay_result.is_err() {
-            return;
-        }
-
-        //go back to waiting
-    }
-}
-
-pub fn start_relay_keepalive(
-    socket: UdpSocket,
-    peers: Arc<Mutex<Vec<PeerInfo>>>,
-    server_id: String,
-    channel: String,
-    signaling_addr: String,
-    relay_sync: RelaySync,
-) {
-    thread::spawn(move || {
-        relay_keepalive_loop(
-            &socket,
-            &peers,
-            &server_id,
-            &channel,
-            &signaling_addr,
-            &relay_sync,
-        );
-    });
-}
-
-struct UserMessageContext {
-    socket: UdpSocket,
-    peers: Arc<Mutex<Vec<PeerInfo>>>,
-    username: String,
-    send_via_server: Arc<AtomicBool>,
-    signaling_addr: String,
-    is_relay: Arc<Mutex<bool>>,
-    channel_has_server_relays: Arc<AtomicBool>,
+pub struct UserMessageContext {
+    pub socket: UdpSocket,
+    pub peers: Arc<Mutex<Vec<PeerInfo>>>,
+    pub username: String,
+    pub send_via_server: Arc<AtomicBool>,
+    pub signaling_addr: String,
+    pub is_relay: Arc<Mutex<bool>>,
+    pub channel_has_server_relays: Arc<AtomicBool>,
+    pub sync: PunchSync,
 }
 
 fn handle_user_message(context: &UserMessageContext, message: &str) -> std::io::Result<()> {
+    if workers_stopping(&context.sync) {
+        return Ok(());
+    }
     let payload = format!("{MSG_DATA} {} {message}\n", context.username);
 
     // The server is the sole distribution owner for this submission.
@@ -375,10 +245,8 @@ fn handle_user_message(context: &UserMessageContext, message: &str) -> std::io::
     )
 }
 
-fn user_input_loop(context: &UserMessageContext) {
-    use std::io::{self, BufRead};
-    let stdin = io::stdin();
-    for msg in stdin.lock().lines().map_while(Result::ok) {
+fn user_input_loop(context: &UserMessageContext, input: impl std::io::BufRead) {
+    for msg in input.lines().map_while(Result::ok) {
         let msg = msg.trim();
         if msg.is_empty() {
             continue;
@@ -392,28 +260,14 @@ fn user_input_loop(context: &UserMessageContext) {
             break;
         }
     }
+    stop_workers(&context.sync);
 }
 
-pub fn start_user_input(
-    socket: UdpSocket,
-    peers: Arc<Mutex<Vec<PeerInfo>>>,
-    username: String,
-    send_via_server: Arc<AtomicBool>,
-    signaling_addr: String,
-    is_relay: Arc<Mutex<bool>>,
-    channel_has_server_relays: Arc<AtomicBool>,
-) {
-    let context = UserMessageContext {
-        socket,
-        peers,
-        username,
-        send_via_server,
-        signaling_addr,
-        is_relay,
-        channel_has_server_relays,
-    };
-
-    thread::spawn(move || user_input_loop(&context));
+pub fn start_user_input(context: UserMessageContext) {
+    thread::spawn(move || {
+        let input = std::io::stdin();
+        user_input_loop(&context, input.lock());
+    });
 }
 
 #[cfg(test)]

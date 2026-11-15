@@ -103,3 +103,58 @@ async fn cleanup_still_removes_a_channel_that_remains_empty() {
     cleanup_empty_channels(Arc::clone(&state), cleanup).await;
     assert!(state.lock().await.is_empty());
 }
+
+#[tokio::test]
+async fn expiry_never_promotes_an_ineligible_or_already_expired_participant() {
+    let now = Instant::now();
+    let mut expired = user("expired", 1);
+    expired.last_pong = now
+        .checked_sub(Duration::from_secs(41))
+        .expect("fixture timestamp");
+    for nat_kind in [NatKind::Cone, NatKind::Symmetric] {
+        let mut remaining = user("remaining", 2);
+        remaining.nat_kind = nat_kind;
+        remaining.needs_server_relay = true;
+        remaining.last_pong = now;
+        let state = state(vec![expired.clone(), remaining], None);
+        let (_, _, notices) = collect_heartbeat_data_at(Arc::clone(&state), now).await;
+        assert_eq!(state.lock().await["s"]["c"].relay, None);
+        assert!(notices.iter().all(|(_, bytes)| bytes != b"MODE RELAY\n"));
+        assert!(
+            notices
+                .iter()
+                .any(|(_, bytes)| bytes.starts_with(b"MODE SERVER_RELAY remaining"))
+        );
+    }
+    let mut another = user("another", 2);
+    another.last_pong = expired.last_pong;
+    let state = state(vec![expired, another], Some("expired"));
+    let (_, cleanup, notices) = collect_heartbeat_data_at(Arc::clone(&state), now).await;
+    assert!(state.lock().await["s"]["c"].users.is_empty());
+    assert_eq!(state.lock().await["s"]["c"].relay, None);
+    assert_eq!(cleanup, [("s".into(), "c".into())]);
+    assert_eq!(notices.len(), 0);
+}
+
+#[tokio::test]
+async fn registration_expiry_keeps_its_own_threshold_and_scan_cadence() {
+    let start = Instant::now();
+    let mut member = user("member", 1);
+    member.last_pong = start;
+    let state = state(vec![member], Some("member"));
+    for scan in [
+        start,
+        start + SERVER_HEARTBEAT_INTERVAL,
+        start + REGISTRATION_EXPIRY,
+    ] {
+        collect_heartbeat_data_at(Arc::clone(&state), scan).await;
+        assert_eq!(state.lock().await["s"]["c"].users.len(), 1);
+    }
+    let (_, cleanup, _) = collect_heartbeat_data_at(
+        Arc::clone(&state),
+        start + REGISTRATION_EXPIRY + SERVER_HEARTBEAT_INTERVAL,
+    )
+    .await;
+    assert!(state.lock().await["s"]["c"].users.is_empty());
+    assert_eq!(cleanup, [("s".into(), "c".into())]);
+}

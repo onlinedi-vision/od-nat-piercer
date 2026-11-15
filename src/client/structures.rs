@@ -13,7 +13,7 @@ pub enum NatKind {
 #[derive(Clone, Debug)]
 pub struct PeerInfo {
     pub addr: SocketAddr,
-    pub last_pong: Instant,
+    pub last_direct_activity: Option<Instant>,
     pub username: String,
     pub connected: bool,
     pub created_at: Instant,
@@ -21,16 +21,10 @@ pub struct PeerInfo {
     pub relay_requested: bool,  //we asked server once
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct PunchState {
     pub paused: bool,
+    pub stopping: bool,
 }
 
 pub type PunchSync = Arc<(Mutex<PunchState>, Condvar)>;
-
-#[derive(Debug)]
-pub struct RelayState {
-    pub is_active: bool, // = is_relay || channel_has_server_relays
-}
-
-pub type RelaySync = Arc<(Mutex<RelayState>, Condvar)>;

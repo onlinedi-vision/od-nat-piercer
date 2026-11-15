@@ -82,7 +82,7 @@ impl Fixture {
         }
         let peers = Arc::new(Mutex::new(vec![PeerInfo {
             addr: direct.local_addr()?,
-            last_pong: Instant::now(),
+            last_direct_activity: Some(Instant::now()),
             username: "direct".into(),
             connected: true,
             created_at: Instant::now(),
@@ -192,6 +192,10 @@ impl Fixture {
             signaling_addr: self.server.local_addr()?.to_string(),
             is_relay: Arc::clone(&self.is_relay),
             channel_has_server_relays: Arc::clone(&self.has_server_peers),
+            sync: Arc::new((
+                Mutex::new(crate::client::structures::PunchState::default()),
+                std::sync::Condvar::new(),
+            )),
         })
     }
 }
@@ -209,7 +213,7 @@ fn expect_empty(endpoint: &UdpSocket) -> io::Result<()> {
 fn peer(name: &str, addr: SocketAddr, via_server: bool) -> PeerInfo {
     PeerInfo {
         addr,
-        last_pong: Instant::now(),
+        last_direct_activity: Some(Instant::now()),
         username: name.into(),
         connected: true,
         created_at: Instant::now(),
@@ -739,5 +743,29 @@ async fn failed_direct_attempt_is_not_retried_through_the_server() -> io::Result
             "DATA relay 0152",
         )?;
     }
+    Ok(())
+}
+
+#[tokio::test]
+async fn input_eof_requests_shutdown_without_a_route_or_membership_change() -> io::Result<()> {
+    let socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))?;
+    let sync = Arc::new((
+        Mutex::new(crate::client::structures::PunchState::default()),
+        std::sync::Condvar::new(),
+    ));
+    let context = UserMessageContext {
+        socket,
+        peers: Arc::new(Mutex::new(Vec::new())),
+        username: "me".into(),
+        send_via_server: Arc::new(AtomicBool::new(false)),
+        signaling_addr: "127.0.0.1:1".into(),
+        is_relay: Arc::new(Mutex::new(false)),
+        channel_has_server_relays: Arc::new(AtomicBool::new(false)),
+        sync: Arc::clone(&sync),
+    };
+    user_input_loop(&context, std::io::Cursor::new(Vec::<u8>::new()));
+    assert!(workers_stopping(&sync));
+    assert!(!context.send_via_server.load(Ordering::Acquire));
+    assert_eq!(context.peers.lock().unwrap().len(), 0);
     Ok(())
 }

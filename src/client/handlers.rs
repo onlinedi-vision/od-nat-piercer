@@ -58,7 +58,7 @@ fn handle_mode_direct(
         } else if !guard.iter().any(|p| p.addr == addr) {
             guard.push(PeerInfo {
                 addr,
-                last_pong: Instant::now(),
+                last_direct_activity: None,
                 username: username.to_string(),
                 connected: false,
                 created_at: Instant::now(),
@@ -73,9 +73,9 @@ fn handle_mode_direct(
 
 fn handle_user_left(parts: &[&str], peers: &Arc<Mutex<Vec<PeerInfo>>>) -> std::io::Result<()> {
     let username = parts[1];
-    let mut guard = peers.lock().map_err(|_| {
-        std::io::Error::other("Cannot process message: peers mutex is poisoned")
-    })?;
+    let mut guard = peers
+        .lock()
+        .map_err(|_| std::io::Error::other("Cannot process message: peers mutex is poisoned"))?;
     guard.retain(|p| p.username != username);
     println!("[CLIENT:user] {username} left, removed from list");
     Ok(())
@@ -111,7 +111,9 @@ pub fn handle_mode_line(
                         return Ok(());
                     }
                     let relay = *is_relay.lock().map_err(|_| {
-                        std::io::Error::other("Cannot process message: relay state mutex is poisoned")
+                        std::io::Error::other(
+                            "Cannot process message: relay state mutex is poisoned",
+                        )
                     })?;
                     let mut guard = peers.lock().map_err(|_| {
                         std::io::Error::other("Cannot process message: peers mutex is poisoned")
@@ -129,7 +131,7 @@ pub fn handle_mode_line(
                     //mark that peer as server-relayed to stop punching it
                     for peer in guard.iter_mut().filter(|p| p.username == username) {
                         peer.use_server_relay = true;
-                        peer.connected = true; // stop punching
+                        peer.connected = false; // server routing is not direct connectivity
                         peer.relay_requested = true;
                     }
                 } else {
@@ -148,57 +150,25 @@ pub fn handle_mode_line(
 }
 
 pub fn handle_ping(socket: &UdpSocket, src: std::net::SocketAddr) {
-    let _ = socket.send_to(MSG_PONG.as_bytes(), src);
-    println!("Received {MSG_PING} from {src}, sent {MSG_PONG}");
-}
-
-/// Records a pong received from a peer.
-///
-/// # Errors
-///
-/// Returns an error if the peer mutex is poisoned.
-pub fn handle_pong(
-    peers: &Arc<Mutex<Vec<PeerInfo>>>,
-    src: std::net::SocketAddr,
-) -> std::io::Result<()> {
-    let mut peers_guard = peers.lock().map_err(|_| {
-        std::io::Error::other("Cannot process message: peers mutex is poisoned")
-    })?;
-    if let Some(peer) = peers_guard.iter_mut().find(|p| p.addr == src) {
-        peer.last_pong = Instant::now();
-        println!("Received {MSG_PONG} from {}", peer.username);
+    if let Err(error) = socket.send_to(MSG_PONG.as_bytes(), src) {
+        eprintln!("Failed path response to {src}: {error}");
     }
-    Ok(())
 }
 
-pub fn ensure_connected(p: &mut PeerInfo, con_type: &str) {
-    if !p.connected {
-        println!(
-            "Peer {} is now CONNECTED ({}) at {}",
-            p.username, con_type, p.addr
-        );
-    }
-    p.last_pong = Instant::now();
-    p.connected = true;
-}
-
-/// Handles a hole-punch message received from a peer.
-///
-/// # Errors
-///
-/// Returns an error if the peer mutex is poisoned.
-pub fn handle_hole_punch(
+fn record_direct_activity(
     peers: &Arc<Mutex<Vec<PeerInfo>>>,
-    src: std::net::SocketAddr,
+    src: SocketAddr,
+    now: Instant,
 ) -> std::io::Result<()> {
-    println!("Received hole punch from {src}");
-    let mut peers_guard = peers.lock().map_err(|_| {
-        std::io::Error::other("Cannot process message: peers mutex is poisoned")
-    })?;
-    if let Some(peer) = peers_guard.iter_mut().find(|p| p.addr == src) {
-        ensure_connected(peer, "punch");
-    } else {
-        println!("Hole punch received from unknown peer: {src}");
+    let mut guard = peers
+        .lock()
+        .map_err(|_| std::io::Error::other("Cannot process message: peers mutex is poisoned"))?;
+    if let Some(peer) = guard.iter_mut().find(|peer| peer.addr == src)
+        && !peer.use_server_relay
+        && !peer.relay_requested
+    {
+        peer.last_direct_activity = Some(now);
+        peer.connected = true;
     }
     Ok(())
 }
@@ -217,7 +187,6 @@ pub fn handle_data_message(
         return Ok(());
     };
     println!("[{}]: {}", data.sender, data.payload);
-    mark_peer_connected_by_name(context.peers, data.sender)?;
 
     // The server already owns distribution of this packet. Its copy is final,
     // even when this endpoint also has the participant-relay role.
@@ -243,35 +212,6 @@ pub fn handle_data_message(
     }
 }
 
-/// Marks a peer as connected after receiving a direct message.
-///
-/// # Errors
-///
-/// Returns an error if the peer mutex is poisoned.
-pub fn handle_peer_message(
-    peers: &Arc<Mutex<Vec<PeerInfo>>>,
-    src: std::net::SocketAddr,
-) -> std::io::Result<()> {
-    let mut guard = peers.lock().map_err(|_| {
-        std::io::Error::other("Cannot process message: peers mutex is poisoned")
-    })?;
-    if let Some(p) = guard.iter_mut().find(|p| p.addr == src) {
-        ensure_connected(p, "direct");
-    }
-    Ok(())
-}
-
-// we will call this function when DATA sender... is seen (even received from the server)
-fn mark_peer_connected_by_name(peers: &Arc<Mutex<Vec<PeerInfo>>>, name: &str) -> std::io::Result<()> {
-    let mut guard = peers.lock().map_err(|_| {
-        std::io::Error::other("Cannot process message: peers mutex is poisoned")
-    })?;
-    if let Some(peer) = guard.iter_mut().find(|p| p.username == name) {
-        ensure_connected(peer, "via server");
-    }
-    Ok(())
-}
-
 pub struct IncomingMessageContext<'a> {
     pub socket: &'a UdpSocket,
     pub peers: &'a Arc<Mutex<Vec<PeerInfo>>>,
@@ -292,9 +232,21 @@ pub fn process_incoming_message(
     message: &str,
     src: SocketAddr,
 ) -> std::io::Result<()> {
+    process_incoming_message_at(context, message, src, Instant::now())
+}
+
+pub(crate) fn process_incoming_message_at(
+    context: &IncomingMessageContext<'_>,
+    message: &str,
+    src: SocketAddr,
+    now: Instant,
+) -> std::io::Result<()> {
     // DATA occupies one complete datagram. Validate size/newlines before the
     // multi-line MODE parser can trim a truncated carrier or interpret payload.
-    if message.starts_with(&format!("{MSG_DATA} ")) {
+    if message.split_whitespace().next() == Some(MSG_DATA) {
+        if src != context.server_addr && Data::parse(message).is_some() {
+            record_direct_activity(context.peers, src, now)?;
+        }
         return handle_data_message(context, message, src);
     }
     for line in message.lines() {
@@ -302,11 +254,13 @@ pub fn process_incoming_message(
         if line.is_empty() {
             continue;
         }
+        if src != context.server_addr && matches!(line, MSG_PING | MSG_PONG | MSG_HOLE_PUNCH) {
+            record_direct_activity(context.peers, src, now)?;
+        }
         match line {
             MSG_PING => handle_ping(context.socket, src),
-            MSG_PONG => handle_pong(context.peers, src)?,
-            MSG_HOLE_PUNCH => handle_hole_punch(context.peers, src)?,
-            _ => {
+            MSG_PONG | MSG_HOLE_PUNCH => {}
+            _ if src == context.server_addr => {
                 handle_mode_line(
                     line,
                     context.peers,
@@ -315,6 +269,7 @@ pub fn process_incoming_message(
                     context.channel_has_server_relays,
                 )?;
             }
+            _ => {}
         }
     }
     Ok(())

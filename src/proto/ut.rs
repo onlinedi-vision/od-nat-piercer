@@ -14,7 +14,7 @@ mod tests {
             src_peer_id: 2,
             dst_peer_id: BROADCAST,
             stream_id: 3,
-            payload_len: payload.len() as u16,
+            payload_len: u16::try_from(payload.len()).map_err(|_| "payload length exceeds u16")?,
         };
 
         let buf = encode(h, payload);
@@ -37,7 +37,7 @@ mod tests {
     }
 
     #[test]
-    fn decode_rejects_bad_version() {
+    fn decode_rejects_bad_version() -> Result<(), &'static str> {
         let payload = b"a";
         let h = Header {
             kind: Kind::Control,
@@ -46,11 +46,12 @@ mod tests {
             src_peer_id: 2,
             dst_peer_id: BROADCAST,
             stream_id: 3,
-            payload_len: payload.len() as u16,
+            payload_len: u16::try_from(payload.len()).map_err(|_| "payload length exceeds u16")?,
         };
         let mut buf = encode(h, payload);
         buf[4] = 99;
         assert!(decode(&buf).is_none());
+        Ok(())
     }
 
     #[test]
@@ -61,7 +62,7 @@ mod tests {
     }
 
     #[test]
-    fn decode_rejects_truncated_payload() {
+    fn decode_rejects_truncated_payload() -> Result<(), &'static str> {
         let payload = b"abcd";
         let h = Header {
             kind: Kind::Control,
@@ -70,10 +71,11 @@ mod tests {
             src_peer_id: 0,
             dst_peer_id: BROADCAST,
             stream_id: 0,
-            payload_len: payload.len() as u16,
+            payload_len: u16::try_from(payload.len()).map_err(|_| "payload length exceeds u16")?,
         };
         let buf = encode(h, payload);
         let truncated = &buf[..buf.len() - 1];
         assert!(decode(truncated).is_none());
+        Ok(())
     }
 }

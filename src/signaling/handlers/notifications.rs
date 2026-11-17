@@ -273,8 +273,7 @@ pub async fn handle_relay_transition(
         state
             .get_mut(server_id)
             .and_then(|channels| channels.get_mut(channel_name))
-            .map(relay_handover)
-            .unwrap_or_default()
+            .map_or_default(relay_handover)
     };
     // Selection and its recipient snapshot are atomic; no stale post-send write.
     for (recipients, message) in notices {

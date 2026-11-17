@@ -103,7 +103,7 @@ pub async fn handle_connect_message(
 
 #[test]
 fn welcome_payload_uses_machine_readable_format() {
-    let payload = welcome_payload(123456789, 42);
+    let payload = welcome_payload(123_456_789, 42);
 
     assert_eq!(payload, "WELCOME 123456789 42\n");
 }

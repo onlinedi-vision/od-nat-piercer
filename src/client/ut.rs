@@ -14,7 +14,7 @@ mod tests {
 
         try_handle_welcome("WELCOME 123456789 42\n", &channel_id, &my_peer_id);
 
-        assert_eq!(channel_id.load(Ordering::Acquire), 123456789);
+        assert_eq!(channel_id.load(Ordering::Acquire), 123_456_789);
         assert_eq!(my_peer_id.load(Ordering::Acquire), 42);
     }
 

@@ -108,8 +108,8 @@ fn welcome_payload_uses_machine_readable_format() {
     assert_eq!(payload, "WELCOME 123456789 42\n");
 }
 
-#[allow(clippy::disallowed_methods)] // Test assertions and tokio::test use expect.
 #[tokio::test]
+#[allow(clippy::disallowed_methods)] // tokio::test generates expect when creating its runtime.
 async fn first_cone_member_receives_relay_mode_and_matching_welcome() -> std::io::Result<()> {
     let exchange = async {
         let server = Arc::new(UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, 0)).await?);
@@ -139,7 +139,7 @@ async fn first_cone_member_receives_relay_mode_and_matching_welcome() -> std::io
         let (header, payload) = packets
             .iter()
             .find_map(|packet| packet::decode(packet))
-            .expect("join must emit framed WELCOME");
+            .ok_or_else(|| std::io::Error::other("join must emit framed WELCOME"))?;
         let registry = state.lock().await;
         let channel = &registry["test-server"]["test-channel"];
         assert_eq!(channel.users.len(), 1);
@@ -148,7 +148,7 @@ async fn first_cone_member_receives_relay_mode_and_matching_welcome() -> std::io
         assert_eq!(header.channel_id, channel.channel_id);
         assert_eq!(header.dst_peer_id, channel.users[0].peer_id);
         assert_eq!(
-            std::str::from_utf8(payload).expect("WELCOME text"),
+            std::str::from_utf8(payload).map_err(std::io::Error::other)?,
             format!(
                 "WELCOME {} {}\n",
                 channel.channel_id, channel.users[0].peer_id

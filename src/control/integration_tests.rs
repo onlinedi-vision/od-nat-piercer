@@ -1,5 +1,3 @@
-#![allow(clippy::disallowed_methods)] // Tokio test runtime and explicit test assertions.
-
 //! Shared bounded localhost fixture using the production connection and client.
 use std::{
     collections::HashMap, future::Future, net::Ipv4Addr, pin::Pin, sync::Arc, time::Duration,
@@ -72,7 +70,7 @@ impl Peer {
     }
 
     pub(super) async fn message(&mut self) -> ControlResult<ControlMessage> {
-        let frame = self.read.next().await.expect("server frame")?;
+        let frame = self.read.next().await.ok_or("missing server frame")??;
         let Message::Text(text) = frame else {
             panic!("expected JSON, got {frame:?}");
         };
@@ -103,7 +101,7 @@ impl Peer {
     pub(super) async fn barrier(&mut self) -> ControlResult<()> {
         self.write.send(Message::Ping(vec![42])).await?;
         assert_eq!(
-            self.read.next().await.expect("barrier pong")?,
+            self.read.next().await.ok_or("missing barrier pong")??,
             Message::Pong(vec![42])
         );
         Ok(())
@@ -175,7 +173,11 @@ impl Harness {
             if let Some(result) = self.completed.remove(&index) {
                 return result;
             }
-            let (ended, result) = self.tasks.join_next().await.expect("connection task")?;
+            let (ended, result) = self
+                .tasks
+                .join_next()
+                .await
+                .ok_or("missing connection task")??;
             self.completed.insert(ended, result);
         }
     }
@@ -191,6 +193,7 @@ pub(super) async fn run_case(
 }
 
 #[tokio::test]
+#[allow(clippy::disallowed_methods)] // tokio::test generates expect when creating its runtime.
 async fn real_websocket_registration_broadcast_result_and_cleanup() -> ControlResult<()> {
     run_case(|h| {
         Box::pin(async move {
@@ -215,6 +218,7 @@ async fn real_websocket_registration_broadcast_result_and_cleanup() -> ControlRe
 }
 
 #[tokio::test]
+#[allow(clippy::disallowed_methods)] // tokio::test generates expect when creating its runtime.
 async fn malformed_json_cleans_up_registration() -> ControlResult<()> {
     run_case(|h| {
         Box::pin(async move {

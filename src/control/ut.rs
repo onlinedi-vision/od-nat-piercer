@@ -27,7 +27,7 @@ mod tests {
     }
 
     #[test]
-    fn join_control_json_roundtrip() {
+    fn join_control_json_roundtrip() -> serde_json::Result<()> {
         let msg = ControlMessage::JoinControl {
             request_id: 1,
             server_id: "Server1".to_string(),
@@ -36,8 +36,8 @@ mod tests {
             peer_id: 7,
         };
 
-        let json = serde_json::to_string(&msg).unwrap();
-        let parsed: ControlMessage = serde_json::from_str(&json).unwrap();
+        let json = serde_json::to_string(&msg)?;
+        let parsed: ControlMessage = serde_json::from_str(&json)?;
 
         match parsed {
             ControlMessage::JoinControl {
@@ -55,17 +55,18 @@ mod tests {
             }
             _ => panic!("expected JoinControl"),
         }
+        Ok(())
     }
 
     #[test]
-    fn control_msg_json_roundtrip() {
+    fn control_msg_json_roundtrip() -> serde_json::Result<()> {
         let msg = ControlMessage::ControlMsg {
             message_id: 42,
             payload: "hello".to_string(),
         };
 
-        let json = serde_json::to_string(&msg).unwrap();
-        let parsed: ControlMessage = serde_json::from_str(&json).unwrap();
+        let json = serde_json::to_string(&msg)?;
+        let parsed: ControlMessage = serde_json::from_str(&json)?;
 
         match parsed {
             ControlMessage::ControlMsg {
@@ -77,14 +78,15 @@ mod tests {
             }
             _ => panic!("expected ControlMsg"),
         }
+        Ok(())
     }
 
     #[test]
-    fn control_ack_json_roundtrip() {
+    fn control_ack_json_roundtrip() -> serde_json::Result<()> {
         let msg = ControlMessage::ControlAck { message_id: 99 };
 
-        let json = serde_json::to_string(&msg).unwrap();
-        let parsed: ControlMessage = serde_json::from_str(&json).unwrap();
+        let json = serde_json::to_string(&msg)?;
+        let parsed: ControlMessage = serde_json::from_str(&json)?;
 
         match parsed {
             ControlMessage::ControlAck { message_id, .. } => {
@@ -92,6 +94,7 @@ mod tests {
             }
             _ => panic!("expected ControlAck"),
         }
+        Ok(())
     }
 
     #[test]

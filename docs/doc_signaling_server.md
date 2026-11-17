@@ -120,6 +120,14 @@ older than 40 seconds can be removed on a scan, with departure notifications and
 relay reassignment where applicable. This is not an exact 40-second disconnect
 deadline.
 
+An eligible participant that is alone in its channel is sent PING on the
+20-second scan. Successful local sends log `Sent PING to registered client
+<address>`; PONG from a registered source updates liveness and logs `Received
+PONG from registered client <address>` outside the state lock. A channel with
+multiple participants uses client-originated HB for registration liveness;
+the server does not periodically PING every member. Routine peer-to-peer
+PING/PONG and successful HB handling remain silent.
+
 ## WebSocket CONTROL
 
 The endpoint is `ws://<signaling_ip>:2133`. A normal client sends:

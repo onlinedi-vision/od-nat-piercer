@@ -82,10 +82,32 @@ It skips connected or server-relayed peers and can pause when this client is
 told to send through the server. The worker runs in the background while the
 client process is active.
 
-The client sends a server heartbeat every 20 seconds. When active, the relay
-keepalive worker checks peer liveness and can request server relaying for a
-peer that has not connected. Route recovery and membership handling are still
-prototype behavior; they are not production guarantees.
+The client sends a server registration heartbeat every 20 seconds. Its UDP
+receive loop checks direct paths every 250 ms, and a participant relay probes
+its active direct neighbours at least 1 second apart. A valid observation from
+that direct endpoint refreshes path health; server traffic does not.
+
+The first valid direct packet from a known peer logs
+`Direct path observed from <peer> at <address>; stopped hole punching` once for
+that peer entry. This records inbound path activity, not a completed
+bidirectional or authenticated handshake. Routine peer-to-peer PING/PONG
+exchanges are silent; send errors and fallback requests remain visible.
+
+PING received from the configured signaling server logs
+`Received PING from signaling server <address>; replying with PONG`.
+The reply is attempted through the existing handler; a send failure is logged.
+The server currently probes an eligible participant only when it is alone in
+its channel, on the 20-second server scan. With multiple participants, clients
+maintain their server registration through HB messages, so no periodic server
+PING/PONG log is expected for that channel. HB success remains silent.
+
+An established path is retired after 5 seconds without a valid direct
+observation. Initial setup has a separate 12-second grace. A relay can request
+fallback for a failed neighbour, and an ordinary participant can request its own
+fallback after losing its relay. These requests preserve server registrations.
+They attempt UDP signaling; they do not confirm successful fallback delivery.
+Server registration expiry is separate: more than 40 seconds without a matching
+heartbeat or PONG, checked every 20 seconds.
 
 ## Terminal messages and stopping
 
@@ -94,9 +116,14 @@ route determines whether it goes to known peers or through the signaling server.
 This traffic is separate from reliable WebSocket CONTROL and has no application
 ACK/retry guarantee.
 
-Stop each client with `Ctrl+C`. The executable currently has no coordinated
-session shutdown or automatic CONTROL reconnect. Process termination does not
-send a graceful DISCONNECT; server membership may remain until timeout cleanup.
+For a controlled leave, close stdin (EOF, for example `Ctrl+D` on an empty
+Unix terminal line). The client cancels CONTROL, wakes and joins its network
+workers, then attempts one DISCONNECT from its registered UDP endpoint.
+Normal/error exit uses the same cleanup. The stdin reader remains process-owned;
+automatic CONTROL reconnect and a reusable application-session API are future work.
+
+`Ctrl+C` or other forced process termination does not guarantee DISCONNECT.
+A lost departure packet also leaves the registration until server expiry.
 
 For a complete two-client example, use the
 [local testing guide](doc_test_od_nat_piercer.md).

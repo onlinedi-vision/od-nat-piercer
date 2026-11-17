@@ -1,5 +1,3 @@
-#![allow(clippy::disallowed_methods)] // Tokio test runtime and explicit test assertions.
-
 use futures_util::{SinkExt, StreamExt};
 use tokio::{net::TcpListener, time::timeout};
 use tokio_tungstenite::{
@@ -38,6 +36,7 @@ async fn socket_pair() -> ControlResult<(
 }
 
 #[tokio::test]
+#[allow(clippy::disallowed_methods)] // tokio::test generates expect when creating its runtime.
 async fn registration_is_required_and_semantic_rejection_consumes_id() -> ControlResult<()> {
     run_case(|h| {
         Box::pin(async move {
@@ -73,6 +72,7 @@ async fn registration_is_required_and_semantic_rejection_consumes_id() -> Contro
 }
 
 #[tokio::test]
+#[allow(clippy::disallowed_methods)] // tokio::test generates expect when creating its runtime.
 async fn identical_join_is_idempotent_and_conflict_is_rejected() -> ControlResult<()> {
     run_case(|h| {
         Box::pin(async move {
@@ -111,6 +111,7 @@ async fn identical_join_is_idempotent_and_conflict_is_rejected() -> ControlResul
 }
 
 #[tokio::test]
+#[allow(clippy::disallowed_methods)] // tokio::test generates expect when creating its runtime.
 async fn invalid_registration_fields_get_rejection_then_close() -> ControlResult<()> {
     run_case(|h| {
         Box::pin(async move {
@@ -150,6 +151,7 @@ async fn invalid_registration_fields_get_rejection_then_close() -> ControlResult
 }
 
 #[tokio::test]
+#[allow(clippy::disallowed_methods)] // tokio::test generates expect when creating its runtime.
 async fn registration_timeout_is_not_extended_by_rejected_broadcast() -> ControlResult<()> {
     run_case(|h| {
         Box::pin(async move {
@@ -186,6 +188,7 @@ async fn registration_timeout_is_not_extended_by_rejected_broadcast() -> Control
 }
 
 #[tokio::test]
+#[allow(clippy::disallowed_methods)] // tokio::test generates expect when creating its runtime.
 async fn zero_gap_and_reused_request_ids_close_connection() -> ControlResult<()> {
     run_case(|h| {
         Box::pin(async move {
@@ -210,6 +213,7 @@ async fn zero_gap_and_reused_request_ids_close_connection() -> ControlResult<()>
 }
 
 #[tokio::test]
+#[allow(clippy::disallowed_methods)] // tokio::test generates expect when creating its runtime.
 async fn server_rejects_binary_and_wrong_direction_messages() -> ControlResult<()> {
     run_case(|h| {
         Box::pin(async move {
@@ -243,6 +247,7 @@ async fn server_rejects_binary_and_wrong_direction_messages() -> ControlResult<(
 }
 
 #[tokio::test]
+#[allow(clippy::disallowed_methods)] // tokio::test generates expect when creating its runtime.
 async fn client_matches_results_by_type_and_ignores_unknown_results() -> ControlResult<()> {
     timeout(std::time::Duration::from_secs(10), async {
         let (client, mut server) = socket_pair().await?;
@@ -306,6 +311,7 @@ async fn client_matches_results_by_type_and_ignores_unknown_results() -> Control
 }
 
 #[tokio::test]
+#[allow(clippy::disallowed_methods)] // tokio::test generates expect when creating its runtime.
 async fn missing_result_times_out_without_retransmission() -> ControlResult<()> {
     timeout(std::time::Duration::from_secs(10), async {
         let (client, mut server) = socket_pair().await?;
@@ -346,6 +352,7 @@ async fn missing_result_times_out_without_retransmission() -> ControlResult<()> 
 }
 
 #[tokio::test]
+#[allow(clippy::disallowed_methods)] // tokio::test generates expect when creating its runtime.
 async fn handler_failure_sends_no_ack_and_clears_client_state() -> ControlResult<()> {
     timeout(std::time::Duration::from_secs(10), async {
         let (client, mut server) = socket_pair().await?;
@@ -401,6 +408,7 @@ async fn handler_failure_sends_no_ack_and_clears_client_state() -> ControlResult
 }
 
 #[tokio::test]
+#[allow(clippy::disallowed_methods)] // tokio::test generates expect when creating its runtime.
 async fn client_cli_registers_then_processes_and_acks_without_demo_broadcast() -> ControlResult<()>
 {
     timeout(std::time::Duration::from_secs(10), async {
@@ -454,6 +462,7 @@ async fn client_cli_registers_then_processes_and_acks_without_demo_broadcast() -
 }
 
 #[tokio::test]
+#[allow(clippy::disallowed_methods)] // tokio::test generates expect when creating its runtime.
 async fn client_rejects_invalid_input_and_reused_notifications_before_processing()
 -> ControlResult<()> {
     run_case(|h| {
@@ -510,6 +519,7 @@ async fn client_rejects_invalid_input_and_reused_notifications_before_processing
 }
 
 #[tokio::test]
+#[allow(clippy::disallowed_methods)] // tokio::test generates expect when creating its runtime.
 async fn ready_traffic_cannot_hide_an_expired_request_deadline() -> ControlResult<()> {
     run_case(|h| {
         Box::pin(async move {
@@ -518,7 +528,7 @@ async fn ready_traffic_cannot_hide_an_expired_request_deadline() -> ControlResul
             peer.send(PAYLOAD).await?;
             // Read an actual result from the socket, then leave it ready for the
             // production transition while advancing the confirmation deadline.
-            let frame = peer.read.next().await.expect("broadcast result")?;
+            let frame = peer.read.next().await.ok_or("missing broadcast result")??;
             let mut ready = futures_util::stream::iter([Ok(frame)]).chain(&mut peer.read);
             peer.time.send_replace(peer.clock.now() + ACK_TIMEOUT);
             let error = receive_event(
@@ -542,6 +552,7 @@ async fn ready_traffic_cannot_hide_an_expired_request_deadline() -> ControlResul
 }
 
 #[tokio::test]
+#[allow(clippy::disallowed_methods)] // tokio::test generates expect when creating its runtime.
 async fn websocket_enforces_real_frame_and_message_limits() -> ControlResult<()> {
     run_case(|h| {
         Box::pin(async move {
@@ -565,6 +576,7 @@ async fn websocket_enforces_real_frame_and_message_limits() -> ControlResult<()>
 }
 
 #[tokio::test]
+#[allow(clippy::disallowed_methods)] // tokio::test generates expect when creating its runtime.
 async fn cancelling_client_receive_closes_state_and_releases_pending() -> ControlResult<()> {
     timeout(std::time::Duration::from_secs(10), async {
         let (client, mut server) = socket_pair().await?;
@@ -574,7 +586,10 @@ async fn cancelling_client_receive_closes_state_and_releases_pending() -> Contro
         state
             .join(&mut write, &registration("server", "channel", 7), &clock)
             .await?;
-        let _ = server.next().await.expect("registration request")?;
+        let _ = server
+            .next()
+            .await
+            .ok_or("missing registration request")??;
         assert!(
             timeout(
                 std::time::Duration::ZERO,
@@ -593,7 +608,7 @@ async fn cancelling_client_receive_closes_state_and_releases_pending() -> Contro
         assert!(state.sender.ensure_open().is_err());
         close_socket(&mut write, Some(&ReliabilityError::Closed)).await?;
         assert!(matches!(
-            server.next().await.expect("close frame")?,
+            server.next().await.ok_or("missing close frame")??,
             Message::Close(_)
         ));
         Ok(())
@@ -602,6 +617,7 @@ async fn cancelling_client_receive_closes_state_and_releases_pending() -> Contro
 }
 
 #[tokio::test]
+#[allow(clippy::disallowed_methods)] // tokio::test generates expect when creating its runtime.
 async fn dropping_control_worker_cancels_a_pending_registration_and_closes_socket()
 -> ControlResult<()> {
     timeout(std::time::Duration::from_secs(2), async {

@@ -1,5 +1,3 @@
-#![deny(clippy::disallowed_methods)]
-
 use super::*;
 use crate::client::handlers::{IncomingMessageContext, process_incoming_message_at};
 use std::{

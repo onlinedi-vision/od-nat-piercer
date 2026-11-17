@@ -63,17 +63,29 @@ these events rather than an exact transcript:
    and incoming ACK behavior are exercised by the automated tests below.
    A later join does not replay earlier messages.
 4. On a typical localhost run, the first client starts with `MODE RELAY`.
-   After the second joins, peer address messages, UDP punches, and
-   `CONNECTED (direct)` messages show the attempted direct path.
+   After the second joins, `Added peer` messages show discovered endpoints.
+   `Sent UDP punch` messages show connection attempts; those logs alone do not
+   confirm that the direct path is usable.
+   `Direct path observed from <peer> at <address>; stopped hole punching`
+   records the first valid inbound direct packet from each known peer.
+   Routine peer-to-peer PING/PONG remains silent; the path-observed message does not
+   confirm both directions or authentication.
 5. Enter a short line such as `hello from user1` in the first client terminal
    and check that the second displays it. Repeat in the other direction.
 
-Example CONTROL log lines are:
+Successful CONTROL registration logs:
 
 ~~~text
-Connected to control WebSocket server at ws://127.0.0.1:2133
 CONTROL registration accepted.
 ~~~
+
+To observe server keepalive, leave one eligible client alone in its channel
+through a 20-second server scan. The server logs `Sent PING to registered client
+<address>`, the client logs `Received PING from signaling server <address>;
+replying with PONG`, and the server logs `Received PONG from registered client
+<address>` if the response arrives from a registered source. With multiple
+members in that channel, registration uses the clients' silent HB messages;
+the server does not periodically PING all members.
 
 Recipients log `Processed server CONTROL` when a server message arrives.
 The automated CONTROL suite uses explicit test messages to exercise broadcast,
@@ -93,9 +105,15 @@ a tested channel capacity or prove all multi-participant routing behavior.
 
 ## Stop the prototype
 
-Stop each client and the server with `Ctrl+C`. The client has no coordinated
-graceful departure, so a stopped client's membership can remain until the server
-removes it through timeout processing.
+For a controlled client leave, close its stdin (EOF, for example `Ctrl+D` on an
+empty Unix terminal line). The client cancels CONTROL, wakes and joins its
+network workers, then attempts one DISCONNECT from the same UDP endpoint.
+The remaining client should receive USER_LEFT if the departure and notification
+arrive.
+
+Stop the server with `Ctrl+C`. Forced client termination with `Ctrl+C`, or a lost
+DISCONNECT packet, can leave its registration until server expiry: more than
+40 seconds without a matching heartbeat or PONG, checked every 20 seconds.
 
 ## Automated tests
 
@@ -124,6 +142,13 @@ barriers, a controlled monotonic clock and a ten-second case bound. State tests
 also exercise counter exhaustion and combined queue/pending capacity. No separate
 server process, external service or arbitrary sleep is required. Fixture teardown
 joins or aborts connection tasks and releases sockets.
+
+UDP tests also cover path-specific activity, 250-ms checks, 1-second probe
+spacing, the separate 5-second established/12-second initial thresholds,
+membership-preserving fallback requests, eligible relay handover and disjoint
+direct/server forwarding. CLI tests cover source validation, malformed DATA,
+one departure attempt and stopping paused network workers. Time-sensitive
+checks use controlled timestamps; EOF uses a finite injected reader.
 
 ## Troubleshooting and scope
 

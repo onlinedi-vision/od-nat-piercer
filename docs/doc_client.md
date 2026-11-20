@@ -1,135 +1,62 @@
-# Client guide
+# Development client
 
-The prototype client joins a channel, attempts direct UDP connectivity, and uses
-participant or server relay paths where selected by the signaling server. It
-also opens a WebSocket connection for CONTROL registration and reception.
+The CLI exchanges plaintext terminal text through direct UDP, a participant
+relay and explicit server fallback. It does not implement voice or encryption.
 
-Audio integration is future work. The current client exchanges terminal text
-and connectivity messages, without transport encryption or participant
-authentication. Use it in a controlled development environment.
+```sh
+./target/release/client onlinedi.vision server1 channel1 user1 4001
+```
 
-## Build and start
+Arguments are signaling host, server namespace, channel, username and fixed local
+UDP port. Use the same namespace/channel and different usernames for participants.
+Use distinct local ports for processes sharing one machine. Names and IDs are
+not authenticated credentials. The client resolves an IPv4 signaling address.
 
-From the repository root:
+## Joining and recovering
 
-~~~bash
-cargo build --release --bin client
-./target/release/client 127.0.0.1 server1 channel1 user1 4000
-~~~
+1. Bind the requested port and probe server UDP 2131/2132, waiting up to 1 second.
+2. Register a fresh 128-bit attempt through CONNECT/CHALLENGE/CONFIRM/WELCOME.
+3. Bind CONTROL at `ws://<server>:2133` to the committed transport session.
+4. Apply a complete route snapshot, then probe the selected direct neighbours.
+5. Exchange text when the selected route is ready. Otherwise report not-ready;
+   input is not retained for a later successful reconnection.
 
-Start the [signaling server](doc_signaling_server.md) first.
+A confirmed restart gets a fresh peer ID even with the same name and address.
+An old timeout, heartbeat or direct packet cannot update the replacement by name.
+The attempt ID is used during setup, not attached to every data packet.
 
-The command takes five positional arguments:
+Eligible direct paths are punched at least 150 ms apart during the first second,
+then 1.5 seconds apart, for at most 12 seconds. Observing a direct packet stops
+punching and starts 1-second health probes. Five seconds without valid direct
+activity requests fallback over confirmed CONTROL. It does not remove the user
+from the application or prove that a new route has already become active.
 
-~~~text
-client <signaling_ip> <server_id> <channel> <user> <local_port>
-~~~
+A server registration heartbeat runs every second. Routine heartbeat replies,
+PING/PONG and successful punches do not print. Logs show direct observation,
+fallback (including failed peer/address), registration/recovery and failures.
+Repeated UDP errors are rate-limited.
 
-| Argument | Example | Meaning |
-| --- | --- | --- |
-| `signaling_ip` | `127.0.0.1` | Signaling server IP address; localhost for this example. |
-| `server_id` | `server1` | Logical namespace that groups channels on the server. |
-| `channel` | `channel1` | Channel name within that namespace. |
-| `user` | `user1` | Prototype username, supplied by the caller. |
-| `local_port` | `4000` | Local UDP port; the client binds `0.0.0.0:4000`. |
+Six seconds without a fresh matching heartbeat ACK starts registration recovery.
+A CONTROL-only failure first retries CONTROL while UDP checks continue. Recovery
+uses slots at 0, 1, 3, 7, 15 and 23 seconds, stopping after 30 seconds. A suspended
+process does not emit a burst of missed retries on return. Socket recreation
+keeps the configured local port; a bind error is reported explicitly.
 
-Use the same server and channel for participants who should communicate.
-Use distinct usernames and, when running on one computer, distinct local UDP
-ports. These names and IDs are not authenticated credentials.
+Enter `/retry` for a fresh explicit cycle or `/quit` to exit. EOF also exits.
+There is no special Ctrl+C handler. Crash/forced termination correctness depends
+on scoped replacement and expiry, not on a departure message. `/quit` attempts a
+best-effort scoped DISCONNECT; failed cleanup does not block a later join.
 
-## Connection flow
+## Important limits
 
-1. Bind a nonblocking UDP socket on the requested local port.
-2. Send NAT probes to the signaling server's UDP ports `2131` and `2132`.
-   The client waits up to 600 ms for two observed-address responses.
-3. Send `CONNECT <server_id> <channel> <user> <nat_type>` to UDP port `2131`.
-4. Handle the server's `WELCOME <channel_id> <peer_id>` response and route
-   instructions. WELCOME currently travels inside an ODNP CONTROL UDP packet.
-5. Once a nonzero peer ID is available, open `ws://<signaling_ip>:2133`, send
-   `JoinControl`, wait for `JoinAccepted`, then receive server CONTROL messages. Incoming messages
-   are processed and ACKed.
-6. Continue handling UDP traffic, peer information, heartbeat messages, and
-   terminal input until the process is stopped or a fatal error ends the client.
+NAT classification is a heuristic. Unknown means insufficient observations and
+still allows path attempts. Using the same public IP does not guarantee router
+hairpinning; LAN discovery is not included. Server fallback remains available.
 
-WELCOME and route messages may arrive in either order. The WebSocket connection
-can therefore start during the main receive loop rather than immediately after
-CONNECT. See [CONTROL](doc_control.md) for its separate result/ACK and timeout rules.
+This is development transport: source and session checks are not authentication.
+Text is plaintext, and no audio capture, codec, MEDIA or E2EE exists here.
+Automated localhost/controlled-clock tests do not establish behavior of real
+routers, iPhone network switching, OS suspension or production capacity.
 
-## NAT probing and route selection
-
-The NAT probe compares source addresses reported by the two server ports:
-
-| Probe result | Client classification | Current behavior |
-| --- | --- | --- |
-| Same observed IP and port | Cone-like | Attempt UDP hole punching for eligible peers. |
-| Different observed IP or port | Symmetric-like | Skip hole punching and rely on server relay selection. |
-| Fewer than two responses | Unknown | Continue setup and permit hole-punch attempts. |
-
-This is a heuristic, not a complete NAT discovery procedure or a guarantee of
-reachability. Localhost commonly reports a cone-like result because both probes
-use the same local address; that does not exercise a real router.
-
-The server communicates route choices with these messages:
-
-| Message | Meaning |
-| --- | --- |
-| `MODE DIRECT <peer_user> <peer_addr>` | Add a peer address for direct UDP communication. |
-| `MODE RELAY` | Assign this client the participant relay role. A lone eligible client can receive it too. |
-| `MODE SERVER_RELAY <user>` | Use the server relay path for the named participant. |
-
-For eligible peers, the hole-punch worker retries with increasing intervals.
-It skips connected or server-relayed peers and can pause when this client is
-told to send through the server. The worker runs in the background while the
-client process is active.
-
-The client sends a server registration heartbeat every 20 seconds. Its UDP
-receive loop checks direct paths every 250 ms, and a participant relay probes
-its active direct neighbours at least 1 second apart. A valid observation from
-that direct endpoint refreshes path health; server traffic does not.
-
-The first valid direct packet from a known peer logs
-`Direct path observed from <peer> at <address>; stopped hole punching` once for
-that peer entry. This records inbound path activity, not a completed
-bidirectional or authenticated handshake. Routine peer-to-peer PING/PONG
-exchanges are silent; send errors and fallback requests remain visible.
-
-PING received from the configured signaling server logs
-`Received PING from signaling server <address>; replying with PONG`.
-The reply is attempted through the existing handler; a send failure is logged.
-The server currently probes an eligible participant only when it is alone in
-its channel, on the 20-second server scan. With multiple participants, clients
-maintain their server registration through HB messages, so no periodic server
-PING/PONG log is expected for that channel. HB success remains silent.
-
-An established path is retired after 5 seconds without a valid direct
-observation. Initial setup has a separate 12-second grace. A relay can request
-fallback for a failed neighbour, and an ordinary participant can request its own
-fallback after losing its relay. These requests preserve server registrations.
-They attempt UDP signaling; they do not confirm successful fallback delivery.
-Server registration expiry is separate: more than 40 seconds without a matching
-heartbeat or PONG, checked every 20 seconds.
-
-## Terminal messages and stopping
-
-Enter a short line in a client terminal to send prototype UDP text. The selected
-route determines whether it goes to known peers or through the signaling server.
-This traffic is separate from reliable WebSocket CONTROL and has no application
-ACK/retry guarantee.
-
-For a controlled leave, close stdin (EOF, for example `Ctrl+D` on an empty
-Unix terminal line). The client cancels CONTROL, wakes and joins its network
-workers, then attempts one DISCONNECT from its registered UDP endpoint.
-Normal/error exit uses the same cleanup. The stdin reader remains process-owned;
-automatic CONTROL reconnect and a reusable application-session API are future work.
-
-`Ctrl+C` or other forced process termination does not guarantee DISCONNECT.
-A lost departure packet also leaves the registration until server expiry.
-
-For a complete two-client example, use the
-[local testing guide](doc_test_od_nat_piercer.md).
-
-## Source
-
-- [Client executable](../src/bin/client.rs)
-- [NAT probes and networking workers](../src/client/networking.rs)
-- [UDP message handlers](../src/client/handlers.rs)
+See [protocol](protocol.md), [CONTROL](doc_control.md), and
+[ADR-017](decisions/ADR-017-prototype-session-recovery.md).

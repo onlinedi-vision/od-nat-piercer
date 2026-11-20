@@ -12,6 +12,10 @@ pub(super) struct CapacityReservation {
 }
 
 pub(super) enum Outbound {
+    Snapshot {
+        snapshot: crate::recovery::wire::Snapshot,
+        reservation: CapacityReservation,
+    },
     Control {
         payload: Arc<str>,
         reservation: CapacityReservation,
@@ -53,7 +57,7 @@ impl ControlPeer {
         self.tx.is_closed() || self.stop.borrow().is_some()
     }
 
-    pub(super) fn same_connection(&self, other: &Self) -> bool {
+    pub(crate) fn same_connection(&self, other: &Self) -> bool {
         self.tx.same_channel(&other.tx)
     }
 
@@ -71,6 +75,32 @@ impl ControlPeer {
             .try_send(Outbound::Control {
                 payload: Arc::clone(payload),
                 reservation,
+            })
+            .is_err()
+        {
+            self.close(ReliabilityError::SlowConsumer);
+            return false;
+        }
+        true
+    }
+
+    pub(crate) fn retire(&self) {
+        self.close(ReliabilityError::Closed);
+    }
+
+    pub(crate) fn enqueue_snapshot(&self, snapshot: crate::recovery::wire::Snapshot) -> bool {
+        if self.is_closed() {
+            return false;
+        }
+        let Ok(slot) = Arc::clone(&self.slots).try_acquire_owned() else {
+            self.close(ReliabilityError::SlowConsumer);
+            return false;
+        };
+        if self
+            .tx
+            .try_send(Outbound::Snapshot {
+                snapshot,
+                reservation: CapacityReservation { _slot: slot },
             })
             .is_err()
         {

@@ -8,7 +8,7 @@ use tokio_tungstenite::tungstenite::{Error as WsError, Message, protocol::WebSoc
 
 use super::{messages::ControlMessage, recipient::CapacityReservation};
 
-pub(super) type ControlResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
+pub(crate) type ControlResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
 
 // Provisional development policy, not measured production capacity.
 pub(super) const WINDOW: usize = 32;
@@ -96,7 +96,7 @@ pub(super) fn check_raw_size(bytes: usize) -> Result<(), ReliabilityError> {
     }
 }
 
-pub(super) fn encode(message: &ControlMessage) -> ControlResult<String> {
+pub(crate) fn encode(message: &ControlMessage) -> ControlResult<String> {
     match message {
         ControlMessage::JoinControl {
             server_id,
@@ -246,6 +246,7 @@ impl Sequence {
 pub(super) enum Confirmation {
     Join,
     Broadcast,
+    Fallback,
     Ack,
     Rejection,
 }

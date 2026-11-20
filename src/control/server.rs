@@ -44,29 +44,8 @@ impl Registration {
     }
 }
 
-/// Starts the control WebSocket server.
-///
-/// # Errors
-/// Returns an error if the server cannot listen or accept a connection.
-pub async fn start_control_server(addr: &str, peers: ControlPeers) -> std::io::Result<()> {
-    let listener = TcpListener::bind(addr).await?;
-    println!("Control WebSocket server listening on {addr}");
-    loop {
-        let (stream, _) = listener.accept().await?;
-        let peers = Arc::clone(&peers);
-        tokio::spawn(async move {
-            if let Err(e) = handle_connection(stream, peers).await {
-                eprintln!("control ws connection error: {e}");
-            }
-        });
-    }
-}
-
-pub(super) async fn handle_connection(stream: TcpStream, peers: ControlPeers) -> ControlResult<()> {
-    handle_connection_with_clock(stream, peers, Clock::default()).await
-}
-
 // The production handler and real localhost tests differ only in their clock.
+#[cfg(test)]
 pub(super) async fn handle_connection_with_clock(
     stream: TcpStream,
     peers: ControlPeers,
@@ -91,6 +70,8 @@ struct Connection {
     sender: ReliableSender,
     requests: Sequence,
     clock: Clock,
+    sessions: Option<crate::recovery::server::SharedRegistry>,
+    binding: Option<crate::recovery::wire::Binding>,
 }
 
 impl Connection {
@@ -109,12 +90,52 @@ impl Connection {
             sender: ReliableSender::default(),
             requests: Sequence::default(),
             clock,
+            sessions: None,
+            binding: None,
         }
     }
 
     async fn run(&mut self) -> ControlResult<()> {
         while let Some(message) = self.next_message().await? {
             match message {
+                ControlMessage::Fallback {
+                    request_id,
+                    session,
+                    target,
+                } => {
+                    self.requests.accept(request_id)?;
+                    let Some(binding) = self
+                        .binding
+                        .as_ref()
+                        .filter(|binding| binding.session == session)
+                    else {
+                        return Err(
+                            ReliabilityError::Protocol("fallback outside bound session").into()
+                        );
+                    };
+                    let Some(sessions) = &self.sessions else {
+                        return Err(ReliabilityError::Closed.into());
+                    };
+                    if !sessions
+                        .lock()
+                        .await
+                        .request_fallback(binding, target, &self.recipient)
+                    {
+                        return Err(ReliabilityError::Protocol("inactive fallback binding").into());
+                    }
+                    send_control_message(
+                        &mut self.write,
+                        &ControlMessage::FallbackResult { request_id },
+                    )
+                    .await?;
+                }
+                ControlMessage::SessionJoin {
+                    request_id,
+                    binding,
+                } => {
+                    self.requests.accept(request_id)?;
+                    self.register_session(request_id, binding).await?;
+                }
                 ControlMessage::JoinControl {
                     request_id,
                     server_id,
@@ -122,6 +143,9 @@ impl Connection {
                     user,
                     peer_id,
                 } => {
+                    if self.sessions.is_some() {
+                        return Err(ReliabilityError::Protocol("session binding required").into());
+                    }
                     self.requests.accept(request_id)?;
                     self.register(
                         request_id,
@@ -158,7 +182,10 @@ impl Connection {
             return Err(reason.into());
         }
         self.sender.check_deadlines(&self.clock)?;
-        if self.registration.is_none() && self.clock.now() >= self.registration_deadline {
+        if self.registration.is_none()
+            && self.binding.is_none()
+            && self.clock.now() >= self.registration_deadline
+        {
             return Err(ReliabilityError::RegistrationTimedOut.into());
         }
         Ok(())
@@ -172,8 +199,7 @@ impl Connection {
                 .next_deadline()
                 .into_iter()
                 .chain(
-                    self.registration
-                        .is_none()
+                    (self.registration.is_none() && self.binding.is_none())
                         .then_some(self.registration_deadline),
                 )
                 .min();
@@ -206,6 +232,23 @@ impl Connection {
 
     async fn send_queued(&mut self, message: Outbound) -> ControlResult<()> {
         match message {
+            Outbound::Snapshot {
+                snapshot,
+                reservation,
+            } => {
+                self.sender
+                    .send(
+                        &mut self.write,
+                        |message_id| ControlMessage::RouteSnapshot {
+                            message_id,
+                            snapshot,
+                        },
+                        Confirmation::Ack,
+                        Some(reservation),
+                        &self.clock,
+                    )
+                    .await?;
+            }
             Outbound::Control {
                 payload,
                 reservation,
@@ -237,6 +280,41 @@ impl Connection {
             &ControlMessage::RequestRejected { request_id, reason },
         )
         .await
+    }
+
+    async fn register_session(
+        &mut self,
+        request_id: u64,
+        binding: crate::recovery::wire::Binding,
+    ) -> ControlResult<()> {
+        let Some(sessions) = self.sessions.clone() else {
+            return Err(ReliabilityError::Protocol("session registry unavailable").into());
+        };
+        if self
+            .binding
+            .as_ref()
+            .is_some_and(|current| *current != binding)
+            || !sessions.lock().await.valid_binding(&binding)
+        {
+            self.reject(request_id, RequestRejection::InvalidRegistration)
+                .await?;
+            return Err(ReliabilityError::Protocol("retired session").into());
+        }
+        send_control_message(
+            &mut self.write,
+            &ControlMessage::JoinAccepted { request_id },
+        )
+        .await?;
+        // Recheck after the socket write; registration may have been replaced.
+        if !sessions
+            .lock()
+            .await
+            .bind_control(&binding, &self.recipient)
+        {
+            return Err(ReliabilityError::Protocol("session replaced during CONTROL bind").into());
+        }
+        self.binding = Some(binding);
+        Ok(())
     }
 
     async fn register(&mut self, request_id: u64, next: Registration) -> ControlResult<()> {
@@ -349,4 +427,38 @@ async fn broadcast(
         list.retain(|peer| !peer.is_closed());
     }
     report
+}
+
+/// Serve the session-bound CONTROL protocol; unscoped joins are rejected.
+/// # Errors
+/// Returns a listener accept failure.
+pub async fn serve_sessions(
+    listener: TcpListener,
+    registry: crate::recovery::server::SharedRegistry,
+) -> std::io::Result<()> {
+    loop {
+        let (stream, _) = listener.accept().await?;
+        let registry = registry.clone();
+        tokio::spawn(async move {
+            // Failure closes this connection; the client owns bounded recovery.
+            let _ = handle_session_connection(stream, registry).await;
+        });
+    }
+}
+
+pub(crate) async fn handle_session_connection(
+    stream: TcpStream,
+    registry: crate::recovery::server::SharedRegistry,
+) -> ControlResult<()> {
+    let socket = tokio::time::timeout(
+        REGISTRATION_TIMEOUT,
+        accept_async_with_config(stream, Some(websocket_config())),
+    )
+    .await??;
+    let peers = Arc::new(Mutex::new(HashMap::new()));
+    let mut connection = Connection::new(socket, peers, Clock::default());
+    connection.sessions = Some(registry);
+    let result = connection.run().await;
+    connection.finish(&result).await;
+    result
 }

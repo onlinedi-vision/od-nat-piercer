@@ -11,7 +11,7 @@ use std::{net::SocketAddr, sync::Arc};
 use tokio::{net::UdpSocket, sync::Mutex};
 
 use super::{
-    notifications::handle_connect_notifications,
+    notifications::{handle_connect_notifications, replay_current_route},
     utils::{add_new_user, remove_user_from_other_channels, update_existing_user},
 };
 
@@ -95,11 +95,15 @@ pub async fn handle_connect_message(
     }
 
     if !is_new_user {
+        replay_current_route(&users_to_notify, &user_name, src_addr, &socket).await;
         return;
     }
 
     handle_connect_notifications(&server_id, &channel_name, users_to_notify, socket, state).await;
 }
+
+#[cfg(test)]
+mod reconnect_tests;
 
 #[test]
 fn welcome_payload_uses_machine_readable_format() {

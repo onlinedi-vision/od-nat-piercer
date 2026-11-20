@@ -16,9 +16,7 @@ pub async fn handle_pong(src: SocketAddr, state: Arc<Mutex<ServerMap>>) {
         }
         registered
     };
-    if registered {
-        println!("Received PONG from registered client {src}");
-    }
+    if registered {}
 }
 
 pub async fn handle_heartbeat(parts: &[&str], src: SocketAddr, state: Arc<Mutex<ServerMap>>) {

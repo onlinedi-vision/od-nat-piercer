@@ -23,7 +23,7 @@ pub struct PathMonitor {
 
 struct PathActions {
     probes: Vec<std::net::SocketAddr>,
-    reports: Vec<(&'static str, String)>,
+    reports: Vec<(&'static str, String, std::net::SocketAddr)>,
 }
 
 pub struct PathContext<'a> {
@@ -73,8 +73,10 @@ impl PathMonitor {
                 eprintln!("Failed path probe to {address}: {error}");
             }
         }
-        for (command, target) in reports {
-            eprintln!("Requesting server fallback for {target}; route activation is unconfirmed");
+        for (command, target, address) in reports {
+            eprintln!(
+                "Requesting server fallback for {target}: {command}, inactive path {address}; route activation is unconfirmed"
+            );
             let report = format!(
                 "{command} {} {} {target}",
                 context.server_id, context.channel
@@ -126,7 +128,7 @@ impl PathMonitor {
                 } else {
                     (MSG_REQUEST_RELAY, context.user.to_owned())
                 };
-                reports.push(report);
+                reports.push((report.0, report.1, peer.addr));
             } else if context.is_relay && probe_due {
                 probes.push(peer.addr);
             }

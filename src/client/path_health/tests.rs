@@ -84,6 +84,72 @@ impl Fixture {
 }
 
 #[test]
+fn replacement_retires_old_address_without_fallback_for_the_new_path() -> io::Result<()> {
+    let start = Instant::now();
+    let fixture = Fixture::new(start)?;
+    let replacement = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))?;
+    let address = replacement.local_addr()?;
+    process_incoming_message_at(
+        &fixture.incoming()?,
+        &format!("MODE DIRECT upstream {address}"),
+        fixture.server.local_addr()?,
+        start,
+    )?;
+    {
+        let peers = fixture.lock_peers()?;
+        assert_eq!(peers.len(), 1);
+        assert_eq!(peers[0].addr, address);
+        assert!(peers[0].last_direct_activity.is_none());
+        assert!(!peers[0].connected);
+    }
+    let observed = start + Duration::from_secs(1);
+    process_incoming_message_at(&fixture.incoming()?, "PONG", address, observed)?;
+    // Old endpoint traffic cannot refresh the replacement's direct health.
+    process_incoming_message_at(
+        &fixture.incoming()?,
+        "PONG",
+        fixture.peer.local_addr()?,
+        start + Duration::from_secs(4),
+    )?;
+    let mut monitor = PathMonitor::new(start);
+    monitor.tick(&fixture.context(true), start + ESTABLISHED_PATH_TIMEOUT)?;
+    let peers = fixture.lock_peers()?;
+    assert_eq!(peers[0].last_direct_activity, Some(observed));
+    assert!(!peers[0].relay_requested);
+    fixture.server.set_nonblocking(true)?;
+    fixture.peer.set_nonblocking(true)?;
+    for socket in [&fixture.server, &fixture.peer] {
+        assert!(matches!(
+            socket.recv_from(&mut [0; 256]),
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock
+        ));
+    }
+    Ok(())
+}
+
+#[test]
+fn repeated_direct_notice_preserves_health_and_does_not_revive_retired_path() -> io::Result<()> {
+    let start = Instant::now();
+    let fixture = Fixture::new(start)?;
+    let notice = format!("MODE DIRECT upstream {}", fixture.peer.local_addr()?);
+    for retired in [false, true] {
+        fixture.lock_peers()?[0].relay_requested = retired;
+        process_incoming_message_at(
+            &fixture.incoming()?,
+            &notice,
+            fixture.server.local_addr()?,
+            start + Duration::from_secs(1),
+        )?;
+        let peers = fixture.lock_peers()?;
+        assert_eq!(peers.len(), 1);
+        assert_eq!(peers[0].last_direct_activity, Some(start));
+        assert_eq!(peers[0].created_at, start);
+        assert_eq!(peers[0].relay_requested, retired);
+    }
+    Ok(())
+}
+
+#[test]
 fn established_failure_obeys_threshold_and_check_cadence_once() -> io::Result<()> {
     let start = Instant::now();
     let fixture = Fixture::new(start)?;
@@ -162,11 +228,8 @@ fn only_valid_input_from_the_observed_path_refreshes_health() -> io::Result<()> 
     let start = Instant::now();
     let fixture = Fixture::new(start)?;
     let later = start + Duration::from_secs(4);
-    for message in [
-        "DATA upstream relayed",
-        "PONG",
-        "MODE DIRECT upstream 127.0.0.1:1",
-    ] {
+    let duplicate_notice = format!("MODE DIRECT upstream {}", fixture.peer.local_addr()?);
+    for message in ["DATA upstream relayed", "PONG", duplicate_notice.as_str()] {
         process_incoming_message_at(
             &fixture.incoming()?,
             message,

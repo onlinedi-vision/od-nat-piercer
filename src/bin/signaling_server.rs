@@ -1,80 +1,58 @@
-use od_nat_piercer::control::server::{ControlPeers, start_control_server};
-use od_nat_piercer::signaling::{
-    handlers::handle_message, heartbeat::start_heartbeat, structures::ServerMap,
+use od_nat_piercer::{
+    control::server::serve_sessions,
+    recovery::{
+        CHECK_INTERVAL,
+        server::{Registry, SharedRegistry, dispatch},
+        wire::MAX_DATAGRAM,
+    },
 };
-use std::collections::HashMap;
-use std::net::SocketAddr;
-use std::sync::Arc;
-use tokio::net::UdpSocket;
-use tokio::sync::Mutex;
+use std::{io, sync::Arc, time::Instant};
+use tokio::{
+    net::{TcpListener, UdpSocket},
+    sync::Mutex,
+    time::{MissedTickBehavior, interval},
+};
 
-#[allow(clippy::disallowed_methods)] //tokio::main generates expect when building the runtime.
+#[allow(clippy::disallowed_methods)] // tokio::main builds the runtime.
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let socket_main = UdpSocket::bind("0.0.0.0:2131").await?;
-    let socket_probe = UdpSocket::bind("0.0.0.0:2132").await?;
-
-    println!("Signaling server listening on 0.0.0.0:2131");
-
-    let socket_main = Arc::new(socket_main);
-    let socket_probe = Arc::new(socket_probe);
-
-    let state = Arc::new(Mutex::new(ServerMap::new()));
-    let control_peers: ControlPeers = Arc::new(Mutex::new(HashMap::new()));
-    let control_peers_clone = Arc::clone(&control_peers);
-
-    start_heartbeat(Arc::clone(&socket_main), Arc::clone(&state));
-
-    tokio::spawn(async move {
-        if let Err(e) = start_control_server("0.0.0.0:2133", control_peers_clone).await {
-            eprintln!("control server failed: {e}");
-        }
-    });
-
-    run_server(socket_main, socket_probe, state).await;
-    Ok(())
+async fn main() -> io::Result<()> {
+    let main = UdpSocket::bind("0.0.0.0:2131").await?;
+    let probe = UdpSocket::bind("0.0.0.0:2132").await?;
+    let control = TcpListener::bind("0.0.0.0:2133").await?;
+    let registry = Arc::new(Mutex::new(Registry::default()));
+    println!("Signaling UDP 2131/2132 and CONTROL 2133 listening");
+    tokio::select! {
+        result = serve_sessions(control, registry.clone()) => result,
+        result = run_udp(main, probe, registry) => result,
+    }
 }
 
-async fn run_server(
-    socket_main: Arc<UdpSocket>,
-    socket_probe: Arc<UdpSocket>,
-    state: Arc<Mutex<ServerMap>>,
-) {
-    let mut buf_main = [0u8; 2048];
-    let mut buf_probe = [0u8; 2048];
-
+async fn run_udp(main: UdpSocket, probe: UdpSocket, registry: SharedRegistry) -> io::Result<()> {
+    let mut primary = [0; MAX_DATAGRAM + 1];
+    let mut secondary = [0; MAX_DATAGRAM + 1];
+    let mut tick = interval(CHECK_INTERVAL);
+    tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    let mut last_error = None;
     loop {
-        tokio::select! {
-            res = socket_main.recv_from(&mut buf_main) => {
-                if let Ok((len,src)) = res{
-                    process_datagram(&buf_main[..len], src, Arc::clone(&socket_main), Arc::clone(&state),).await;
-                }
+        let result = tokio::select! {
+            _ = tick.tick() => { registry.lock().await.expire(Instant::now()); Ok(()) },
+            result = main.recv_from(&mut primary) => {
+                let (len, source) = result?;
+                dispatch(&main, &registry, &primary[..len], source, true).await
             }
-
-            res = socket_probe.recv_from(&mut buf_probe) => {
-                if let Ok((len,src)) = res{
-                    process_datagram(&buf_probe[..len], src, Arc::clone(&socket_probe), Arc::clone(&state),).await;
-                }
+            result = probe.recv_from(&mut secondary) => {
+                let (len, source) = result?;
+                dispatch(&probe, &registry, &secondary[..len], source, false).await
+            }
+        };
+        if let Err(error) = result {
+            let now = Instant::now();
+            if last_error
+                .is_none_or(|last| now.duration_since(last) >= std::time::Duration::from_secs(5))
+            {
+                eprintln!("UDP send error: {error}");
+                last_error = Some(now);
             }
         }
     }
-}
-
-async fn process_datagram(
-    buf: &[u8],
-    src: SocketAddr,
-    socket: Arc<UdpSocket>,
-    state: Arc<Mutex<ServerMap>>,
-) {
-    if let Some((hdr, payload)) = od_nat_piercer::proto::packet::decode(buf) {
-        if hdr.kind == od_nat_piercer::proto::packet::Kind::Control
-            && let Ok(s) = std::str::from_utf8(payload)
-        {
-            handle_message(s.to_string(), src, socket, state).await;
-        }
-
-        return;
-    }
-    let msg = String::from_utf8_lossy(buf).to_string();
-    handle_message(msg, src, socket, state).await;
 }

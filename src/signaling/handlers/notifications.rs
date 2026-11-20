@@ -8,6 +8,50 @@ use crate::{
 use std::{net::SocketAddr, sync::Arc};
 use tokio::{net::UdpSocket, sync::Mutex};
 
+/// Rebuild only the requesting endpoint's view from the current snapshot.
+/// A repeated CONNECT must not reselect the relay or reset other peers' paths.
+pub(super) async fn replay_current_route(
+    channel: &Channel,
+    username: &str,
+    address: SocketAddr,
+    socket: &UdpSocket,
+) {
+    let Some(user) = channel
+        .users
+        .iter()
+        .find(|user| user.name == username && user.addr == address)
+    else {
+        return;
+    };
+    let relay = channel
+        .users
+        .iter()
+        .find(|user| Some(user.name.as_str()) == channel.relay.as_deref());
+    let notices = if channel.relay.as_deref() == Some(username) {
+        let mut notices = vec![format!("{MSG_MODE} {MSG_RELAY}\n")];
+        for peer in channel.users.iter().filter(|peer| peer.name != username) {
+            notices.push(if peer.needs_server_relay {
+                format!("{MSG_MODE} {MSG_SERVER_RELAY} {}\n", peer.name)
+            } else {
+                format!("{MSG_MODE} {MSG_DIRECT} {} {}\n", peer.name, peer.addr)
+            });
+        }
+        notices
+    } else if let Some(relay) = relay.filter(|_| !user.needs_server_relay) {
+        vec![format!(
+            "{MSG_MODE} {MSG_DIRECT} {} {}\n",
+            relay.name, relay.addr
+        )]
+    } else {
+        vec![format!("{MSG_MODE} {MSG_SERVER_RELAY} {username}\n")]
+    };
+    for notice in notices {
+        if let Err(error) = socket.send_to(notice.as_bytes(), address).await {
+            eprintln!("Failed to replay route to {username} ({address}): {error}");
+        }
+    }
+}
+
 pub async fn mark_relay_in_channel(
     state: &Arc<Mutex<ServerMap>>,
     server_id: &str,

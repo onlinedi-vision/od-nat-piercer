@@ -1,75 +1,18 @@
 use std::collections::HashMap;
-use std::net::UdpSocket;
+use std::net::{SocketAddr, UdpSocket};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::client::routing::send_data;
-use crate::client::structures::{NatKind, PeerInfo, PunchSync};
-use crate::proto::control_text::{
-    MSG_DATA, MSG_HB, MSG_HOLE_PUNCH, MSG_NAT_PROBE, MSG_NAT_SEEN, NAT_TYPE_CONE,
-    NAT_TYPE_SYMMETRIC,
-};
+use crate::client::structures::{PeerInfo, PunchSync};
+use crate::proto::control_text::{MSG_DATA, MSG_HB, MSG_HOLE_PUNCH};
 
-const PUNCH_INITIAL_SLEEP_MS: u64 = 150; //initial sleep between punches
-const PUNCH_MAX_SLEEP_MS: u64 = 1500; // max sleep value between punches
+const PUNCH_INITIAL_INTERVAL: Duration = Duration::from_millis(150);
+const PUNCH_INITIAL_WINDOW: Duration = Duration::from_secs(1);
+const PUNCH_LATER_INTERVAL: Duration = Duration::from_millis(1500);
 const HEARTBEAT_SLEEP_SEC: u64 = 20; // sleep between heartbeats
-const NAT_DETECT_TOTAL_TIMEOUT_MS: u64 = 600; // maximum waiting time for server to respond to both probes
-const NAT_DETECT_POLL_SLEEP_MS: u64 = 20; // sleep between polls when socket is WouldBlock
-
-#[must_use]
-pub fn detect_nat_kind(socket: &UdpSocket, signaling_ip: &str) -> NatKind {
-    let addr1 = format!("{signaling_ip}:2131");
-    let addr2 = format!("{signaling_ip}:2132");
-
-    let _ = socket.send_to(format!("{MSG_NAT_PROBE} 1\n").as_bytes(), &addr1);
-    let _ = socket.send_to(format!("{MSG_NAT_PROBE} 2\n").as_bytes(), &addr2);
-
-    let mut seen = Vec::new();
-    let mut buf = [0u8; 256];
-    let deadline = Instant::now() + Duration::from_millis(NAT_DETECT_TOTAL_TIMEOUT_MS);
-
-    while seen.len() < 2 && Instant::now() < deadline {
-        match socket.recv_from(&mut buf) {
-            Ok((len, _src)) => {
-                let msg = String::from_utf8_lossy(&buf[..len]).to_string();
-                if msg.starts_with(&format!("{MSG_NAT_SEEN} "))
-                    && let Some(addr_str) = msg.split_whitespace().nth(1)
-                    && let Ok(observed) = addr_str.parse::<std::net::SocketAddr>()
-                {
-                    seen.push(observed);
-                }
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                std::thread::sleep(Duration::from_millis(NAT_DETECT_POLL_SLEEP_MS));
-            }
-            Err(_) => break,
-        }
-    }
-
-    if seen.len() < 2 {
-        println!("NAT detection: insufficient responses, treating as Unknown");
-        return NatKind::Unknown;
-    }
-
-    let a = seen[0];
-    let b = seen[1];
-
-    if a.ip() != b.ip() {
-        println!("NAT detection: different public IPs, treating as Symmetric");
-        return NatKind::Symmetric;
-    }
-
-    if a.port() == b.port() {
-        println!("NAT detection: {NAT_TYPE_CONE} (same addr on both ports): {a}");
-        NatKind::Cone
-    } else {
-        println!("NAT detection: {NAT_TYPE_SYMMETRIC} (different ports): {a} vs {b}");
-        NatKind::Symmetric
-    }
-}
-
 /// Requests local worker shutdown and wakes paused/sleeping workers.
 pub fn stop_workers(sync: &PunchSync) {
     let (lock, wake) = &**sync;
@@ -117,8 +60,48 @@ pub fn start_heartbeat(
     })
 }
 
+// The local advertisement timestamp resets scheduling when an address is
+// replaced/reintroduced. It is not a protocol session generation.
+type PunchSchedule = HashMap<(SocketAddr, Instant), Instant>;
+
+fn needs_punch(peer: &PeerInfo, now: Instant) -> bool {
+    !peer.connected
+        && !peer.use_server_relay
+        && !peer.relay_requested
+        && now.saturating_duration_since(peer.created_at)
+            < crate::client::path_health::INITIAL_PATH_TIMEOUT
+}
+
+fn collect_punches(
+    peers: &[PeerInfo],
+    schedule: &mut PunchSchedule,
+    now: Instant,
+) -> Vec<(String, SocketAddr)> {
+    schedule.retain(|&(addr, created_at), _| {
+        peers.iter().any(|peer| {
+            peer.addr == addr && peer.created_at == created_at && needs_punch(peer, now)
+        })
+    });
+    let mut targets = Vec::new();
+    for peer in peers.iter().filter(|peer| needs_punch(peer, now)) {
+        let next = schedule.entry((peer.addr, peer.created_at)).or_insert(now);
+        if now < *next {
+            continue;
+        }
+        let interval = if now.saturating_duration_since(peer.created_at) < PUNCH_INITIAL_WINDOW {
+            PUNCH_INITIAL_INTERVAL
+        } else {
+            PUNCH_LATER_INTERVAL
+        };
+        // A delayed worker sends once, never a catch-up burst.
+        *next = now + interval;
+        targets.push((peer.username.clone(), peer.addr));
+    }
+    targets
+}
+
 fn hole_punching_loop(socket: &UdpSocket, peers: &Arc<Mutex<Vec<PeerInfo>>>, sync: &PunchSync) {
-    let mut backoff: HashMap<String, u64> = HashMap::new(); //username -> ms
+    let mut schedule = PunchSchedule::new();
 
     loop {
         // block if we are paused (sending via server) -> block here
@@ -143,43 +126,27 @@ fn hole_punching_loop(socket: &UdpSocket, peers: &Arc<Mutex<Vec<PeerInfo>>>, syn
             }
         }
 
-        {
+        let targets = {
             let Ok(guard) = peers.lock() else {
                 eprintln!("Hole punching stopped: peers mutex is poisoned");
                 return;
             };
-            backoff.retain(|name, _| {
-                guard.iter().any(|peer| {
-                    &peer.username == name
-                        && !peer.connected
-                        && !peer.use_server_relay
-                        && !peer.relay_requested
-                })
-            });
-            for p in guard.iter() {
-                if p.connected || p.use_server_relay || p.relay_requested {
-                    continue; //don't punch server-relayed peers
-                }
-
-                if let Err(e) = socket.send_to(MSG_HOLE_PUNCH.as_bytes(), p.addr) {
-                    eprintln!("Failed to send punch to {}: {}", p.addr, e);
-                } else {
-                    println!("Sent UDP punch to {} ({})", p.username, p.addr);
-                }
-
-                let entry = backoff
-                    .entry(p.username.clone())
-                    .or_insert(PUNCH_INITIAL_SLEEP_MS);
-                *entry = (*entry).saturating_mul(2).min(PUNCH_MAX_SLEEP_MS);
+            collect_punches(&guard, &mut schedule, Instant::now())
+        };
+        for (name, addr) in targets {
+            if let Err(error) = socket.send_to(MSG_HOLE_PUNCH.as_bytes(), addr) {
+                eprintln!("Failed to send punch to {name} ({addr}): {error}");
             }
         }
 
-        let sleep_ms = backoff
+        let now = Instant::now();
+        let sleep = schedule
             .values()
+            .map(|next| next.saturating_duration_since(now))
             .min()
-            .copied()
-            .unwrap_or(PUNCH_INITIAL_SLEEP_MS);
-        if !wait_for_worker_tick(sync, Duration::from_millis(sleep_ms)) {
+            .unwrap_or(PUNCH_INITIAL_INTERVAL)
+            .min(PUNCH_INITIAL_INTERVAL);
+        if !wait_for_worker_tick(sync, sleep) {
             return;
         }
     }
@@ -272,3 +239,6 @@ pub fn start_user_input(context: UserMessageContext) {
 
 #[cfg(test)]
 mod routing_tests;
+
+#[cfg(test)]
+mod punching_tests;

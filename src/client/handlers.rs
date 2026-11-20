@@ -56,6 +56,9 @@ fn handle_mode_direct(
         if username == me {
             println!("Server confirms you ({me}) are relay for {addr_str}");
         } else if !guard.iter().any(|p| p.addr == addr) {
+            // One current address per advertised participant. Retiring the old
+            // entry also retires its path monitor and punching schedule.
+            guard.retain(|peer| peer.username != username);
             guard.push(PeerInfo {
                 addr,
                 last_direct_activity: None,
@@ -268,9 +271,6 @@ pub(crate) fn process_incoming_message_at(
         }
         match line {
             MSG_PING => {
-                if src == context.server_addr {
-                    println!("Received PING from signaling server {src}; replying with PONG");
-                }
                 handle_ping(context.socket, src);
             }
             MSG_PONG | MSG_HOLE_PUNCH => {}

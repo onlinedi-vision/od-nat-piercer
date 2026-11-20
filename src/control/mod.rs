@@ -3,7 +3,7 @@ pub mod messages;
 pub mod server;
 
 mod recipient;
-mod reliability;
+pub(crate) mod reliability;
 
 #[cfg(test)]
 mod ut;
